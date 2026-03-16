@@ -2,14 +2,14 @@
 
 from ._array import Array
 from ._doc import Doc, Extension, node
-from ._node import DocNode
+from ._node import AtomNode
 from ._types import ChangeEvent, Diff, Operations
 from ._undo import UndoManager
 
 __all__ = [
     "Array",
     "Doc",
-    "DocNode",
+    "AtomNode",
     "Extension",
     "UndoManager",
     "ChangeEvent",

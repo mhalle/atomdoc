@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from ulid import ULID
 
 from ._id import node_id_factory
-from ._node import DocNode, _MISSING
+from ._node import AtomNode, _MISSING
 from ._types import (
     ChangeEvent,
     Diff,
@@ -24,7 +24,7 @@ from ._types import (
 # ---------------------------------------------------------------------------
 
 def node(cls_or_name: type | str | None = None) -> Any:
-    """Decorator to create a DocNode subclass from any class with annotations.
+    """Decorator to create a AtomNode subclass from any class with annotations.
 
     Usage::
 
@@ -40,19 +40,19 @@ def node(cls_or_name: type | str | None = None) -> Any:
     extracted as slots, everything else becomes state fields.
     """
     if isinstance(cls_or_name, str):
-        def decorator(cls: type) -> type[DocNode]:
+        def decorator(cls: type) -> type[AtomNode]:
             return _make_node_from_class(cls, cls_or_name)
         return decorator
     elif cls_or_name is None:
-        def decorator(cls: type) -> type[DocNode]:
+        def decorator(cls: type) -> type[AtomNode]:
             return _make_node_from_class(cls, cls.__name__)
         return decorator
     else:
         return _make_node_from_class(cls_or_name, cls_or_name.__name__)
 
 
-def _make_node_from_class(source_cls: type, node_type_name: str) -> type[DocNode]:
-    """Create a DocNode subclass from any annotated class."""
+def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNode]:
+    """Create a AtomNode subclass from any annotated class."""
 
     # Extract annotations and defaults
     annotations: dict[str, Any] = {}
@@ -82,10 +82,10 @@ def _make_node_from_class(source_cls: type, node_type_name: str) -> type[DocNode
     for name, val in defaults.items():
         ns[name] = val
 
-    # Create the DocNode subclass
+    # Create the AtomNode subclass
     new_cls = type(
         source_cls.__name__,
-        (DocNode,),
+        (AtomNode,),
         ns,
         node_type=node_type_name,
     )
@@ -110,7 +110,7 @@ class Extension:
 
     def __init__(
         self,
-        nodes: list[type[DocNode]] | None = None,
+        nodes: list[type[AtomNode]] | None = None,
         normalize: Callable[[Diff], None] | None = None,
     ) -> None:
         self.nodes = nodes or []
@@ -121,10 +121,10 @@ class Extension:
 # Doc
 # ---------------------------------------------------------------------------
 
-def _discover_node_types(root_cls: type[DocNode]) -> dict[str, type[DocNode]]:
+def _discover_node_types(root_cls: type[AtomNode]) -> dict[str, type[AtomNode]]:
     """Walk slot declarations to discover all reachable node types from root."""
-    result: dict[str, type[DocNode]] = {}
-    pending: list[type[DocNode]] = [root_cls]
+    result: dict[str, type[AtomNode]] = {}
+    pending: list[type[AtomNode]] = [root_cls]
     while pending:
         cls = pending.pop()
         if not hasattr(cls, "_node_type"):
@@ -139,20 +139,20 @@ def _discover_node_types(root_cls: type[DocNode]) -> dict[str, type[DocNode]]:
 
 
 class Doc:
-    """The document container — a rooted tree of DocNode instances."""
+    """The document container — a rooted tree of AtomNode instances."""
 
     def __init__(
         self,
-        root_type: type[DocNode] | DocNode | str,
-        nodes: list[type[DocNode]] | None = None,
+        root_type: type[AtomNode] | AtomNode | str,
+        nodes: list[type[AtomNode]] | None = None,
         extensions: list[Extension] | None = None,
         *,
         doc_id: str | None = None,
         strict_mode: bool = True,
     ) -> None:
         # Resolve root_type: accept an instance (snapshot), a class, or a string
-        root_snapshot: DocNode | None = None
-        if isinstance(root_type, DocNode):
+        root_snapshot: AtomNode | None = None
+        if isinstance(root_type, AtomNode):
             # Instance passed — extract class and snapshot data
             root_snapshot = root_type
             root_cls = type(root_snapshot)
@@ -165,12 +165,12 @@ class Doc:
             root_type_str = str(root_type)
 
         # Collect explicit node types
-        all_nodes: list[type[DocNode]] = list(nodes or [])
+        all_nodes: list[type[AtomNode]] = list(nodes or [])
         all_extensions = extensions or []
         for ext in all_extensions:
             all_nodes.extend(ext.nodes)
 
-        self._node_types: dict[str, type[DocNode]] = {}
+        self._node_types: dict[str, type[AtomNode]] = {}
 
         # If root class provided, auto-discover reachable types from slots
         if root_cls is not None:
@@ -200,7 +200,7 @@ class Doc:
         else:
             self._id = str(ULID()).lower()
 
-        self._node_map: dict[str, DocNode] = {}
+        self._node_map: dict[str, AtomNode] = {}
         self._strict_mode = strict_mode
         self._lifecycle_stage: LifeCycleStage = "idle"
         self._operations: Operations = ([], {})
@@ -226,7 +226,7 @@ class Doc:
                 self._normalize_listeners.append(ext.normalize)
         self._lifecycle_stage = "idle"
 
-    def _apply_snapshot(self, live_node: DocNode, snapshot: DocNode) -> None:
+    def _apply_snapshot(self, live_node: AtomNode, snapshot: AtomNode) -> None:
         """Populate a live node tree from a snapshot (user-constructed node)."""
         # Copy state
         for key, value in snapshot._state.items():
@@ -267,38 +267,38 @@ class Doc:
                 self._apply_snapshot(child, child_snapshot)
 
     @property
-    def root(self) -> DocNode:
+    def root(self) -> AtomNode:
         return self._root
 
     @property
     def id(self) -> str:
         return self._id
 
-    def get_node_by_id(self, node_id: str) -> DocNode | None:
+    def get_node_by_id(self, node_id: str) -> AtomNode | None:
         return self._node_map.get(node_id)
 
     # --- Tree navigation ---
 
-    def parent(self, node: DocNode) -> DocNode | None:
+    def parent(self, node: AtomNode) -> AtomNode | None:
         """Parent of this node, or None for root."""
         return node._parent
 
-    def next_sibling(self, node: DocNode) -> DocNode | None:
+    def next_sibling(self, node: AtomNode) -> AtomNode | None:
         """Next sibling within the same slot."""
         return node._next_sibling
 
-    def prev_sibling(self, node: DocNode) -> DocNode | None:
+    def prev_sibling(self, node: AtomNode) -> AtomNode | None:
         """Previous sibling within the same slot."""
         return node._prev_sibling
 
-    def ancestors(self, node: DocNode) -> Iterator[DocNode]:
+    def ancestors(self, node: AtomNode) -> Iterator[AtomNode]:
         """Walk up from node to root (excludes node)."""
         current = node._parent
         while current is not None:
             yield current
             current = current._parent
 
-    def descendants(self, node: DocNode) -> Iterator[DocNode]:
+    def descendants(self, node: AtomNode) -> Iterator[AtomNode]:
         """Depth-first traversal of all descendants across all slots (excludes node)."""
         for slot_name in node._slot_order:
             child = node._slot_first.get(slot_name)
@@ -307,14 +307,14 @@ class Doc:
                 yield from self.descendants(child)
                 child = child._next_sibling
 
-    def next_siblings(self, node: DocNode) -> Iterator[DocNode]:
+    def next_siblings(self, node: AtomNode) -> Iterator[AtomNode]:
         """Forward siblings after node (within same slot)."""
         current = node._next_sibling
         while current is not None:
             yield current
             current = current._next_sibling
 
-    def prev_siblings(self, node: DocNode) -> Iterator[DocNode]:
+    def prev_siblings(self, node: AtomNode) -> Iterator[AtomNode]:
         """Backward siblings before node (within same slot)."""
         current = node._prev_sibling
         while current is not None:
@@ -323,9 +323,9 @@ class Doc:
 
     # --- Node creation ---
 
-    def create_node(self, node_cls: type[DocNode], **state: Any) -> DocNode:
+    def create_node(self, node_cls: type[AtomNode], **state: Any) -> AtomNode:
         if not hasattr(node_cls, "_node_type"):
-            raise TypeError(f"{node_cls} is not a valid DocNode subclass")
+            raise TypeError(f"{node_cls} is not a valid AtomNode subclass")
         if node_cls._node_type not in self._node_types:
             raise ValueError(
                 f"Node type '{node_cls._node_type}' is not registered"
@@ -345,7 +345,7 @@ class Doc:
 
     # --- Central write path ---
 
-    def _set_node_state(self, node: DocNode, key: str, value: Any) -> None:
+    def _set_node_state(self, node: AtomNode, key: str, value: Any) -> None:
         from . import _operations as ops
         from ._transaction import with_transaction
 
@@ -366,11 +366,11 @@ class Doc:
 
     def _insert_into_slot(
         self,
-        parent: DocNode,
+        parent: AtomNode,
         slot_name: str,
         position: str,
-        nodes: list[DocNode],
-        target: DocNode | None = None,
+        nodes: list[AtomNode],
+        target: AtomNode | None = None,
     ) -> None:
         """Insert nodes into a specific slot of parent."""
         if not nodes:
@@ -451,11 +451,11 @@ class Doc:
 
     def _attach_node(
         self,
-        node: DocNode,
-        parent: DocNode,
+        node: AtomNode,
+        parent: AtomNode,
         slot_name: str,
-        prev: DocNode | None = None,
-        next_: DocNode | None = None,
+        prev: AtomNode | None = None,
+        next_: AtomNode | None = None,
     ) -> None:
         node._parent = parent
         node._slot_name = slot_name
@@ -605,7 +605,7 @@ class Doc:
 
     # --- Clean JSON (user-facing, no IDs) ---
 
-    def to_json(self, node: DocNode | None = None) -> dict[str, Any]:
+    def to_json(self, node: AtomNode | None = None) -> dict[str, Any]:
         """Return clean JSON for a node (default: root). No internal IDs."""
         if self._lifecycle_stage not in ("idle", "change"):
             raise RuntimeError("Cannot serialize during an active transaction")
@@ -624,8 +624,8 @@ class Doc:
     def restore(
         cls,
         data: JsonDoc,
-        root_type: type[DocNode] | None = None,
-        nodes: list[type[DocNode]] | None = None,
+        root_type: type[AtomNode] | None = None,
+        nodes: list[type[AtomNode]] | None = None,
         extensions: list[Extension] | None = None,
         strict_mode: bool = True,
     ) -> Doc:
@@ -633,7 +633,7 @@ class Doc:
         doc_id = data[0]
         root_type_str = data[1]
 
-        effective_root: type[DocNode] | str = root_type if root_type is not None else root_type_str
+        effective_root: type[AtomNode] | str = root_type if root_type is not None else root_type_str
 
         doc = cls(
             root_type=effective_root,
@@ -653,7 +653,7 @@ class Doc:
 
         return doc
 
-    def _create_node_from_json(self, json_node: JsonDoc) -> DocNode:
+    def _create_node_from_json(self, json_node: JsonDoc) -> AtomNode:
         node_id = json_node[0]
         node_type = json_node[1]
         state_dict = json_node[2] if len(json_node) > 2 else {}
@@ -674,7 +674,7 @@ class Doc:
         return node
 
     @staticmethod
-    def json_schema(nodes: list[type[DocNode]]) -> dict[str, Any]:
+    def json_schema(nodes: list[type[AtomNode]]) -> dict[str, Any]:
         schemas: dict[str, Any] = {}
         for node_cls in nodes:
             if hasattr(node_cls, "_schema_model") and node_cls._schema_model is not None:
@@ -687,7 +687,7 @@ class Doc:
 # ---------------------------------------------------------------------------
 
 
-def _node_to_wire(node: DocNode) -> JsonDoc:
+def _node_to_wire(node: AtomNode) -> JsonDoc:
     """Serialize a node to wire format (with IDs)."""
     state = node._state_to_json_plain()
     result: JsonDoc = [node.id, node._node_type, state]
@@ -696,7 +696,7 @@ def _node_to_wire(node: DocNode) -> JsonDoc:
         slots_dict: dict[str, list[JsonDoc]] = {}
         for slot_name in node._slot_order:
             children: list[JsonDoc] = []
-            child: DocNode | None = node._slot_first.get(slot_name)
+            child: AtomNode | None = node._slot_first.get(slot_name)
             while child is not None:
                 children.append(_node_to_wire(child))
                 child = child._next_sibling
@@ -706,7 +706,7 @@ def _node_to_wire(node: DocNode) -> JsonDoc:
     return result
 
 
-def _node_to_data(node: DocNode) -> dict[str, Any]:
+def _node_to_data(node: AtomNode) -> dict[str, Any]:
     """Serialize a node to clean JSON (no IDs, just data)."""
     result: dict[str, Any] = {}
 
@@ -727,7 +727,7 @@ def _node_to_data(node: DocNode) -> dict[str, Any]:
     # Slots
     for slot_name in node._slot_order:
         children: list[dict[str, Any]] = []
-        child: DocNode | None = node._slot_first.get(slot_name)
+        child: AtomNode | None = node._slot_first.get(slot_name)
         while child is not None:
             children.append(_node_to_data(child))
             child = child._next_sibling
@@ -736,13 +736,13 @@ def _node_to_data(node: DocNode) -> dict[str, Any]:
     return result
 
 
-def _deserialize_slots(doc: Doc, parent: DocNode, slots_data: dict[str, list[JsonDoc]]) -> None:
+def _deserialize_slots(doc: Doc, parent: AtomNode, slots_data: dict[str, list[JsonDoc]]) -> None:
     """Recursively deserialize slot children."""
     for slot_name, children_data in slots_data.items():
         if slot_name not in parent._slot_first:
             continue  # skip unknown slots
 
-        prev: DocNode | None = None
+        prev: AtomNode | None = None
         for child_json in children_data:
             child = doc._create_node_from_json(child_json)
             child._parent = parent
@@ -766,7 +766,7 @@ def _deserialize_slots(doc: Doc, parent: DocNode, slots_data: dict[str, list[Jso
                     _deserialize_slots(doc, child_node, child_json[3])
 
 
-def _descendants_inclusive_iter(node: DocNode):  # type: ignore[no-untyped-def]
+def _descendants_inclusive_iter(node: AtomNode):  # type: ignore[no-untyped-def]
     """Yield node and all its descendants."""
     yield node
     for slot_name in node._slot_order:
@@ -776,11 +776,11 @@ def _descendants_inclusive_iter(node: DocNode):  # type: ignore[no-untyped-def]
             child = child._next_sibling
 
 
-def _make_root_class(root_type: str) -> type[DocNode]:
+def _make_root_class(root_type: str) -> type[AtomNode]:
     ns: dict[str, Any] = {}
     cls = type(
         f"_Root_{root_type}",
-        (DocNode,),
+        (AtomNode,),
         ns,
         node_type=root_type,
     )

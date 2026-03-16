@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import BaseModel
 
-from atomdoc import Doc, DocNode
+from atomdoc import Doc, AtomNode
 
 
 class Color(BaseModel, frozen=True):
@@ -14,12 +14,12 @@ class Color(BaseModel, frozen=True):
     b: int = 0
 
 
-class PageNode(DocNode, node_type="page"):
+class PageNode(AtomNode, node_type="page"):
     title: str = ""
     body: str = ""
 
 
-class AnnotationNode(DocNode, node_type="annotation"):
+class AnnotationNode(AtomNode, node_type="annotation"):
     label: str = ""
     color: Color = Color()
     opacity: float = 1.0

@@ -1,8 +1,8 @@
-"""Tests for DocNode schema via __init_subclass__."""
+"""Tests for AtomNode schema via __init_subclass__."""
 
 from pydantic import BaseModel
 
-from atomdoc import DocNode
+from atomdoc import AtomNode
 
 
 class Vec3(BaseModel, frozen=True):
@@ -11,7 +11,7 @@ class Vec3(BaseModel, frozen=True):
     z: float = 0.0
 
 
-class ShapeNode(DocNode, node_type="shape"):
+class ShapeNode(AtomNode, node_type="shape"):
     label: str = ""
     position: Vec3 = Vec3()
     data: bytes = b""
@@ -45,7 +45,7 @@ def test_mixin_fields():
         created_at: str = ""
         updated_at: str = ""
 
-    class ProjectNode(DocNode, Timestamped, node_type="project"):
+    class ProjectNode(AtomNode, Timestamped, node_type="project"):
         name: str = ""
 
     assert "name" in ProjectNode._field_tiers
@@ -54,7 +54,7 @@ def test_mixin_fields():
 
 
 def test_is_abstract_without_node_type():
-    class AbstractNode(DocNode):
+    class AbstractNode(AtomNode):
         pass
 
     assert AbstractNode._is_abstract is True

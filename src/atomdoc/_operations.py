@@ -8,7 +8,7 @@ from ._range import _descendants
 
 if TYPE_CHECKING:
     from ._doc import Doc
-    from ._node import DocNode
+    from ._node import AtomNode
     from ._types import Operations
 
 
@@ -19,7 +19,7 @@ def _is_obj_empty(d: dict[str, Any]) -> bool:
 # --- State ops ---
 
 
-def on_set_state_inverse(doc: Doc, node: DocNode, key: str) -> None:
+def on_set_state_inverse(doc: Doc, node: AtomNode, key: str) -> None:
     if doc._diff.inserted.__contains__(node.id):
         return
     inv_patch = doc._inverse_operations[1]
@@ -29,7 +29,7 @@ def on_set_state_inverse(doc: Doc, node: DocNode, key: str) -> None:
     inv_patch.setdefault(node.id, {})[key] = original
 
 
-def on_set_state_forward(doc: Doc, node: DocNode, key: str) -> None:
+def on_set_state_forward(doc: Doc, node: AtomNode, key: str) -> None:
     state_patches = doc._operations[1]
     value_string = node._stringify_state_key(key)
 
@@ -53,7 +53,7 @@ def on_set_state_forward(doc: Doc, node: DocNode, key: str) -> None:
 # --- Insert ops ---
 
 
-def _copy_inserted_to_diff(doc: Doc, node: DocNode) -> None:
+def _copy_inserted_to_diff(doc: Doc, node: AtomNode) -> None:
     diff = doc._diff
     was_deleted = node.id in diff.deleted
     if was_deleted:
@@ -68,8 +68,8 @@ def _copy_inserted_to_diff(doc: Doc, node: DocNode) -> None:
         doc._operations[1][node.id] = json_state
 
 
-def _get_slot_children_list(node: DocNode, slot_name: str) -> list[DocNode]:
-    result: list[DocNode] = []
+def _get_slot_children_list(node: AtomNode, slot_name: str) -> list[AtomNode]:
+    result: list[AtomNode] = []
     child = node._slot_first.get(slot_name)
     while child is not None:
         result.append(child)
@@ -79,14 +79,14 @@ def _get_slot_children_list(node: DocNode, slot_name: str) -> list[DocNode]:
 
 def on_insert_range(
     doc: Doc,
-    parent: DocNode,
+    parent: AtomNode,
     slot_name: str,
     position: str,
-    nodes: list[DocNode],
+    nodes: list[AtomNode],
 ) -> None:
     """Record insert operations with slot name."""
-    new_prev: DocNode | None = None
-    new_next: DocNode | None = None
+    new_prev: AtomNode | None = None
+    new_next: AtomNode | None = None
 
     if position == "append":
         new_prev = parent._slot_last.get(slot_name)
@@ -144,9 +144,9 @@ def on_insert_range(
 
 def on_insert_range_before(
     doc: Doc,
-    target: DocNode,
+    target: AtomNode,
     slot_name: str,
-    nodes: list[DocNode],
+    nodes: list[AtomNode],
 ) -> None:
     """Record insert-before operations with slot name."""
     parent = target._parent
@@ -198,7 +198,7 @@ def on_insert_range_before(
 # --- Delete ops ---
 
 
-def _copy_deleted_to_diff(doc: Doc, node: DocNode) -> None:
+def _copy_deleted_to_diff(doc: Doc, node: AtomNode) -> None:
     diff = doc._diff
     was_inserted = node.id in diff.inserted
     if was_inserted:
@@ -213,7 +213,7 @@ def _copy_deleted_to_diff(doc: Doc, node: DocNode) -> None:
         diff.deleted[node.id] = node
 
 
-def on_delete_range(doc: Doc, start_node: DocNode, end_node: DocNode) -> None:
+def on_delete_range(doc: Doc, start_node: AtomNode, end_node: AtomNode) -> None:
     from ._range import _detach_range, _iter_range, _descendants_inclusive
 
     operations = doc._operations[0]
@@ -256,7 +256,7 @@ def on_delete_range(doc: Doc, start_node: DocNode, end_node: DocNode) -> None:
             for desc_slot in desc._slot_order:
                 if desc._slot_first.get(desc_slot) is not None:
                     child_json: list[tuple[str, str]] = []
-                    child: DocNode | None = desc._slot_first.get(desc_slot)
+                    child: AtomNode | None = desc._slot_first.get(desc_slot)
                     while child is not None:
                         _copy_deleted_to_diff(doc, child)
                         child_json.append((child.id, child._node_type))
@@ -273,12 +273,12 @@ def on_delete_range(doc: Doc, start_node: DocNode, end_node: DocNode) -> None:
 
 def on_move_range(
     doc: Doc,
-    start_node: DocNode,
-    end_node: DocNode,
-    new_parent: DocNode,
+    start_node: AtomNode,
+    end_node: AtomNode,
+    new_parent: AtomNode,
     new_slot: str,
-    new_prev: DocNode | None,
-    new_next: DocNode | None,
+    new_prev: AtomNode | None,
+    new_next: AtomNode | None,
 ) -> None:
     from ._range import _iter_range
 

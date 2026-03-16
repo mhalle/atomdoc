@@ -8,7 +8,7 @@ T = TypeVar("T")
 
 
 class Array(list[T], Generic[T]):
-    """Type marker for a named child slot on a DocNode.
+    """Type marker for a named child slot on a AtomNode.
 
     Never instantiated at runtime. ``__init_subclass__`` inspects the
     annotation and wires up a per-slot linked list + ChildrenView property.

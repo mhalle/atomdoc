@@ -3,7 +3,7 @@
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from atomdoc import Doc, DocNode
+from atomdoc import Doc, AtomNode
 
 
 class Color(BaseModel, frozen=True):
@@ -12,7 +12,7 @@ class Color(BaseModel, frozen=True):
     b: int = 0
 
 
-class DescNode(DocNode, node_type="test_desc"):
+class DescNode(AtomNode, node_type="test_desc"):
     name: str = ""
     count: int = 0
     color: Color = Color()

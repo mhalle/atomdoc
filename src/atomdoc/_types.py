@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from ._node import DocNode
+    from ._node import AtomNode
 
 # Lifecycle stages
 LifeCycleStage = Literal[
@@ -40,7 +40,7 @@ class Diff:
 
     def __init__(self) -> None:
         self.inserted: set[str] = set()
-        self.deleted: dict[str, DocNode] = {}
+        self.deleted: dict[str, AtomNode] = {}
         self.moved: set[str] = set()
         self.updated: set[str] = set()
 
@@ -64,5 +64,5 @@ class ChangeEvent:
 # JSON document format (new — dict-based children):
 # [doc_id, root_type, {state}, {"slot1": [...], "slot2": [...]}]
 # Each child: [node_id, node_type, {state}] or [node_id, node_type, {state}, {slots}]
-JsonDocNode = list[Any]
+JsonAtomNode = list[Any]
 JsonDoc = list[Any]

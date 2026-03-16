@@ -201,9 +201,9 @@ class TestValidationWithUndo:
 class TestPlainClassNoValidation:
     def test_plain_class_no_validator_model(self):
         """@node on a plain class should not have a validator model."""
-        from atomdoc import DocNode
+        from atomdoc import AtomNode
 
-        class PlainNode(DocNode, node_type="plain_test"):
+        class PlainNode(AtomNode, node_type="plain_test"):
             x: int = 0
 
         assert PlainNode._validator_model is None

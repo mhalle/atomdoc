@@ -2,10 +2,10 @@
 
 import pytest
 
-from atomdoc import Doc, DocNode
+from atomdoc import Doc, AtomNode
 
 
-class TextNode(DocNode, node_type="text_m"):
+class TextNode(AtomNode, node_type="text_m"):
     value: str = ""
 
 

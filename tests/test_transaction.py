@@ -2,10 +2,10 @@
 
 import pytest
 
-from atomdoc import Doc, DocNode, ChangeEvent
+from atomdoc import Doc, AtomNode, ChangeEvent
 
 
-class TxNode(DocNode, node_type="tx_node"):
+class TxNode(AtomNode, node_type="tx_node"):
     value: str = ""
 
 

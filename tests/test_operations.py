@@ -1,9 +1,9 @@
 """Tests for operation tracking."""
 
-from atomdoc import Doc, DocNode, ChangeEvent
+from atomdoc import Doc, AtomNode, ChangeEvent
 
 
-class OpNode(DocNode, node_type="op_node"):
+class OpNode(AtomNode, node_type="op_node"):
     value: str = ""
 
 

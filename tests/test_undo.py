@@ -2,10 +2,10 @@
 
 import pytest
 
-from atomdoc import Doc, DocNode, UndoManager
+from atomdoc import Doc, AtomNode, UndoManager
 
 
-class UndoNode(DocNode, node_type="undo_node"):
+class UndoNode(AtomNode, node_type="undo_node"):
     value: str = ""
 
 

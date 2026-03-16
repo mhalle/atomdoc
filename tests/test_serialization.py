@@ -3,7 +3,7 @@
 import pytest
 from pydantic import BaseModel
 
-from atomdoc import Doc, DocNode
+from atomdoc import Doc, AtomNode
 
 
 class Color(BaseModel, frozen=True):
@@ -12,7 +12,7 @@ class Color(BaseModel, frozen=True):
     b: int = 0
 
 
-class SerNode(DocNode, node_type="ser_node"):
+class SerNode(AtomNode, node_type="ser_node"):
     title: str = ""
     color: Color = Color()
     data: bytes = b""

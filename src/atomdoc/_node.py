@@ -1,4 +1,4 @@
-"""DocNode base class — plain Python objects with Pydantic-powered schemas."""
+"""AtomNode base class — plain Python objects with Pydantic-powered schemas."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ _MISSING = object()
 
 
 class SlotDef:
-    """Definition of a named child slot on a DocNode class."""
+    """Definition of a named child slot on a AtomNode class."""
 
     __slots__ = ("name", "allowed_type")
 
@@ -47,10 +47,10 @@ class SlotDescriptor:
         raise AttributeError(f"Cannot assign to slot '{self.name}' directly; use .append(), .insert(), etc.")
 
 
-class DocNode:
+class AtomNode:
     """Base class for all document nodes.
 
-    Subclass with ``class MyNode(DocNode, node_type="my_type"):`` to define
+    Subclass with ``class MyNode(AtomNode, node_type="my_type"):`` to define
     a node type. Fields are declared as class-level annotations with defaults.
     Array[T] fields become named child slots.
     """
@@ -70,13 +70,13 @@ class DocNode:
     id: str
     _state: dict[str, Any]
     _doc_ref: Any  # Doc | None
-    _parent: DocNode | None
+    _parent: AtomNode | None
     _slot_name: str | None  # which slot of parent this node belongs to
-    _prev_sibling: DocNode | None
-    _next_sibling: DocNode | None
-    # Per-slot first/last pointers: {slot_name: DocNode | None}
-    _slot_first: dict[str, DocNode | None]
-    _slot_last: dict[str, DocNode | None]
+    _prev_sibling: AtomNode | None
+    _next_sibling: AtomNode | None
+    # Per-slot first/last pointers: {slot_name: AtomNode | None}
+    _slot_first: dict[str, AtomNode | None]
+    _slot_last: dict[str, AtomNode | None]
 
     def __init_subclass__(cls, node_type: str | None = None, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -95,7 +95,7 @@ class DocNode:
         defaults: dict[str, Any] = {}
 
         for base in reversed(cls.__mro__):
-            if base is DocNode or base is object:
+            if base is AtomNode or base is object:
                 continue
             base_annotations = getattr(base, "__annotations__", {})
             for name, ann in base_annotations.items():
@@ -198,8 +198,8 @@ class DocNode:
         object.__setattr__(self, "_prev_sibling", None)
         object.__setattr__(self, "_next_sibling", None)
         object.__setattr__(self, "_snapshot", None)
-        slot_first: dict[str, DocNode | None] = {}
-        slot_last: dict[str, DocNode | None] = {}
+        slot_first: dict[str, AtomNode | None] = {}
+        slot_last: dict[str, AtomNode | None] = {}
         for name in self._slot_order:
             slot_first[name] = None
             slot_last[name] = None
@@ -218,7 +218,7 @@ class DocNode:
         object.__setattr__(self, "_slot_last", {})
 
         state: dict[str, Any] = {}
-        slots: dict[str, list[DocNode]] = {}
+        slots: dict[str, list[AtomNode]] = {}
 
         # Apply defaults for state fields
         for name, default in self._field_defaults.items():
@@ -245,7 +245,7 @@ class DocNode:
 
     # --- Range ---
 
-    def to(self, later_sibling: DocNode) -> NodeRange:
+    def to(self, later_sibling: AtomNode) -> NodeRange:
         """Create a range from this node to ``later_sibling`` (inclusive)."""
         return NodeRange(self, later_sibling)
 
@@ -255,11 +255,11 @@ class DocNode:
         """Delete this node and all its descendants."""
         self.to(self).delete()
 
-    def move(self, target: DocNode, slot_name: str, position: str = "append") -> None:
+    def move(self, target: AtomNode, slot_name: str, position: str = "append") -> None:
         """Move this node to a slot on target."""
         self.to(self).move(target, slot_name, position)  # type: ignore[arg-type]
 
-    def insert_after(self, *nodes: DocNode) -> None:
+    def insert_after(self, *nodes: AtomNode) -> None:
         """Insert nodes after this node in the same slot."""
         doc = self._doc_ref
         if doc is None:
@@ -270,7 +270,7 @@ class DocNode:
             raise RuntimeError("Node has no parent slot")
         doc._insert_into_slot(parent, slot, "after", list(nodes), target=self)
 
-    def insert_before(self, *nodes: DocNode) -> None:
+    def insert_before(self, *nodes: AtomNode) -> None:
         """Insert nodes before this node in the same slot."""
         doc = self._doc_ref
         if doc is None:
@@ -281,7 +281,7 @@ class DocNode:
             raise RuntimeError("Node has no parent slot")
         doc._insert_into_slot(parent, slot, "before", list(nodes), target=self)
 
-    def replace(self, *nodes: DocNode) -> None:
+    def replace(self, *nodes: AtomNode) -> None:
         """Replace this node with the given nodes."""
         prev = self._prev_sibling
         next_sib = self._next_sibling

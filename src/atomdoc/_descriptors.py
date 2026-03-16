@@ -1,4 +1,4 @@
-"""StateDescriptor — intercepts attribute access on DocNode instances."""
+"""StateDescriptor — intercepts attribute access on AtomNode instances."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pydantic import TypeAdapter
 
 
 class StateDescriptor:
-    """Descriptor installed on DocNode subclasses for each declared field.
+    """Descriptor installed on AtomNode subclasses for each declared field.
 
     - ``__get__`` reads from ``node._state`` (plain value).
     - ``__set__`` validates via TypeAdapter, then delegates to

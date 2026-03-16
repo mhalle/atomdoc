@@ -1,9 +1,9 @@
 """Tests ported from docnode/readonly.test.ts — traversal and navigation."""
 
-from atomdoc import Doc, DocNode
+from atomdoc import Doc, AtomNode
 
 
-class TextNode(DocNode, node_type="text_tr"):
+class TextNode(AtomNode, node_type="text_tr"):
     value: str = ""
 
 
@@ -204,7 +204,7 @@ class TestIsinstance:
         doc = setup_tree()
         for child in doc.root.children:
             assert isinstance(child, TextNode)
-            assert isinstance(child, DocNode)
+            assert isinstance(child, AtomNode)
 
     def test_isinstance_root(self):
         doc = setup_tree()

@@ -3,10 +3,10 @@
 import pytest
 from ulid import ULID
 
-from atomdoc import Doc, DocNode, Extension, UndoManager
+from atomdoc import Doc, AtomNode, Extension, UndoManager
 
 
-class TextNode(DocNode, node_type="text_lp"):
+class TextNode(AtomNode, node_type="text_lp"):
     value: str = ""
 
 

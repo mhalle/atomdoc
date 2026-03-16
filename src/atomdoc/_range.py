@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ._node import DocNode
+    from ._node import AtomNode
 
 
 class NodeRange:
@@ -14,12 +14,12 @@ class NodeRange:
 
     __slots__ = ("_start", "_end")
 
-    def __init__(self, start: DocNode, end: DocNode) -> None:
+    def __init__(self, start: AtomNode, end: AtomNode) -> None:
         self._start = start
         self._end = end
 
-    def __iter__(self) -> Iterator[DocNode]:
-        current: DocNode | None = self._start
+    def __iter__(self) -> Iterator[AtomNode]:
+        current: AtomNode | None = self._start
         while current is not None:
             yield current
             if current is self._end:
@@ -50,7 +50,7 @@ class NodeRange:
 
         with_transaction(doc, _do)
 
-    def move(self, target: DocNode, slot_name: str, position: str = "append") -> None:
+    def move(self, target: AtomNode, slot_name: str, position: str = "append") -> None:
         """Move all nodes in the range to a slot on target."""
         doc = self._start._doc_ref
         if doc is None:
@@ -73,8 +73,8 @@ class NodeRange:
                     raise ValueError("Target is descendant of the range")
                 anc = anc._parent
 
-            new_prev: DocNode | None = None
-            new_next: DocNode | None = None
+            new_prev: AtomNode | None = None
+            new_next: AtomNode | None = None
 
             if position == "append":
                 if target._slot_last.get(slot_name) is self._end:
@@ -117,9 +117,9 @@ class NodeRange:
         with_transaction(doc, _do)
 
 
-def _iter_range(start: DocNode, end: DocNode) -> Iterator[DocNode]:
+def _iter_range(start: AtomNode, end: AtomNode) -> Iterator[AtomNode]:
     """Iterate siblings from start to end (inclusive)."""
-    current: DocNode | None = start
+    current: AtomNode | None = start
     while current is not None:
         yield current
         if current is end:
@@ -130,7 +130,7 @@ def _iter_range(start: DocNode, end: DocNode) -> Iterator[DocNode]:
     )
 
 
-def _descendants_inclusive(node: DocNode) -> Iterator[DocNode]:
+def _descendants_inclusive(node: AtomNode) -> Iterator[AtomNode]:
     """Depth-first traversal of node and all its descendants."""
     yield node
     for slot_name in node._slot_order:
@@ -140,7 +140,7 @@ def _descendants_inclusive(node: DocNode) -> Iterator[DocNode]:
             child = child._next_sibling
 
 
-def _descendants(node: DocNode) -> Iterator[DocNode]:
+def _descendants(node: AtomNode) -> Iterator[AtomNode]:
     """Depth-first traversal of descendants (excludes node itself)."""
     for slot_name in node._slot_order:
         child = node._slot_first.get(slot_name)
@@ -150,7 +150,7 @@ def _descendants(node: DocNode) -> Iterator[DocNode]:
             child = child._next_sibling
 
 
-def _detach_range(start: DocNode, end: DocNode) -> None:
+def _detach_range(start: AtomNode, end: AtomNode) -> None:
     """Unlink a range of siblings from the tree."""
     old_prev = start._prev_sibling
     old_next = end._next_sibling

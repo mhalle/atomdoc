@@ -3,7 +3,7 @@
 import pytest
 from pydantic import BaseModel
 
-from atomdoc import Doc, DocNode, Array, node, UndoManager
+from atomdoc import Doc, AtomNode, Array, node, UndoManager
 
 
 # --- Schema definitions using @node decorator ---
@@ -45,7 +45,7 @@ def make_doc():
 
 class TestNodeDecorator:
     def test_creates_docnode_subclass(self):
-        assert issubclass(Annotation, DocNode)
+        assert issubclass(Annotation, AtomNode)
         assert Annotation._node_type == "Annotation"
 
     def test_preserves_class_name(self):

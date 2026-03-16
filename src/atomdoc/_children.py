@@ -6,10 +6,10 @@ from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, overload
 
 if TYPE_CHECKING:
-    from ._node import DocNode
+    from ._node import AtomNode
 
 
-class ChildrenView(Sequence["DocNode"]):
+class ChildrenView(Sequence["AtomNode"]):
     """Sequence view over a named slot's children.
 
     Supports len, indexing, slicing, iteration, truthiness, containment,
@@ -18,7 +18,7 @@ class ChildrenView(Sequence["DocNode"]):
 
     __slots__ = ("_node", "_slot_name")
 
-    def __init__(self, node: DocNode, slot_name: str) -> None:
+    def __init__(self, node: AtomNode, slot_name: str) -> None:
         self._node = node
         self._slot_name = slot_name
 
@@ -31,11 +31,11 @@ class ChildrenView(Sequence["DocNode"]):
         return count
 
     @overload
-    def __getitem__(self, index: int) -> DocNode: ...
+    def __getitem__(self, index: int) -> AtomNode: ...
     @overload
-    def __getitem__(self, index: slice) -> list[DocNode]: ...
+    def __getitem__(self, index: slice) -> list[AtomNode]: ...
 
-    def __getitem__(self, index: int | slice) -> DocNode | list[DocNode]:
+    def __getitem__(self, index: int | slice) -> AtomNode | list[AtomNode]:
         if isinstance(index, slice):
             return list(self)[index]
         if index < 0:
@@ -50,7 +50,7 @@ class ChildrenView(Sequence["DocNode"]):
             i += 1
         raise IndexError(f"index {index} out of range for slot '{self._slot_name}'")
 
-    def __iter__(self) -> Iterator[DocNode]:
+    def __iter__(self) -> Iterator[AtomNode]:
         current = self._node._slot_first.get(self._slot_name)
         while current is not None:
             yield current
@@ -71,21 +71,21 @@ class ChildrenView(Sequence["DocNode"]):
 
     # --- Mutation methods ---
 
-    def append(self, *nodes: DocNode) -> None:
+    def append(self, *nodes: AtomNode) -> None:
         """Append nodes to the end of this slot."""
         doc = self._node._doc_ref
         if doc is None:
             raise RuntimeError("Node is not attached to a document")
         doc._insert_into_slot(self._node, self._slot_name, "append", list(nodes))
 
-    def prepend(self, *nodes: DocNode) -> None:
+    def prepend(self, *nodes: AtomNode) -> None:
         """Prepend nodes to the beginning of this slot."""
         doc = self._node._doc_ref
         if doc is None:
             raise RuntimeError("Node is not attached to a document")
         doc._insert_into_slot(self._node, self._slot_name, "prepend", list(nodes))
 
-    def insert(self, index: int, node: DocNode) -> None:
+    def insert(self, index: int, node: AtomNode) -> None:
         """Insert a node at the given index in this slot."""
         if index == 0:
             self.prepend(node)

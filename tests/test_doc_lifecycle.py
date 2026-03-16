@@ -2,10 +2,10 @@
 
 import pytest
 
-from atomdoc import Doc, DocNode, ChangeEvent
+from atomdoc import Doc, AtomNode, ChangeEvent
 
 
-class ItemNode(DocNode, node_type="item_lc"):
+class ItemNode(AtomNode, node_type="item_lc"):
     name: str = ""
 
 
@@ -34,7 +34,7 @@ def test_create_node(doc):
 
 
 def test_create_unregistered_node(doc):
-    class OtherNode(DocNode, node_type="other_lc"):
+    class OtherNode(AtomNode, node_type="other_lc"):
         x: int = 0
 
     with pytest.raises(ValueError, match="not registered"):

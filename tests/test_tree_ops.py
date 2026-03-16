@@ -2,14 +2,14 @@
 
 import pytest
 
-from atomdoc import Doc, DocNode
+from atomdoc import Doc, AtomNode
 
 
-class RootNode(DocNode, node_type="root_tree"):
+class RootNode(AtomNode, node_type="root_tree"):
     title: str = ""
 
 
-class LeafNode(DocNode, node_type="leaf_tree"):
+class LeafNode(AtomNode, node_type="leaf_tree"):
     label: str = ""
 
 

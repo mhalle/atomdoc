@@ -1,20 +1,41 @@
 # AtomDoc
 
-Local-first document models for Python with type-safe schemas, semantic
-atomicity, and operation tracking.
+> **This is a conceptual prototype for a collaborative document system
+> based on Pydantic models. It is both conceptually and directly based on
+> [DocuKit](https://github.com/docukit/docukit). This project is fully
+> unsupported and intended for exploration only.**
 
-AtomDoc gives you a tree of typed nodes where reads and writes feel like
-plain Python — attribute access, assignment, iteration, `isinstance` —
-while the library invisibly tracks operations, enforces atomicity
-boundaries, and batches changes into transactions.
+AtomDoc explores local-first document models for Python with type-safe
+schemas, semantic atomicity, and operation tracking.
 
-## Install
+## What makes this distinct
 
-```
-pip install atomdoc
-```
+An AtomDoc schema **dictates the shape of a document** — its node types,
+their fields, their allowed children, and their default values. Pydantic
+is used throughout: to define the schema, to serialize and deserialize
+documents, and to validate state at transaction boundaries.
 
-Requires Python 3.12+ and Pydantic 2.
+The key idea is **semantic atomicity**: Pydantic `frozen=True` models
+define the boundary of mutation. A frozen model like `Color` must be
+replaced as a whole — there is no operation that changes just the red
+channel. This prevents invalid transient states: a user cannot produce a
+malformed color by editing one component at a time or by typing half a
+hex string. The operation layer enforces that the smallest unit of change
+for a `Color` is the entire `Color`. (An editing UI must enforce the
+same boundary — presenting color edits as a single atomic action, not
+as three independent field edits.)
+
+This means the schema does double duty: it describes the data **and** it
+describes the granularity of change. Primitive fields (`str`, `int`,
+`float`, `bool`) are independently editable — concurrent edits to
+different fields merge cleanly. Frozen model fields are atomic — they
+are replaced as a unit, with last-write-wins on conflict. The merge
+semantics are derived from the type annotations, not configured
+separately.
+
+## Requirements
+
+Python 3.12+ and Pydantic 2.
 
 ## Quick start
 
@@ -326,12 +347,12 @@ class MyNode:
 ```
 
 The node type name defaults to the class name. The class can also extend
-`DocNode` directly if you prefer:
+`AtomNode` directly if you prefer:
 
 ```python
-from atomdoc import DocNode
+from atomdoc import AtomNode
 
-class MyNode(DocNode, node_type="MyNode"):
+class MyNode(AtomNode, node_type="MyNode"):
     title: str = ""
     items: Array[OtherNode] = []
 ```

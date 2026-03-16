@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel
 
-from atomdoc import Doc, DocNode, UndoManager, ChangeEvent
+from atomdoc import Doc, AtomNode, UndoManager, ChangeEvent
 
 
 class Color(BaseModel, frozen=True):
@@ -11,11 +11,11 @@ class Color(BaseModel, frozen=True):
     b: int = 0
 
 
-class PageNode(DocNode, node_type="page_int"):
+class PageNode(AtomNode, node_type="page_int"):
     title: str = ""
 
 
-class AnnotationNode(DocNode, node_type="annotation_int"):
+class AnnotationNode(AtomNode, node_type="annotation_int"):
     label: str = ""
     color: Color = Color()
 
