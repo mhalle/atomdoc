@@ -63,8 +63,8 @@ class Page:
     annotations: Array[Annotation] = []
 ```
 
-`Array[T]` declares a named child slot — an ordered collection of child
-nodes. Everything else is a state field.
+`Array[T]` declares an ordered collection of child nodes. Everything
+else is a state field.
 
 ### Create a document
 
@@ -78,8 +78,7 @@ doc = Doc(Page(
 ))
 ```
 
-Node types are auto-discovered from slot declarations — no registration
-needed.
+Node types are auto-discovered from the schema — no registration needed.
 
 ### Read like plain Python
 
@@ -95,8 +94,7 @@ for ann in doc.root.annotations:
     print(ann.label, ann.color)
 ```
 
-Slot access supports indexing, slicing, iteration, `len`, `bool`, and
-`in` — it looks and feels like a list.
+Arrays support indexing, slicing, iteration, `len`, `bool`, and `in`.
 
 ### Mutate
 
@@ -113,7 +111,7 @@ with doc.transaction():
     doc.root.annotations.clear()                    # remove all
 ```
 
-### Multiple named slots
+### Multiple child arrays
 
 A node can have multiple independently managed child collections:
 
@@ -137,12 +135,11 @@ len(doc.root.annotations)  # 1
 len(doc.root.notes)        # 1
 ```
 
-Slots are independent — each has its own ordering. Siblings within one
-slot don't cross into another.
+Each array is independent — its own ordering, its own operations.
 
 ### Nested nodes
 
-Nodes with slots can be nested arbitrarily:
+Nodes can be nested arbitrarily:
 
 ```python
 @node
@@ -171,24 +168,18 @@ doc = Doc(Document(
 doc.root.sections[0].pages[0].annotations[0].label  # "note"
 ```
 
-### Serialize and restore
+### Serialize
+
+Two formats — clean JSON for reading, wire format for persistence:
 
 ```python
-data = doc.to_json()
+# Clean JSON — no internal IDs, just data
+doc.to_json()
+# {"title": "Hello", "annotations": [{"label": "Important", "color": {"r": 255, "g": 0, "b": 0}}]}
 
-doc2 = Doc.from_json(data, root_type=Page)
-assert doc2.root.title == "Hello"
-assert doc2.root.annotations[0].color.r == 255
-```
-
-The JSON format uses a dict for slot children:
-
-```json
-["doc-id", "Page", {"title": "\"Hello\""}, {
-  "annotations": [
-    ["ann-id", "Annotation", {"label": "\"Important\"", "color": "{\"r\": 255, \"g\": 0, \"b\": 0}"}]
-  ]
-}]
+# Wire format — includes IDs, for dump/restore and operation replay
+wire = doc.dump()
+doc2 = Doc.restore(wire, root_type=Page)
 ```
 
 ### Undo / redo
@@ -219,12 +210,12 @@ doc.on_change(lambda event: print(
 ```
 
 Change events fire once per transaction, after all mutations and
-normalization are complete.
+normalization are complete. Each event carries forward and inverse
+operations for sync and undo.
 
 ### Transactions
 
-All mutations occur within a transaction. Explicit transactions batch
-multiple changes into a single event:
+Explicit transactions batch multiple changes into a single event:
 
 ```python
 with doc.transaction():
@@ -234,13 +225,13 @@ with doc.transaction():
 # one change event fires here
 ```
 
-Bare assignments open and commit an implicit transaction:
+Bare assignments auto-commit immediately:
 
 ```python
-doc.root.title = "B"  # auto-committed immediately
+doc.root.title = "B"  # committed on its own
 ```
 
-If an exception occurs inside a transaction, all mutations roll back:
+Exceptions roll back the entire transaction:
 
 ```python
 with doc.transaction():
@@ -263,9 +254,6 @@ be valid.
 class Annotation(BaseModel):
     opacity: float = Field(ge=0.0, le=1.0, default=1.0)
 ```
-
-`Field(ge=0, le=1)` is enforced both per-write (via `TypeAdapter`) and
-at commit time (via `model_validate`).
 
 ### Field validators
 
@@ -297,102 +285,72 @@ class Annotation(BaseModel):
         return self
 ```
 
-This allows transient invalid states within a transaction:
+Invalid intermediate states within a transaction are fine:
 
 ```python
 with doc.transaction():
     ann.visible = True
-    ann.opacity = 0.0    # invalid intermediate state — OK
+    ann.opacity = 0.0    # invalid here — OK
     ann.visible = False   # fixed before commit
 # final state is valid — commit succeeds
 ```
 
-If validation fails at commit, the entire transaction rolls back and no
-change event fires.
+If validation fails at commit, the entire transaction rolls back.
 
 ### Plain classes skip validation
 
-`@node` on a plain class (not a `BaseModel`) creates nodes without
-model-level validation. Per-field type checking via `TypeAdapter` still
-applies.
-
-```python
-@node
-class Simple:
-    x: int = 0
-    y: str = ""
-```
+`@node` on a plain class (not a `BaseModel`) works without model-level
+validation. Per-field type checking still applies.
 
 ## The `@node` decorator
 
 `@node` converts any class into a document node type:
 
 ```python
-# Plain class — no Pydantic validation
 @node
 class MyNode:
     title: str = ""
     items: Array[OtherNode] = []
 
-# BaseModel — full Pydantic validation at commit time
 @node
-class MyNode(BaseModel):
+class MyNode(BaseModel):       # with Pydantic validation
     title: str = ""
-    items: Array[OtherNode] = []
 
-# Custom type name
-@node("my_custom_type")
+@node("my_custom_type")        # custom type name
 class MyNode:
     title: str = ""
 ```
 
-The node type name defaults to the class name. The class can also extend
-`AtomNode` directly if you prefer:
-
-```python
-from atomdoc import AtomNode
-
-class MyNode(AtomNode, node_type="MyNode"):
-    title: str = ""
-    items: Array[OtherNode] = []
-```
+The node type name defaults to the class name.
 
 ## Tree navigation
 
-Navigation is through the doc, not on the node:
+Navigation goes through the doc:
 
 ```python
-doc.parent(ann)               # parent node
-doc.next_sibling(ann)         # next sibling within the same slot
-doc.prev_sibling(ann)         # previous sibling within the same slot
+doc.parent(ann)
+doc.next_sibling(ann)
+doc.prev_sibling(ann)
 
-for ancestor in doc.ancestors(ann):       # walk up to root
+for ancestor in doc.ancestors(ann):
     ...
 
-for desc in doc.descendants(doc.root):    # depth-first, all slots
-    ...
-
-for sib in doc.next_siblings(ann):        # forward within slot
-    ...
-
-for sib in doc.prev_siblings(ann):        # backward within slot
+for desc in doc.descendants(doc.root):
     ...
 ```
 
-`descendants()` traverses all slots in declaration order. Nodes
-themselves are pure data — the doc owns the tree structure.
+Nodes are pure data — the doc owns the tree structure.
 
 ## Field tiers
 
-The schema defines the granularity of change. The tier is inferred
-automatically from the type annotation:
+The tier is inferred automatically from the type annotation:
 
 | Tier | Python type | Behavior |
 |------|-------------|----------|
 | **Mergeable** | `str`, `int`, `float`, `bool` | One operation per field. Concurrent edits to different fields merge. |
 | **Atomic** | `frozen=True` Pydantic model | Replaced as a unit. Last-write-wins on conflict. |
 | **Opaque** | `bytes` | Stored as base64, not diffed or merged. |
-| **Structure** | `Array[T]` | Named child slot. Per-node insert/delete/move operations. |
+| **Structure** | `Array[T]` | Ordered child collection. Per-node insert/delete/move operations. |
 
 ## Extensions
 
