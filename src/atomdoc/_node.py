@@ -107,17 +107,20 @@ class AtomNode:
                     if not isinstance(val, (StateDescriptor, SlotDescriptor)):
                         defaults[name] = val
 
-        # Resolve string annotations
+        # Resolve string annotations (needed for ``from __future__ import
+        # annotations``).  We only resolve the user-declared field names,
+        # not the full MRO, to avoid needing atomdoc internals in the
+        # namespace.
         module = sys.modules.get(cls.__module__, None)
-        globalns = getattr(module, "__dict__", {}) if module else {}
-        try:
-            resolved = get_type_hints(cls, globalns=globalns, include_extras=True)
-        except Exception:
-            resolved = {}
-
-        for name in list(annotations):
-            if name in resolved:
-                annotations[name] = resolved[name]
+        if module is not None:
+            globalns = module.__dict__
+            for name in list(annotations):
+                ann = annotations[name]
+                if isinstance(ann, str):
+                    try:
+                        annotations[name] = eval(ann, globalns)  # noqa: S307
+                    except Exception:
+                        pass
 
         # Separate Array fields (slots) from state fields
         state_annotations: dict[str, Any] = {}
@@ -355,15 +358,20 @@ class AtomNode:
 
     # --- Plain JSON serialization (for document format) ---
 
-    def _state_to_json_plain(self) -> dict[str, Any]:
-        """Serialize non-default state fields to plain JSON values (no double-stringify)."""
+    def _state_to_json_plain(self, include_defaults: bool = False) -> dict[str, Any]:
+        """Serialize state fields to plain JSON values (no double-stringify).
+
+        If ``include_defaults`` is False (default), fields matching their
+        default value are omitted.
+        """
         from pydantic import BaseModel as _BM
 
         result: dict[str, Any] = {}
         for key, value in self._state.items():
-            default = self._field_defaults.get(key, _MISSING)
-            if default is not _MISSING and value == default:
-                continue
+            if not include_defaults:
+                default = self._field_defaults.get(key, _MISSING)
+                if default is not _MISSING and value == default:
+                    continue
             if isinstance(value, _BM):
                 result[key] = value.model_dump(mode="json")
             elif isinstance(value, bytes):

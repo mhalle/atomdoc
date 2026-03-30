@@ -1,14 +1,16 @@
 """Tests for operation tracking."""
 
-from atomdoc import Doc, AtomNode, ChangeEvent
+from atomdoc import Doc, Array, ChangeEvent, node
 
 
-class OpNode(AtomNode, node_type="op_node"):
+@node
+class OpNode:
     value: str = ""
+    children: Array["OpNode"] = []
 
 
 def test_state_patch_recorded():
-    doc = Doc(root_type="op_node", nodes=[OpNode])
+    doc = Doc(root_type="OpNode", nodes=[OpNode])
     events: list[ChangeEvent] = []
     doc.on_change(lambda ev: events.append(ev))
 
@@ -22,13 +24,13 @@ def test_state_patch_recorded():
 
 
 def test_insert_op_recorded():
-    doc = Doc(root_type="op_node", nodes=[OpNode])
+    doc = Doc(root_type="OpNode", nodes=[OpNode])
     events: list[ChangeEvent] = []
     doc.on_change(lambda ev: events.append(ev))
 
     with doc.transaction():
         n = doc.create_node(OpNode)
-        doc.root.append(n)
+        doc.root.children.append(n)
 
     assert len(events) == 1
     ordered = events[0].operations[0]
@@ -36,10 +38,10 @@ def test_insert_op_recorded():
 
 
 def test_delete_op_recorded():
-    doc = Doc(root_type="op_node", nodes=[OpNode])
+    doc = Doc(root_type="OpNode", nodes=[OpNode])
     with doc.transaction():
         n = doc.create_node(OpNode)
-        doc.root.append(n)
+        doc.root.children.append(n)
 
     events: list[ChangeEvent] = []
     doc.on_change(lambda ev: events.append(ev))
@@ -53,22 +55,22 @@ def test_delete_op_recorded():
 
 
 def test_diff_tracks_inserted():
-    doc = Doc(root_type="op_node", nodes=[OpNode])
+    doc = Doc(root_type="OpNode", nodes=[OpNode])
     events: list[ChangeEvent] = []
     doc.on_change(lambda ev: events.append(ev))
 
     with doc.transaction():
         n = doc.create_node(OpNode)
-        doc.root.append(n)
+        doc.root.children.append(n)
 
     assert n.id in events[0].diff.inserted
 
 
 def test_diff_tracks_deleted():
-    doc = Doc(root_type="op_node", nodes=[OpNode])
+    doc = Doc(root_type="OpNode", nodes=[OpNode])
     with doc.transaction():
         n = doc.create_node(OpNode)
-        doc.root.append(n)
+        doc.root.children.append(n)
 
     events: list[ChangeEvent] = []
     doc.on_change(lambda ev: events.append(ev))
@@ -81,7 +83,7 @@ def test_diff_tracks_deleted():
 
 
 def test_diff_tracks_updated():
-    doc = Doc(root_type="op_node", nodes=[OpNode])
+    doc = Doc(root_type="OpNode", nodes=[OpNode])
     events: list[ChangeEvent] = []
     doc.on_change(lambda ev: events.append(ev))
 
@@ -92,7 +94,7 @@ def test_diff_tracks_updated():
 
 
 def test_state_revert_removes_patch():
-    doc = Doc(root_type="op_node", nodes=[OpNode])
+    doc = Doc(root_type="OpNode", nodes=[OpNode])
     events: list[ChangeEvent] = []
     doc.on_change(lambda ev: events.append(ev))
 

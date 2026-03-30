@@ -77,8 +77,15 @@ def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNod
             if field_info.default is not None and field_name not in defaults:
                 defaults[field_name] = field_info.default
 
-    # Build namespace for the new class
-    ns: dict[str, Any] = {"__annotations__": annotations}
+    # Build namespace for the new class.
+    # __module__ and __qualname__ must be set before type() because
+    # __init_subclass__ uses __module__ to resolve string annotations
+    # (needed when ``from __future__ import annotations`` is active).
+    ns: dict[str, Any] = {
+        "__annotations__": annotations,
+        "__module__": source_cls.__module__,
+        "__qualname__": source_cls.__qualname__,
+    }
     for name, val in defaults.items():
         ns[name] = val
 
@@ -89,8 +96,6 @@ def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNod
         ns,
         node_type=node_type_name,
     )
-    new_cls.__module__ = source_cls.__module__
-    new_cls.__qualname__ = source_cls.__qualname__
 
     # If the source is a BaseModel, store it as the validator model.
     # This preserves @field_validator, @model_validator, Field constraints, etc.
@@ -605,20 +610,30 @@ class Doc:
 
     # --- Clean JSON (user-facing, no IDs) ---
 
-    def to_json(self, node: AtomNode | None = None) -> dict[str, Any]:
-        """Return clean JSON for a node (default: root). No internal IDs."""
+    def to_json(
+        self, node: AtomNode | None = None, *, include_defaults: bool = False,
+    ) -> dict[str, Any]:
+        """Return clean JSON for a node (default: root). No internal IDs.
+
+        If ``include_defaults`` is True, fields with default values are
+        included in the output.
+        """
         if self._lifecycle_stage not in ("idle", "change"):
             raise RuntimeError("Cannot serialize during an active transaction")
         target = node if node is not None else self._root
-        return _node_to_data(target)
+        return _node_to_data(target, include_defaults=include_defaults)
 
     # --- Wire format (dump/restore, has IDs) ---
 
-    def dump(self) -> JsonDoc:
-        """Serialize to wire format (with IDs) for persistence and sync."""
+    def dump(self, *, include_defaults: bool = False) -> JsonDoc:
+        """Serialize to wire format (with IDs) for persistence and sync.
+
+        If ``include_defaults`` is True, fields with default values are
+        included in the output.
+        """
         if self._lifecycle_stage not in ("idle", "change"):
             raise RuntimeError("Cannot serialize during an active transaction")
-        return _node_to_wire(self._root)
+        return _node_to_wire(self._root, include_defaults=include_defaults)
 
     @classmethod
     def restore(
@@ -681,15 +696,91 @@ class Doc:
                 schemas[node_cls._node_type] = node_cls._schema_model.model_json_schema()
         return schemas
 
+    def atomdoc_schema(self) -> dict[str, Any]:
+        """Export JSON Schema with x-atomdoc extensions.
+
+        Returns a schema document describing all node types and frozen
+        value types, suitable for bootstrapping language-agnostic clients.
+        """
+        from ._tier import _is_frozen_model
+
+        node_types: dict[str, Any] = {}
+        value_types: dict[str, Any] = {}
+
+        for type_name, node_cls in self._node_types.items():
+            entry: dict[str, Any] = {}
+
+            # JSON Schema from field adapters (avoids _schema_model rebuild issues)
+            properties: dict[str, Any] = {}
+            for fname, adapter in node_cls._field_adapters.items():
+                try:
+                    properties[fname] = adapter.json_schema()
+                except Exception:
+                    properties[fname] = {}
+            entry["json_schema"] = {"type": "object", "properties": properties}
+
+            # Field tiers
+            entry["field_tiers"] = dict(node_cls._field_tiers)
+
+            # Slots
+            slots: dict[str, Any] = {}
+            for slot_name, slot_def in node_cls._slot_defs.items():
+                allowed = slot_def.allowed_type
+                if allowed is None:
+                    allowed_name = None
+                elif isinstance(allowed, str):
+                    allowed_name = allowed
+                else:
+                    allowed_name = allowed._node_type
+                slots[slot_name] = {"allowed_type": allowed_name}
+            entry["slots"] = slots
+
+            # Field defaults (JSON-safe)
+            defaults: dict[str, Any] = {}
+            for fname, fdefault in node_cls._field_defaults.items():
+                if fdefault is _MISSING:
+                    continue
+                if isinstance(fdefault, BaseModel):
+                    defaults[fname] = fdefault.model_dump(mode="json")
+                else:
+                    defaults[fname] = fdefault
+            entry["field_defaults"] = defaults
+
+            node_types[type_name] = entry
+
+            # Discover frozen value types from field tiers and adapters
+            for fname, tier in node_cls._field_tiers.items():
+                if tier == "atomic":
+                    # Get the actual type from the adapter's core schema
+                    adapter = node_cls._field_adapters.get(fname)
+                    if adapter is None:
+                        continue
+                    # Walk defaults to find the type
+                    default_val = node_cls._field_defaults.get(fname, _MISSING)
+                    if default_val is not _MISSING and isinstance(default_val, BaseModel):
+                        vtype = type(default_val)
+                        if _is_frozen_model(vtype) and vtype.__name__ not in value_types:
+                            value_types[vtype.__name__] = {
+                                "json_schema": vtype.model_json_schema(),
+                                "frozen": True,
+                            }
+
+        return {
+            "version": 1,
+            "root_type": self._root_type,
+            "node_types": node_types,
+            "value_types": value_types,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _node_to_wire(node: AtomNode) -> JsonDoc:
+def _node_to_wire(node: AtomNode, include_defaults: bool = False) -> JsonDoc:
     """Serialize a node to wire format (with IDs)."""
-    state = node._state_to_json_plain()
+    state = node._state_to_json_plain(include_defaults=include_defaults)
     result: JsonDoc = [node.id, node._node_type, state]
 
     if node._slot_order:
@@ -698,7 +789,7 @@ def _node_to_wire(node: AtomNode) -> JsonDoc:
             children: list[JsonDoc] = []
             child: AtomNode | None = node._slot_first.get(slot_name)
             while child is not None:
-                children.append(_node_to_wire(child))
+                children.append(_node_to_wire(child, include_defaults=include_defaults))
                 child = child._next_sibling
             slots_dict[slot_name] = children
         result.append(slots_dict)
@@ -706,15 +797,16 @@ def _node_to_wire(node: AtomNode) -> JsonDoc:
     return result
 
 
-def _node_to_data(node: AtomNode) -> dict[str, Any]:
+def _node_to_data(node: AtomNode, include_defaults: bool = False) -> dict[str, Any]:
     """Serialize a node to clean JSON (no IDs, just data)."""
     result: dict[str, Any] = {}
 
     # State fields
     for key, value in node._state.items():
-        default = node._field_defaults.get(key, _MISSING)
-        if default is not _MISSING and value == default:
-            continue
+        if not include_defaults:
+            default = node._field_defaults.get(key, _MISSING)
+            if default is not _MISSING and value == default:
+                continue
         from pydantic import BaseModel as _BM
         if isinstance(value, _BM):
             result[key] = value.model_dump(mode="json")
@@ -729,7 +821,7 @@ def _node_to_data(node: AtomNode) -> dict[str, Any]:
         children: list[dict[str, Any]] = []
         child: AtomNode | None = node._slot_first.get(slot_name)
         while child is not None:
-            children.append(_node_to_data(child))
+            children.append(_node_to_data(child, include_defaults=include_defaults))
             child = child._next_sibling
         result[slot_name] = children
 

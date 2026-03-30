@@ -3,19 +3,21 @@
 import pytest
 from ulid import ULID
 
-from atomdoc import Doc, AtomNode, Extension, UndoManager
+from atomdoc import Doc, Array, node, Extension, UndoManager
 
 
-class TextNode(AtomNode, node_type="text_lp"):
+@node
+class TextLP:
     value: str = ""
+    children: Array["TextLP"] = []
 
 
 def make_doc(**kwargs):
-    return Doc(root_type="text_lp", nodes=[TextNode], **kwargs)
+    return Doc(root_type="TextLP", nodes=[TextLP], **kwargs)
 
 
 def text(doc, *values):
-    return [doc.create_node(TextNode, value=v) for v in values]
+    return [doc.create_node(TextLP, value=v) for v in values]
 
 
 def assert_doc(doc, expected):
@@ -57,12 +59,12 @@ class TestNormalize:
             nonlocal normalize_called
             normalize_called = True
 
-        ext = Extension(nodes=[TextNode], normalize=my_normalize)
-        doc = Doc(root_type="text_lp", extensions=[ext])
+        ext = Extension(nodes=[TextLP], normalize=my_normalize)
+        doc = Doc(root_type="TextLP", extensions=[ext])
 
         with doc.transaction():
-            n = doc.create_node(TextNode, value="test")
-            doc.root.append(n)
+            n = doc.create_node(TextLP, value="test")
+            doc.root.children.append(n)
 
         assert normalize_called
 
@@ -75,17 +77,17 @@ class TestNormalize:
         def ensure_child(diff):
             doc_ref = ensure_child._doc
             if not doc_ref.root.children:
-                n = doc_ref.create_node(TextNode, value="default")
-                doc_ref.root.append(n)
+                n = doc_ref.create_node(TextLP, value="default")
+                doc_ref.root.children.append(n)
 
-        ext = Extension(nodes=[TextNode], normalize=ensure_child)
-        doc = Doc(root_type="text_lp", extensions=[ext], strict_mode=False)
+        ext = Extension(nodes=[TextLP], normalize=ensure_child)
+        doc = Doc(root_type="TextLP", extensions=[ext], strict_mode=False)
         ensure_child._doc = doc
 
         # Add and delete to trigger normalize
         with doc.transaction():
-            n = doc.create_node(TextNode, value="temp")
-            doc.root.append(n)
+            n = doc.create_node(TextLP, value="temp")
+            doc.root.children.append(n)
 
         with doc.transaction():
             doc.root.children[0].delete()
@@ -95,17 +97,17 @@ class TestNormalize:
 
     def test_strict_mode_rejects_non_idempotent_normalize(self):
         def bad_normalize(diff):
-            n = bad_normalize._doc.create_node(TextNode, value="added")
-            bad_normalize._doc.root.append(n)
+            n = bad_normalize._doc.create_node(TextLP, value="added")
+            bad_normalize._doc.root.children.append(n)
 
-        ext = Extension(nodes=[TextNode], normalize=bad_normalize)
-        doc = Doc(root_type="text_lp", extensions=[ext], strict_mode=True)
+        ext = Extension(nodes=[TextLP], normalize=bad_normalize)
+        doc = Doc(root_type="TextLP", extensions=[ext], strict_mode=True)
         bad_normalize._doc = doc
 
         with pytest.raises(RuntimeError, match="idempotent"):
             with doc.transaction():
-                n = doc.create_node(TextNode, value="initial")
-                doc.root.append(n)
+                n = doc.create_node(TextLP, value="initial")
+                doc.root.children.append(n)
 
 
 # --- dispose ---
@@ -129,7 +131,7 @@ class TestDispose:
 
         doc.on_change(on_change)
         with doc.transaction():
-            doc.root.append(*text(doc, "1"))
+            doc.root.children.append(*text(doc, "1"))
         assert len(events) == 1
 
 
@@ -139,11 +141,11 @@ class TestTransactions:
     def test_rollback_on_error(self):
         doc = make_doc()
         with doc.transaction():
-            doc.root.append(*text(doc, "1"))
+            doc.root.children.append(*text(doc, "1"))
 
         with pytest.raises(ValueError):
             with doc.transaction():
-                doc.root.append(*text(doc, "2"))
+                doc.root.children.append(*text(doc, "2"))
                 raise ValueError("oops")
 
         assert_doc(doc, ["1"])
@@ -161,15 +163,15 @@ class TestTransactions:
     def test_delete_and_reinsert_is_noop(self):
         doc = make_doc()
         with doc.transaction():
-            doc.root.append(*text(doc, "1"))
+            doc.root.children.append(*text(doc, "1"))
 
         events = []
         doc.on_change(lambda ev: events.append(ev))
 
         with doc.transaction():
             doc.root.children[0]
-            doc.root.append(*text(doc, "x"))
-            doc.root.delete_children()
+            doc.root.children.append(*text(doc, "x"))
+            doc.root.children.clear()
 
         # delete_children removed everything, so no net change from initial
         # Actually this IS a change since we lost "1"
@@ -180,13 +182,13 @@ class TestTransactions:
         doc = make_doc()
 
         def bad_handler(ev):
-            doc.root.append(*text(doc, "sneaky"))
+            doc.root.children.append(*text(doc, "sneaky"))
 
         doc.on_change(bad_handler)
 
         with pytest.raises(RuntimeError, match="change"):
             with doc.transaction():
-                doc.root.append(*text(doc, "trigger"))
+                doc.root.children.append(*text(doc, "trigger"))
 
 
 # --- Undo with tree operations ---
@@ -197,8 +199,8 @@ class TestUndoTreeOps:
         undo = UndoManager(doc)
 
         with doc.transaction():
-            doc.root.append(*text(doc, "1", "2", "3", "4", "5"))
-            doc.root.children[1].append(*text(doc, "2.1", "2.2"))
+            doc.root.children.append(*text(doc, "1", "2", "3", "4", "5"))
+            doc.root.children[1].children.append(*text(doc, "2.1", "2.2"))
 
         state1 = [c.value for c in doc.root.children]
         assert state1 == ["1", "2", "3", "4", "5"]
@@ -208,7 +210,7 @@ class TestUndoTreeOps:
             n2, n3 = doc.root.children[1], doc.root.children[2]
             n2.to(n3).delete()
             # Add children to last
-            doc.root.children[-1].append(*text(doc, "5.1", "5.2"))
+            doc.root.children[-1].children.append(*text(doc, "5.1", "5.2"))
 
         assert_doc(doc, ["1", "4", "5"])
 
@@ -232,7 +234,7 @@ class TestUndoTreeOps:
         undo = UndoManager(doc)
 
         with doc.transaction():
-            doc.root.append(*text(doc, "1", "2", "3"))
+            doc.root.children.append(*text(doc, "1", "2", "3"))
 
         with doc.transaction():
             doc.root.children[1].value = "2 CHANGED"
@@ -250,7 +252,7 @@ class TestUndoTreeOps:
         undo = UndoManager(doc, max_steps=1)
 
         with doc.transaction():
-            doc.root.append(*text(doc, "1", "2"))
+            doc.root.children.append(*text(doc, "1", "2"))
 
         assert_doc(doc, ["1", "2"])
         undo.undo()
@@ -269,8 +271,8 @@ class TestDiffTracking:
         doc.on_change(lambda ev: events.append(ev))
 
         with doc.transaction():
-            n = doc.create_node(TextNode, value="1")
-            doc.root.append(n)
+            n = doc.create_node(TextLP, value="1")
+            doc.root.children.append(n)
             n.value = "1 changed"
 
         assert len(events) == 1
@@ -282,7 +284,7 @@ class TestDiffTracking:
         """A node can be in both diff.moved and diff.updated."""
         doc = make_doc()
         with doc.transaction():
-            doc.root.append(*text(doc, "1", "2", "3"))
+            doc.root.children.append(*text(doc, "1", "2", "3"))
 
         events = []
         doc.on_change(lambda ev: events.append(ev))
@@ -291,7 +293,7 @@ class TestDiffTracking:
         n3 = doc.root.children[2]
         with doc.transaction():
             n1.value = "1 CHANGED"
-            n1.move(n3, "append")
+            n1.move(n3, "children")
 
         diff = events[0].diff
         assert n1.id in diff.moved
@@ -301,8 +303,8 @@ class TestDiffTracking:
         """Deleting a node whose state was updated should not include the state patch."""
         doc = make_doc()
         with doc.transaction():
-            n = doc.create_node(TextNode, value="1")
-            doc.root.append(n)
+            n = doc.create_node(TextLP, value="1")
+            doc.root.children.append(n)
 
         events = []
         doc.on_change(lambda ev: events.append(ev))
@@ -321,14 +323,14 @@ class TestDiffTracking:
 # --- Serialization ported tests ---
 
 class TestSerializationPorted:
-    def test_from_json_round_trip(self):
+    def test_dump_restore_round_trip(self):
         doc = make_doc()
         with doc.transaction():
-            doc.root.append(*text(doc, "1", "2"))
-            doc.root.children[1].append(*text(doc, "2.1", "2.2"))
+            doc.root.children.append(*text(doc, "1", "2"))
+            doc.root.children[1].children.append(*text(doc, "2.1", "2.2"))
 
-        data = doc.to_json()
-        doc2 = Doc.from_json(data, nodes=[TextNode])
+        wire = doc.dump()
+        doc2 = Doc.restore(wire, root_type=TextLP)
 
         assert [c.value for c in doc2.root.children] == ["1", "2"]
         assert [c.value for c in doc2.root.children[1].children] == ["2.1", "2.2"]
@@ -336,29 +338,29 @@ class TestSerializationPorted:
     def test_default_values_not_serialized(self):
         doc = make_doc()
         with doc.transaction():
-            n = doc.create_node(TextNode)  # default value=""
-            doc.root.append(n)
-        data = doc.to_json()
+            n = doc.create_node(TextLP)  # default value=""
+            doc.root.children.append(n)
+        wire = doc.dump()
         # The node's state dict should be empty (defaults excluded)
-        node_json = data[3][0]  # first child
+        node_json = wire[3]["children"][0]  # first child
         assert node_json[2] == {}
 
-    def test_from_json_preserves_node_ids(self):
+    def test_dump_restore_preserves_node_ids(self):
         doc = make_doc()
         with doc.transaction():
-            n = doc.create_node(TextNode, value="test")
-            doc.root.append(n)
+            n = doc.create_node(TextLP, value="test")
+            doc.root.children.append(n)
         nid = n.id
 
-        data = doc.to_json()
-        doc2 = Doc.from_json(data, nodes=[TextNode])
+        wire = doc.dump()
+        doc2 = Doc.restore(wire, root_type=TextLP)
         assert doc2.root.children[0].id == nid
 
-    def test_from_json_unknown_type_raises(self):
-        data = ["01kdjkhm2wkfkcw7xkjdjrd1cc", "text_lp", {},
-                [["1", "unknown_type", {}]]]
+    def test_restore_unknown_type_raises(self):
+        data = ["01kdjkhm2wkfkcw7xkjdjrd1cc", "TextLP", {},
+                {"children": [["1", "unknown_type", {}]]}]
         with pytest.raises(ValueError, match="Unknown node type"):
-            Doc.from_json(data, nodes=[TextNode])
+            Doc.restore(data, root_type=TextLP)
 
     def test_serialize_during_transaction_raises(self):
         doc = make_doc()
@@ -367,7 +369,7 @@ class TestSerializationPorted:
         # Force update stage
         doc._lifecycle_stage = "update"
         with pytest.raises(RuntimeError, match="active transaction"):
-            doc.to_json()
+            doc.dump()
         doc._lifecycle_stage = "idle"
 
 
@@ -378,8 +380,8 @@ class TestStateSetting:
         """Setting state to the same value should not produce a change event."""
         doc = make_doc()
         with doc.transaction():
-            n = doc.create_node(TextNode, value="hello")
-            doc.root.append(n)
+            n = doc.create_node(TextLP, value="hello")
+            doc.root.children.append(n)
 
         events = []
         doc.on_change(lambda ev: events.append(ev))
@@ -393,8 +395,8 @@ class TestStateSetting:
         """Setting and then reverting state in the same tx should produce no change."""
         doc = make_doc()
         with doc.transaction():
-            n = doc.create_node(TextNode, value="original")
-            doc.root.append(n)
+            n = doc.create_node(TextLP, value="original")
+            doc.root.children.append(n)
 
         events = []
         doc.on_change(lambda ev: events.append(ev))

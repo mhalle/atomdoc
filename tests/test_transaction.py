@@ -2,16 +2,23 @@
 
 import pytest
 
-from atomdoc import Doc, AtomNode, ChangeEvent
+from atomdoc import Doc, Array, ChangeEvent, node
 
 
-class TxNode(AtomNode, node_type="tx_node"):
+@node
+class TxChild:
     value: str = ""
+
+
+@node
+class TxNode:
+    value: str = ""
+    children: Array[TxChild] = []
 
 
 @pytest.fixture
 def doc():
-    return Doc(root_type="tx_node", nodes=[TxNode])
+    return Doc(root_type="TxNode", nodes=[TxNode, TxChild])
 
 
 def test_explicit_transaction(doc):
@@ -55,8 +62,8 @@ def test_nested_joins_transaction(doc):
     with doc.transaction():
         doc.root.value = "outer"
         # Implicit transaction inside explicit should join
-        n = doc.create_node(TxNode)
-        doc.root.append(n)
+        n = doc.create_node(TxChild)
+        doc.root.children.append(n)
 
     assert len(events) == 1
 

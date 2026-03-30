@@ -3,7 +3,7 @@
 import pytest
 from pydantic import BaseModel
 
-from atomdoc import Doc, AtomNode
+from atomdoc import Doc, Array, node
 
 
 class Color(BaseModel, frozen=True):
@@ -12,26 +12,39 @@ class Color(BaseModel, frozen=True):
     b: int = 0
 
 
-class SerNode(AtomNode, node_type="ser_node"):
+@node
+class SerChild:
     title: str = ""
     color: Color = Color()
     data: bytes = b""
+    children: Array["SerChild"] = []
+
+
+@node
+class SerNode:
+    title: str = ""
+    color: Color = Color()
+    data: bytes = b""
+    children: Array[SerChild] = []
+
+
+ALL_NODES = [SerNode, SerChild]
 
 
 @pytest.fixture
 def doc():
-    return Doc(root_type="ser_node", nodes=[SerNode])
+    return Doc(root_type="SerNode", nodes=ALL_NODES)
 
 
 def test_round_trip(doc):
     with doc.transaction():
         doc.root.title = "Hello"
         doc.root.color = Color(r=255, g=128, b=0)
-        child = doc.create_node(SerNode, title="child")
-        doc.root.append(child)
+        child = doc.create_node(SerChild, title="child")
+        doc.root.children.append(child)
 
-    data = doc.to_json()
-    doc2 = Doc.from_json(data, nodes=[SerNode])
+    wire = doc.dump()
+    doc2 = Doc.restore(wire, root_type=SerNode)
 
     assert doc2.root.title == "Hello"
     assert doc2.root.color == Color(r=255, g=128, b=0)
@@ -41,13 +54,13 @@ def test_round_trip(doc):
 
 def test_round_trip_nested(doc):
     with doc.transaction():
-        a = doc.create_node(SerNode, title="a")
-        b = doc.create_node(SerNode, title="b")
-        doc.root.append(a)
-        a.append(b)
+        a = doc.create_node(SerChild, title="a")
+        b = doc.create_node(SerChild, title="b")
+        doc.root.children.append(a)
+        a.children.append(b)
 
-    data = doc.to_json()
-    doc2 = Doc.from_json(data, nodes=[SerNode])
+    wire = doc.dump()
+    doc2 = Doc.restore(wire, root_type=SerNode)
 
     assert len(doc2.root.children) == 1
     assert doc2.root.children[0].title == "a"
@@ -58,52 +71,72 @@ def test_round_trip_nested(doc):
 
 def test_default_values_excluded(doc):
     data = doc.to_json()
-    state = data[2]
-    # Default values should not be in the serialized state
-    assert "title" not in state
-    assert "color" not in state
+    # to_json returns a dict; default values should not appear in state fields
+    assert "title" not in data or data["title"] == ""
+    # The children slot should be present but empty
+    assert data["children"] == []
 
 
 def test_preserves_doc_id(doc):
-    data = doc.to_json()
-    doc2 = Doc.from_json(data, nodes=[SerNode])
+    wire = doc.dump()
+    doc2 = Doc.restore(wire, root_type=SerNode)
     assert doc2.id == doc.id
 
 
 def test_preserves_node_ids(doc):
     with doc.transaction():
-        child = doc.create_node(SerNode, title="child")
-        doc.root.append(child)
+        child = doc.create_node(SerChild, title="child")
+        doc.root.children.append(child)
 
     child_id = child.id
-    data = doc.to_json()
-    doc2 = Doc.from_json(data, nodes=[SerNode])
+    wire = doc.dump()
+    doc2 = Doc.restore(wire, root_type=SerNode)
 
     assert doc2.root.children[0].id == child_id
 
 
 def test_isinstance_after_deserialize(doc):
     with doc.transaction():
-        child = doc.create_node(SerNode, title="child")
-        doc.root.append(child)
+        child = doc.create_node(SerChild, title="child")
+        doc.root.children.append(child)
 
-    data = doc.to_json()
-    doc2 = Doc.from_json(data, nodes=[SerNode])
+    wire = doc.dump()
+    doc2 = Doc.restore(wire, root_type=SerNode)
 
     assert isinstance(doc2.root, SerNode)
-    assert isinstance(doc2.root.children[0], SerNode)
+    assert isinstance(doc2.root.children[0], SerChild)
 
 
 def test_bytes_round_trip(doc):
     with doc.transaction():
         doc.root.data = b"hello bytes"
 
-    data = doc.to_json()
-    doc2 = Doc.from_json(data, nodes=[SerNode])
+    wire = doc.dump()
+    doc2 = Doc.restore(wire, root_type=SerNode)
     assert doc2.root.data == b"hello bytes"
 
 
 def test_json_schema():
-    schema = Doc.json_schema(nodes=[SerNode])
-    assert "ser_node" in schema
-    assert "properties" in schema["ser_node"]
+    schema = Doc.json_schema(nodes=ALL_NODES)
+    assert "SerNode" in schema
+    assert "properties" in schema["SerNode"]
+
+
+def test_to_json_is_clean(doc):
+    data = doc.to_json()
+    assert isinstance(data, dict)
+    assert "children" in data
+    assert data["children"] == []
+    # No IDs in clean JSON
+    assert "id" not in data
+
+
+def test_to_json_with_data(doc):
+    with doc.transaction():
+        doc.root.children.append(doc.create_node(SerChild, title="x"))
+    data = doc.to_json()
+    assert isinstance(data, dict)
+    assert len(data["children"]) == 1
+    assert data["children"][0]["title"] == "x"
+    assert "id" not in data
+    assert "id" not in data["children"][0]

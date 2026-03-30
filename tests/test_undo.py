@@ -2,16 +2,23 @@
 
 import pytest
 
-from atomdoc import Doc, AtomNode, UndoManager
+from atomdoc import Doc, Array, node, UndoManager
 
 
-class UndoNode(AtomNode, node_type="undo_node"):
+@node
+class UndoChild:
     value: str = ""
+
+
+@node
+class UndoRoot:
+    value: str = ""
+    children: Array[UndoChild] = []
 
 
 @pytest.fixture
 def doc():
-    return Doc(root_type="undo_node", nodes=[UndoNode])
+    return Doc(root_type="UndoRoot", nodes=[UndoRoot, UndoChild])
 
 
 def test_undo_state_change(doc):
@@ -47,8 +54,8 @@ def test_undo_insert(doc):
     undo = UndoManager(doc)
 
     with doc.transaction():
-        n = doc.create_node(UndoNode, value="child")
-        doc.root.append(n)
+        n = doc.create_node(UndoChild, value="child")
+        doc.root.children.append(n)
 
     assert len(doc.root.children) == 1
 
@@ -58,8 +65,8 @@ def test_undo_insert(doc):
 
 def test_undo_delete(doc):
     with doc.transaction():
-        n = doc.create_node(UndoNode, value="child")
-        doc.root.append(n)
+        n = doc.create_node(UndoChild, value="child")
+        doc.root.children.append(n)
 
     undo = UndoManager(doc)
 
