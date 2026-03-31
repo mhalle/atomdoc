@@ -8,6 +8,9 @@
 AtomDoc explores local-first document models for Python with type-safe
 schemas, semantic atomicity, and operation tracking.
 
+A companion TypeScript client package is available at
+[atomdoc-ts](https://github.com/mhalle/atomdoc-ts).
+
 ## What makes this distinct
 
 An AtomDoc schema **dictates the shape of a document** — its node types,
@@ -33,9 +36,25 @@ are replaced as a unit, with last-write-wins on conflict. The merge
 semantics are derived from the type annotations, not configured
 separately.
 
+## Features
+
+- **Core document model**: `@node` decorator, `Array[T]` slots, frozen value types (Pydantic), transactions, undo/redo
+- **Server protocol layer**: `Session`, `Transport` (abstract), `WebSocketTransport`
+- **Wire protocol**: schema/snapshot/patch messages (server to client), op/create/undo/redo (client to server)
+- **Schema export**: `atomdoc_schema()` with `x-atomdoc` extensions (field tiers, slots, value types)
+- **Validation**: full Pydantic validation at transaction commit time
+- **Extensions**: bundle node types and normalization hooks
+- **Full test suite**: 285 tests
+
 ## Requirements
 
 Python 3.12+ and Pydantic 2.
+
+For the server protocol layer, install with the `server` extra:
+
+```bash
+pip install atomdoc[server]
+```
 
 ## Quick start
 
@@ -238,6 +257,79 @@ with doc.transaction():
     doc.root.title = "Temporary"
     raise ValueError("oops")
 # doc.root.title is unchanged
+```
+
+## Server protocol
+
+AtomDoc includes a server protocol layer for connecting clients to a
+shared document over WebSocket (or any custom transport).
+
+### Session and transport
+
+```python
+import asyncio
+from atomdoc import Doc, Session
+from atomdoc._ws_transport import WebSocketTransport
+
+doc = Doc(Page(title="Shared"))
+session = Session(doc)
+
+async def main():
+    transport = WebSocketTransport(host="localhost", port=8765)
+    await session.bind(transport)
+    # Server is now accepting WebSocket connections
+    await asyncio.Future()  # run forever
+
+asyncio.run(main())
+```
+
+### Wire protocol
+
+Messages from server to client:
+
+| Message | Description |
+|---------|-------------|
+| `schema` | JSON Schema with `x-atomdoc` extensions (sent on connect) |
+| `snapshot` | Full document state (sent on connect) |
+| `patch` | Incremental operations (broadcast after each change) |
+| `error` | Error response |
+
+Messages from client to server:
+
+| Message | Description |
+|---------|-------------|
+| `op` | Apply operations to the document |
+| `create` | Create a new node and insert it into a slot |
+| `undo` | Undo one or more steps |
+| `redo` | Redo one or more steps |
+
+### Custom transports
+
+Implement the `Transport` abstract class and `ClientConnection` to use
+any communication channel (HTTP long-polling, WebRTC, etc.):
+
+```python
+from atomdoc import Transport, ClientConnection
+
+class MyTransport(Transport):
+    async def start(self, on_connect, on_message, on_disconnect):
+        ...
+
+    async def stop(self):
+        ...
+```
+
+## Schema export
+
+`Doc.atomdoc_schema()` produces a JSON Schema document with `x-atomdoc`
+extensions that describe field tiers, slots, and value types. This
+enables language-agnostic clients to understand the document structure
+without importing Python code.
+
+```python
+schema = doc.atomdoc_schema()
+# Returns a dict with node types, field tiers (mergeable, atomic,
+# opaque, structure), slot definitions, and frozen value type schemas.
 ```
 
 ## Validation
