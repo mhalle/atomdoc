@@ -26,8 +26,10 @@ MoveOp = tuple[int, str, str | int, str | int, str, str | int, str | int]
 
 OrderedOperation = InsertOp | DeleteOp | MoveOp
 
-# StatePatch: {node_id: {field: json_string}}
-StatePatch = dict[str, dict[str, str]]
+# StatePatch: {node_id: {field: json_value}}
+# Values are native JSON (strings, numbers, booleans, arrays, objects, null).
+# Opaque/bytes fields are base64 strings; receivers decode based on schema tier.
+StatePatch = dict[str, dict[str, Any]]
 
 # Operations: (ordered_ops, state_patch)
 Operations = tuple[list[OrderedOperation], StatePatch]

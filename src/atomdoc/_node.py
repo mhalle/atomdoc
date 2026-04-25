@@ -302,59 +302,42 @@ class AtomNode:
 
     # --- State serialization helpers ---
 
-    def _state_to_json(self) -> dict[str, str]:
-        """Serialize non-default state fields to {field: json_string}."""
-        import json
-        from pydantic import BaseModel as _BM
+    def _state_to_json(self) -> dict[str, Any]:
+        """Serialize non-default state fields to native JSON values.
 
-        result: dict[str, str] = {}
-        for key, value in self._state.items():
-            default = self._field_defaults.get(key, _MISSING)
-            if default is not _MISSING and value == default:
-                continue
-            if isinstance(value, _BM):
-                result[key] = json.dumps(value.model_dump(mode="json"))
-            elif isinstance(value, bytes):
-                import base64
-                result[key] = json.dumps(base64.b64encode(value).decode())
-            else:
-                result[key] = json.dumps(value)
-        return result
+        Values are JSON-compatible (strings, numbers, booleans, arrays,
+        objects, or null). Opaque/bytes fields are base64-encoded strings;
+        receivers decode based on the field's schema tier.
+        """
+        return self._state_to_json_plain(include_defaults=False)
 
-    def _stringify_state_key(self, key: str) -> str:
-        """Serialize a single state key to a JSON string."""
-        import json
+    def _state_key_to_json(self, key: str) -> Any:
+        """Serialize a single state key to a native JSON value.
+
+        Falls back to the field's default if unset, or ``None`` if no
+        default is defined.
+        """
         from pydantic import BaseModel as _BM
 
         if key not in self._state:
             default = self._field_defaults.get(key, _MISSING)
             if default is _MISSING:
-                return json.dumps(None)
+                return None
             value = default
         else:
             value = self._state[key]
 
         if isinstance(value, _BM):
-            return json.dumps(value.model_dump(mode="json"))
+            return value.model_dump(mode="json")
         elif isinstance(value, bytes):
             import base64
-            return json.dumps(base64.b64encode(value).decode())
+            return base64.b64encode(value).decode()
         else:
-            return json.dumps(value)
+            return value
 
-    def _parse_state_key(self, key: str, stringified: str) -> Any:
-        """Parse a stringified state value (used internally by op tracking)."""
-        import json
-
-        json_val = json.loads(stringified)
-        tier = self._field_tiers.get(key)
-        if tier == "opaque" and isinstance(json_val, str):
-            import base64
-            return base64.b64decode(json_val)
-        adapter = self._field_adapters.get(key)
-        if adapter is not None:
-            return adapter.validate_python(json_val)
-        return json_val
+    def _parse_state_key(self, key: str, json_val: Any) -> Any:
+        """Parse a native JSON state value into its Python type."""
+        return self._parse_json_value(key, json_val)
 
     # --- Plain JSON serialization (for document format) ---
 

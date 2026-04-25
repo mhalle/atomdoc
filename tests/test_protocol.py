@@ -38,9 +38,9 @@ def test_operations_round_trip_move():
 
 
 def test_operations_round_trip_state_patch():
-    ops = ([], {"node1": {"title": '"hello"', "count": "42"}})
+    ops = ([], {"node1": {"title": "hello", "count": 42}})
     wire = operations_to_wire(ops)
-    assert wire["state"] == {"node1": {"title": '"hello"', "count": "42"}}
+    assert wire["state"] == {"node1": {"title": "hello", "count": 42}}
     back = operations_from_wire(wire)
     assert back[1] == ops[1]
 
@@ -48,7 +48,7 @@ def test_operations_round_trip_state_patch():
 def test_operations_round_trip_mixed():
     insert = (0, [("id1", "ann")], "p", "children", 0, 0)
     delete = (1, "x", 0)
-    state = {"n1": {"label": '"test"'}}
+    state = {"n1": {"label": "test"}}
     ops = ([insert, delete], state)
     wire = operations_to_wire(ops)
     back = operations_from_wire(wire)

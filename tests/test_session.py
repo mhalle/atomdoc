@@ -208,13 +208,12 @@ async def test_op_applies_state_patch(session, transport):
     await transport.connect_client(client2)
     client2.messages.clear()
 
-    import json
     await transport.send_message(client, {
         "type": MSG_OP,
         "ref": "op1",
         "operations": {
             "ordered": [],
-            "state": {node_id: {"label": json.dumps("new")}},
+            "state": {node_id: {"label": "new"}},
         },
     })
 

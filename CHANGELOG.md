@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-04-20
+
+### Changed
+
+- **Breaking wire protocol change**: state values in `op` and `patch` messages
+  are now **native JSON** (strings, numbers, booleans, arrays, objects, null)
+  rather than JSON-stringified strings. This aligns `op`/`patch` with `snapshot`
+  and `create` messages, which already used native JSON. Opaque/bytes fields
+  continue to travel as base64-encoded JSON strings; receivers decode based on
+  the field's schema tier.
+- `StatePatch` type alias is now `dict[str, dict[str, Any]]`.
+- Renamed `AtomNode._stringify_state_key` → `AtomNode._state_key_to_json`.
+  `_state_to_json` and `_parse_state_key` now delegate to the existing
+  `_state_to_json_plain` / `_parse_json_value` helpers.
+
+### Migration
+
+Clients speaking the old protocol will not interoperate with this release. Bump
+both server and client together. If you hand-build `state` patches in tests or
+tooling, drop the outer `json.dumps(...)` call.
+
 ## [0.2.0] - 2026-03-30
 
 ### Added

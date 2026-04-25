@@ -25,18 +25,18 @@ def on_set_state_inverse(doc: Doc, node: AtomNode, key: str) -> None:
     inv_patch = doc._inverse_operations[1]
     if node.id in inv_patch and key in inv_patch[node.id]:
         return
-    original = node._stringify_state_key(key)
+    original = node._state_key_to_json(key)
     inv_patch.setdefault(node.id, {})[key] = original
 
 
 def on_set_state_forward(doc: Doc, node: AtomNode, key: str) -> None:
     state_patches = doc._operations[1]
-    value_string = node._stringify_state_key(key)
+    new_value = node._state_key_to_json(key)
 
-    prev_value_string = doc._inverse_operations[1].get(node.id, {}).get(key)
+    prev_value = doc._inverse_operations[1].get(node.id, {}).get(key)
     node_patch = state_patches.get(node.id)
 
-    if prev_value_string == value_string and node_patch is not None:
+    if prev_value == new_value and node_patch is not None:
         node_patch.pop(key, None)
         if _is_obj_empty(node_patch):
             del state_patches[node.id]
@@ -45,7 +45,7 @@ def on_set_state_forward(doc: Doc, node: AtomNode, key: str) -> None:
         if inv_node is not None:
             inv_node.pop(key, None)
     else:
-        state_patches.setdefault(node.id, {})[key] = value_string
+        state_patches.setdefault(node.id, {})[key] = new_value
         if node.id not in doc._diff.inserted:
             doc._diff.updated.add(node.id)
 
@@ -391,12 +391,12 @@ def on_apply_operations(doc: Doc, operations: Operations) -> None:
         if node_id not in doc._diff.inserted:
             doc._diff.updated.add(node_id)
         inserted_same_tx = node_id in doc._diff.inserted
-        for key, str_val in patches.items():
+        for key, json_val in patches.items():
             if not inserted_same_tx:
                 if not current_inv_patch.get(node_id, {}).get(key):
-                    original = node._stringify_state_key(key)
+                    original = node._state_key_to_json(key)
                     current_inv_patch.setdefault(node_id, {}).setdefault(key, original)
-            node._state[key] = node._parse_state_key(key, str_val)
+            node._state[key] = node._parse_state_key(key, json_val)
 
 
 # --- Trigger listeners ---
