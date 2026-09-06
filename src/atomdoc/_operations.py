@@ -372,6 +372,16 @@ def on_apply_operations(doc: Doc, operations: Operations) -> None:
             try:
                 parent_id = op[3]
                 slot_name = op[4]
+                prev_id = op[5] if len(op) > 5 else 0
+                next_id = op[6] if len(op) > 6 else 0
+                prev = doc.get_node_by_id(str(prev_id)) if prev_id else None
+                if prev is not None:
+                    start.to(end).move(prev, position="after")
+                    continue
+                nxt = doc.get_node_by_id(str(next_id)) if next_id else None
+                if nxt is not None:
+                    start.to(end).move(nxt, position="before")
+                    continue
                 parent = doc.get_node_by_id(str(parent_id)) if parent_id else doc.root
                 if parent:
                     start.to(end).move(parent, slot_name, "append")
@@ -396,13 +406,21 @@ def on_apply_operations(doc: Doc, operations: Operations) -> None:
                 if not current_inv_patch.get(node_id, {}).get(key):
                     original = node._state_key_to_json(key)
                     current_inv_patch.setdefault(node_id, {}).setdefault(key, original)
+            old_value = node._state.get(key)
             node._state[key] = node._parse_state_key(key, json_val)
+            if key in node._ref_defs:
+                doc._refs_update(node, key, old_value, node._state[key])
 
 
 # --- Trigger listeners ---
 
 
-def maybe_trigger_listeners(doc: Doc) -> None:
+def maybe_trigger_listeners(doc: Doc, ignore_empty_diff: bool = False) -> None:
+    """Run normalizers and, if anything changed, the change listeners.
+
+    With ``ignore_empty_diff`` normalizers run even when nothing changed,
+    which lets extensions establish invariants when a document is created.
+    """
     def has_changes() -> bool:
         diff = doc._diff
         return bool(
@@ -412,7 +430,7 @@ def maybe_trigger_listeners(doc: Doc) -> None:
             or doc._operations[1]
         )
 
-    if not has_changes():
+    if not has_changes() and not ignore_empty_diff:
         return
 
     doc._lifecycle_stage = "normalize"
@@ -427,6 +445,12 @@ def maybe_trigger_listeners(doc: Doc) -> None:
     if not has_changes():
         return
 
+    # Validate inserted/updated nodes against their validator model, after
+    # normalization so normalizer-made changes are covered as well.
+    doc._lifecycle_stage = "idle"
+    doc._validate_changed_nodes()
+    doc._check_ref_integrity()
+
     from ._types import ChangeEvent
 
     doc._lifecycle_stage = "change"
@@ -434,6 +458,26 @@ def maybe_trigger_listeners(doc: Doc) -> None:
         operations=doc._operations,
         inverse_operations=doc._inverse_operations,
         diff=doc._diff,
+        flags=doc._transaction_flags,
     )
     for change_listener in list(doc._change_listeners):
         change_listener(event)
+
+
+# --- Merging ---
+
+
+def merge_operations(*operations_list: Operations) -> Operations:
+    """Concatenate several operation sets into one.
+
+    Ordered operations are appended in order; state patches are merged per
+    node with later values winning. Used by the undo manager to collapse
+    consecutive transactions into a single step.
+    """
+    ordered: list[Any] = []
+    state: dict[str, dict[str, Any]] = {}
+    for ops in operations_list:
+        ordered.extend(ops[0])
+        for node_id, patch in ops[1].items():
+            state.setdefault(node_id, {}).update(patch)
+    return (ordered, state)

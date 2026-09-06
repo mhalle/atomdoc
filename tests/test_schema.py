@@ -102,3 +102,33 @@ def test_node_without_state_fields():
     assert container["json_schema"] == {"type": "object", "properties": {}}
     assert container["field_tiers"] == {}
     assert "items" in container["slots"]
+
+
+def test_field_constraints_exported():
+    from pydantic import Field
+
+    @node
+    class Plain:
+        opacity: float = Field(ge=0.0, le=1.0, default=1.0)
+
+    @node
+    class Model(BaseModel):
+        opacity: float = Field(ge=0.0, le=1.0, default=1.0)
+
+    @node
+    class Root:
+        plains: Array[Plain] = []
+        models: Array[Model] = []
+
+    schema = Doc(root_type=Root).atomdoc_schema()
+    for name in ("Plain", "Model"):
+        prop = schema["node_types"][name]["json_schema"]["properties"]["opacity"]
+        assert prop == {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 1.0}
+        assert schema["node_types"][name]["field_defaults"] == {"opacity": 1.0}
+
+
+def test_json_schema_carries_defaults():
+    schema = make_doc().atomdoc_schema()
+    props = schema["node_types"]["Annotation"]["json_schema"]["properties"]
+    assert props["label"] == {"type": "string", "default": ""}
+    assert props["color"]["default"] == {"r": 0, "g": 0, "b": 0}

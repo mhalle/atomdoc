@@ -2,6 +2,97 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-09-06
+
+Ports the DocNode v0.4 lifecycle and undo improvements from
+[DocuKit](https://github.com/docukit/docukit), and adds references between
+nodes. The operations wire format is unchanged; the schema export gains a
+`refs` block, the `"ref"` tier, and `Field(...)` constraints (see Added).
+
+### Fixed
+
+- **`Field(...)` on a plain `@node` class was ignored.** The `FieldInfo`
+  object leaked through as the field's default value, and its constraints
+  (`ge`, `le`, ...) were never enforced. The default is now unwrapped and
+  the constraints are checked at commit, as they already were for a
+  `BaseModel` source.
+- **Schema export dropped `Field` constraints.** `opacity: float =
+  Field(ge=0.0, le=1.0)` exported as `{"type": "number"}` for both plain
+  and `BaseModel` nodes. Bounds and other `Annotated` metadata now appear
+  in `json_schema`, and each property carries its `default`.
+- **`Doc.restore` could mint a colliding ID session.** The session was
+  minted before the nodes were loaded; if it matched a session already in
+  the dump, new nodes would silently overwrite existing ones. Restore now
+  checks the loaded IDs and re-mints on collision.
+
+- **Move replay lost position.** Applying a move operation (from undo/redo
+  or a remote peer) ignored the recorded `prev`/`next` siblings and always
+  appended to the target slot. Moves now land where they were recorded.
+- **Undo stack eviction was inverted.** A full undo stack discarded the new
+  entry instead of the oldest one.
+- **`on_normalize` was unreachable.** `Extension` had no registration hook,
+  so nothing user-written could run during the `init` stage.
+- Mutating the document during the `init` stage raised; extension
+  registration may now mutate the document.
+- **Normalizer changes bypassed validation.** Pydantic validation ran before
+  normalizers, so nodes a normalizer inserted or edited were never checked.
+  Validation now runs after normalization, before the change event.
+
+### Added
+
+- **References.** `Ref[T]` (one target), `list[Ref[T]]` (many), either
+  `| None`. Reading resolves to the node; assigning accepts a node or an
+  ID; the stored value is the target's ID. The document keeps a reverse
+  index (`doc.referrers(node, field=...)`, never serialized, rebuilt on
+  restore) and checks referential integrity at commit: references must
+  resolve to a node of the declared type, and a node that is still
+  referenced cannot be deleted (policy `restrict`). Violations raise
+  `RefIntegrityError` and roll the transaction back. `node.ref_id(name)`
+  returns the unresolved ID. A dump with dangling references fails to
+  restore in strict mode and warns otherwise.
+- **Schema export:** field tier `"ref"` and a per-node-type `refs` block
+  (`target_type`, `many`, `policy`).
+- `mint_session_id(created_at_ms, existing)`, `session_prefix(node_id)`,
+  and `node_id_factory(..., existing_sessions=...)` in `atomdoc._id`.
+- **Doc-owned undo manager.** Every `Doc` has `doc.undo_manager`, configured
+  with `Doc(undo_manager=UndoManagerConfig(max_steps=..., merge_interval=...))`.
+  It is disabled by default (`max_steps=0`). The standalone
+  `UndoManager(doc)` constructor still works and still defaults to 100 steps.
+- **Merge interval.** Transactions committed within `merge_interval` seconds
+  of each other collapse into a single undo step. Off by default.
+- **Transaction flags.** `ChangeEvent.flags` carries `TransactionFlags`.
+  `doc.transaction(skip_undo=True)` and
+  `doc.apply_operations(ops, skip_undo=True)` mark transactions the undo
+  manager ignores — use them when applying operations from a remote peer.
+- **Undo history transfer.** `undo_manager.export_history()` /
+  `import_history()` move undo and redo state between matching documents
+  (same ID and root type), for example when a document is rebuilt from a
+  newer snapshot.
+- **Normalizers run on construction** (and after `Doc.restore`), so
+  extensions can establish invariants such as a default child. Nothing done
+  during initialization enters undo history.
+- **`Extension(register=...)`** receives the `Doc` during the `init` stage and
+  may call `doc.on_normalize`, `doc.on_change`, and mutate the document.
+- **Pluggable node IDs.** `Doc(node_id_generator=NodeIdGenerator(generate,
+  validate, extract_time=None))`. Without `extract_time`, `generate` is used
+  for every node and all IDs are validated on `Doc.restore`; with it, child
+  nodes keep the compact Lamport-style IDs. `default_node_id_generator()`
+  returns the lowercase-ULID default.
+- `NodeRange.move` / `AtomNode.move` accept `position="before"` / `"after"`
+  with a sibling as the target.
+- `merge_operations(*ops)` concatenates operation sets.
+- `UndoManager.clear()`, `UndoManager.dispose()`, `is_enabled`, `max_steps`,
+  `merge_interval`.
+- `Session` uses `doc.undo_manager` when it is enabled, otherwise it creates
+  a standalone 100-step manager as before.
+
+### Changed
+
+- `Doc.restore` runs normalizers after the tree is loaded rather than on the
+  empty document.
+- `AtomNode.move(target, slot_name, position)`: `slot_name` is now optional
+  and only required for `append`/`prepend`.
+
 ## [0.3.0] - 2026-04-20
 
 ### Changed

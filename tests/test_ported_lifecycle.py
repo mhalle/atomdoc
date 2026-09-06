@@ -74,35 +74,51 @@ class TestNormalize:
             doc.on_normalize(lambda diff: None)
 
     def test_normalize_can_mutate_document(self):
-        def ensure_child(diff):
-            doc_ref = ensure_child._doc
-            if not doc_ref.root.children:
-                n = doc_ref.create_node(TextLP, value="default")
-                doc_ref.root.children.append(n)
+        def register(doc_ref):
+            def ensure_child(diff):
+                if not doc_ref.root.children:
+                    n = doc_ref.create_node(TextLP, value="default")
+                    doc_ref.root.children.append(n)
 
-        ext = Extension(nodes=[TextLP], normalize=ensure_child)
+            doc_ref.on_normalize(ensure_child)
+
+        ext = Extension(nodes=[TextLP], register=register)
         doc = Doc(root_type="TextLP", extensions=[ext], strict_mode=False)
-        ensure_child._doc = doc
 
-        # Add and delete to trigger normalize
-        with doc.transaction():
-            n = doc.create_node(TextLP, value="temp")
-            doc.root.children.append(n)
+        # Normalizers run on construction, so the invariant holds immediately
+        assert_doc(doc, ["default"])
 
         with doc.transaction():
             doc.root.children[0].delete()
 
-        # Normalize should have added "default"
+        # Normalize should have re-added "default"
         assert_doc(doc, ["default"])
 
-    def test_strict_mode_rejects_non_idempotent_normalize(self):
-        def bad_normalize(diff):
-            n = bad_normalize._doc.create_node(TextLP, value="added")
-            bad_normalize._doc.root.children.append(n)
+    def test_strict_mode_rejects_non_idempotent_normalize_on_init(self):
+        def register(doc_ref):
+            def bad_normalize(diff):
+                n = doc_ref.create_node(TextLP, value="added")
+                doc_ref.root.children.append(n)
 
-        ext = Extension(nodes=[TextLP], normalize=bad_normalize)
+            doc_ref.on_normalize(bad_normalize)
+
+        ext = Extension(nodes=[TextLP], register=register)
+        with pytest.raises(RuntimeError, match="idempotent"):
+            Doc(root_type="TextLP", extensions=[ext], strict_mode=True)
+
+    def test_strict_mode_rejects_non_idempotent_normalize_in_transaction(self):
+        def register(doc_ref):
+            def bad_normalize(diff):
+                # Idempotent on an empty diff (construction), not afterwards
+                if not diff.inserted:
+                    return
+                n = doc_ref.create_node(TextLP, value="added")
+                doc_ref.root.children.append(n)
+
+            doc_ref.on_normalize(bad_normalize)
+
+        ext = Extension(nodes=[TextLP], register=register)
         doc = Doc(root_type="TextLP", extensions=[ext], strict_mode=True)
-        bad_normalize._doc = doc
 
         with pytest.raises(RuntimeError, match="idempotent"):
             with doc.transaction():

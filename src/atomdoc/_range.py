@@ -46,12 +46,23 @@ class NodeRange:
             for node in _iter_range(self._start, self._end):
                 for desc in _descendants_inclusive(node):
                     doc._node_map.pop(desc.id, None)
+                    doc._refs_remove(desc)
             _detach_range(self._start, self._end)
 
         with_transaction(doc, _do)
 
-    def move(self, target: AtomNode, slot_name: str, position: str = "append") -> None:
-        """Move all nodes in the range to a slot on target."""
+    def move(
+        self,
+        target: AtomNode,
+        slot_name: str | None = None,
+        position: str = "append",
+    ) -> None:
+        """Move all nodes in the range relative to ``target``.
+
+        With ``append``/``prepend``, ``target`` is the new parent and
+        ``slot_name`` names the slot. With ``before``/``after``, ``target``
+        is a sibling and the range lands next to it in the sibling's slot.
+        """
         doc = self._start._doc_ref
         if doc is None:
             raise RuntimeError("Node is not attached to a document")
@@ -60,14 +71,30 @@ class NodeRange:
         def _do() -> None:
             from . import _operations as ops
 
-            # Validate slot exists on target
-            if slot_name not in target._slot_defs:
-                raise ValueError(f"Slot '{slot_name}' does not exist on {type(target).__name__}")
+            if position not in ("append", "prepend", "before", "after"):
+                raise ValueError(f"Invalid position: {position}")
+
+            if position in ("before", "after"):
+                new_parent = target._parent
+                slot = target._slot_name
+                if new_parent is None or slot is None:
+                    raise ValueError("Cannot move before or after the root")
+            else:
+                if slot_name is None:
+                    raise ValueError("slot_name is required for 'append' and 'prepend'")
+                new_parent = target
+                slot = slot_name
+
+            # Validate slot exists on the new parent
+            if slot not in new_parent._slot_defs:
+                raise ValueError(
+                    f"Slot '{slot}' does not exist on {type(new_parent).__name__}"
+                )
 
             nodes_in_range = set(_iter_range(self._start, self._end))
-            if target in nodes_in_range:
+            if new_parent in nodes_in_range:
                 raise ValueError("Target is in the range")
-            anc = target._parent
+            anc = new_parent._parent
             while anc is not None:
                 if anc in nodes_in_range:
                     raise ValueError("Target is descendant of the range")
@@ -77,22 +104,30 @@ class NodeRange:
             new_next: AtomNode | None = None
 
             if position == "append":
-                if target._slot_last.get(slot_name) is self._end:
+                if new_parent._slot_last.get(slot) is self._end:
                     return
-                new_prev = target._slot_last.get(slot_name)
+                new_prev = new_parent._slot_last.get(slot)
             elif position == "prepend":
-                if target._slot_first.get(slot_name) is self._start:
+                if new_parent._slot_first.get(slot) is self._start:
                     return
-                new_next = target._slot_first.get(slot_name)
+                new_next = new_parent._slot_first.get(slot)
             elif position == "before":
-                raise ValueError("Use 'append' or 'prepend' for slot moves, or use insert_before on a node")
-            elif position == "after":
-                raise ValueError("Use 'append' or 'prepend' for slot moves, or use insert_after on a node")
-            else:
-                raise ValueError(f"Invalid position: {position}")
+                if target in nodes_in_range:
+                    raise ValueError("Target is in the range")
+                if target._prev_sibling is self._end:
+                    return
+                new_prev = target._prev_sibling
+                new_next = target
+            else:  # after
+                if target in nodes_in_range:
+                    raise ValueError("Target is in the range")
+                if target._next_sibling is self._start:
+                    return
+                new_prev = target
+                new_next = target._next_sibling
 
             ops.on_move_range(
-                doc, self._start, self._end, target, slot_name, new_prev, new_next
+                doc, self._start, self._end, new_parent, slot, new_prev, new_next
             )
 
             _detach_range(self._start, self._end)
@@ -102,17 +137,17 @@ class NodeRange:
             if new_prev is not None:
                 new_prev._next_sibling = self._start
             else:
-                target._slot_first[slot_name] = self._start
+                new_parent._slot_first[slot] = self._start
 
             self._end._next_sibling = new_next
             if new_next is not None:
                 new_next._prev_sibling = self._end
             else:
-                target._slot_last[slot_name] = self._end
+                new_parent._slot_last[slot] = self._end
 
             for node in _iter_range(self._start, self._end):
-                node._parent = target
-                node._slot_name = slot_name
+                node._parent = new_parent
+                node._slot_name = slot
 
         with_transaction(doc, _do)
 

@@ -38,10 +38,11 @@ separately.
 
 ## Features
 
-- **Core document model**: `@node` decorator, `Array[T]` slots, frozen value types (Pydantic), transactions, undo/redo
+- **Core document model**: `@node` decorator, `Array[T]` slots, frozen value types (Pydantic), transactions, built-in undo/redo with merge interval and history transfer
 - **Server protocol layer**: `Session`, `Transport` (abstract), `WebSocketTransport`
 - **Wire protocol**: schema/snapshot/patch messages (server to client), op/create/undo/redo (client to server)
-- **Schema export**: `atomdoc_schema()` with `x-atomdoc` extensions (field tiers, slots, value types)
+- **Schema export**: `atomdoc_schema()` with `x-atomdoc` extensions (field tiers, slots, references, value types)
+- **References**: `Ref[T]` fields point at other nodes in the same document, with a reverse index and referential integrity checked at commit
 - **Validation**: full Pydantic validation at transaction commit time
 - **Extensions**: bundle node types and normalization hooks
 - **Full test suite**: 285 tests
@@ -130,6 +131,76 @@ with doc.transaction():
     doc.root.annotations.clear()                    # remove all
 ```
 
+Nodes can be moved within or across child arrays. Append or prepend to a
+slot on a new parent, or position next to a sibling:
+
+```python
+with doc.transaction():
+    ann.move(other_page, "annotations")                 # append to a slot
+    ann.move(other_page, "annotations", "prepend")
+    ann.move(sibling, position="after")                 # next to a sibling
+    first.to(last).move(sibling, position="before")     # a contiguous range
+```
+
+### References
+
+`Array[T]` is **ownership**: every node has exactly one owner and one
+position in the tree. `Ref[T]` is **association**: a field that points at
+another node in the same document without controlling its lifetime.
+
+```python
+from atomdoc import Ref
+
+@node
+class Transform:
+    name: str = ""
+    parent: Ref["Transform"] | None = None      # self-reference
+
+@node
+class Volume:
+    transform: Ref[Transform] | None = None     # one target, optional
+    sources: list[Ref["Volume"]] = []           # many targets
+
+@node
+class Scene:
+    transforms: Array[Transform] = []
+    volumes: Array[Volume] = []
+```
+
+Reading a reference resolves it to the node; assigning accepts a node or
+its ID. On the wire and in `dump()` the value is the target's node ID.
+
+```python
+with doc.transaction():
+    vol.transform = t2                  # or t2.id
+vol.transform is t2                     # True
+vol.ref_id("transform")                 # "-4_D.0" — the stored ID
+doc.referrers(t2)                       # [vol]
+doc.referrers(t2, field="transform")    # only via that field
+```
+
+The document keeps a reverse index and checks **referential integrity at
+transaction commit**, where whole-document invariants belong:
+
+- every reference must resolve to a node of the declared type, and
+- a node that is still referenced cannot be deleted (delete policy
+  `restrict`).
+
+A violation raises `RefIntegrityError` and rolls the transaction back.
+Because the check runs at commit, re-pointing referrers and deleting the
+old target in one transaction is fine. Moving a node is not a delete, so
+reparenting never trips the check. Undo restores deleted nodes with their
+original IDs, so references survive undo and redo.
+
+The index is derived state: it is never serialized, and `Doc.restore`
+rebuilds it. A dump whose references do not resolve fails to restore in
+strict mode and warns otherwise, leaving the field reading as `None`.
+
+References never cross documents. To point at something outside the
+document — another document's node, a file, an ontology term — store a
+plain frozen value (a URI, a digest) and resolve it yourself. Choosing
+`Ref` over such a handle asserts that the two nodes ship together.
+
 ### Multiple child arrays
 
 A node can have multiple independently managed child collections:
@@ -189,7 +260,10 @@ doc.root.sections[0].pages[0].annotations[0].label  # "note"
 
 ### Serialize
 
-Two formats — clean JSON for reading, wire format for persistence:
+Two formats — clean JSON for reading, wire format for persistence. The
+clean form nests children and omits node IDs, except that a `Ref` field
+is emitted as the target's ID, since that is its value; use `dump()`
+when the output must round-trip:
 
 ```python
 # Clean JSON — no internal IDs, just data
@@ -203,20 +277,62 @@ doc2 = Doc.restore(wire, root_type=Page)
 
 ### Undo / redo
 
-```python
-from atomdoc import UndoManager
+Every document owns an undo manager. It is disabled by default; enable it
+with `UndoManagerConfig`:
 
-undo = UndoManager(doc)
+```python
+from atomdoc import Doc, UndoManagerConfig
+
+doc = Doc(Page(title="Hello"), undo_manager=UndoManagerConfig(max_steps=100))
 
 with doc.transaction():
     doc.root.title = "Changed"
 
-undo.undo()
+doc.undo_manager.undo()
 assert doc.root.title == "Hello"
 
-undo.redo()
+doc.undo_manager.redo()
 assert doc.root.title == "Changed"
 ```
+
+`merge_interval` (seconds) collapses transactions committed in quick
+succession into one undo step, so keystroke-level edits undo together:
+
+```python
+doc = Doc(Page(), undo_manager=UndoManagerConfig(max_steps=100, merge_interval=0.5))
+```
+
+Transactions can be excluded from undo history. Use this when applying
+operations that came from a remote peer:
+
+```python
+doc.apply_operations(remote_ops, skip_undo=True)
+
+with doc.transaction(skip_undo=True):
+    ...
+```
+
+A `skip_undo` transaction is always isolated. If one is opened while
+another transaction is in progress, the open transaction is committed
+first, so your own pending edits keep their undo entry and only the
+flagged work is excluded.
+
+Undo history can be moved between two documents with the same ID and root
+type, for example when a document is rebuilt from a newer snapshot:
+
+```python
+history = doc.undo_manager.export_history()
+replacement = Doc.restore(snapshot, root_type=Page, undo_manager=UndoManagerConfig(max_steps=100))
+replacement.undo_manager.import_history(history)
+```
+
+The exported history is plain JSON-serializable data. Its `last_update`
+timestamp comes from the exporting manager's clock (wall-clock seconds by
+default), so a merge window can continue across the transfer only when
+both managers share a clock.
+
+A standalone `UndoManager(doc)` can still be created; it defaults to 100
+steps.
 
 ### Change events
 
@@ -230,7 +346,8 @@ doc.on_change(lambda event: print(
 
 Change events fire once per transaction, after all mutations and
 normalization are complete. Each event carries forward and inverse
-operations for sync and undo.
+operations for sync and undo, plus `event.flags` (`TransactionFlags`),
+whose `skip_undo` tells listeners the transaction was excluded from undo.
 
 ### Transactions
 
@@ -329,8 +446,17 @@ without importing Python code.
 ```python
 schema = doc.atomdoc_schema()
 # Returns a dict with node types, field tiers (mergeable, atomic,
-# opaque, structure), slot definitions, and frozen value type schemas.
+# opaque, ref), slot definitions, reference declarations (target type,
+# cardinality, delete policy), field defaults, and frozen value type
+# schemas. ``Field(...)`` constraints such as ``ge``/``le`` are included.
 ```
+
+The export carries the declarative part of the schema only. Validators
+written as Python functions (`@field_validator`, `@model_validator`) do not
+travel with it, so a remote client can check shape but not every rule:
+the document owner commits, and the owner's validators are the gate. The
+same split applies to references: **the schema validates shape, the
+document validates integrity.**
 
 ## Validation
 
@@ -442,29 +568,72 @@ The tier is inferred automatically from the type annotation:
 | **Mergeable** | `str`, `int`, `float`, `bool` | One operation per field. Concurrent edits to different fields merge. |
 | **Atomic** | `frozen=True` Pydantic model | Replaced as a unit. Last-write-wins on conflict. |
 | **Opaque** | `bytes` | Stored as base64, not diffed or merged. |
-| **Structure** | `Array[T]` | Ordered child collection. Per-node insert/delete/move operations. |
+| **Ref** | `Ref[T]`, `list[Ref[T]]` | A node ID. Replaced as a unit; referential integrity checked at commit. |
+
+`Array[T]` is not a field tier: it is a child slot, taken out of the state
+before fields are classified, with its own per-node insert, delete, and
+move operations.
+
+Bulk data (a large image, a mesh, an external store) should not go in a
+`bytes` field: the opaque tier is copied into every snapshot and patch
+that touches it. Store a frozen handle (`uri`, `digest`, `media_type`)
+instead, so undo and sync move only the handle.
 
 ## Extensions
 
-Bundle node types and normalization hooks:
+Bundle node types with a registration hook. `register` receives the
+document during construction and may register normalizers, attach change
+listeners, and mutate the document:
 
 ```python
 from atomdoc import Extension
 
-def ensure_has_page(diff):
-    if not doc.root.pages:
-        doc.root.pages.append(doc.create_node(Page))
+def register(doc):
+    def ensure_has_page(diff):
+        if not doc.root.pages:
+            doc.root.pages.append(doc.create_node(Page))
 
-ext = Extension(
-    nodes=[Page, Annotation],
-    normalize=ensure_has_page,
-)
+    doc.on_normalize(ensure_has_page)
+
+ext = Extension(nodes=[Page, Annotation], register=register)
 
 doc = Doc(Document, extensions=[ext])
+assert len(doc.root.pages) == 1  # normalizers run on construction
 ```
 
-Normalizers run after mutations and before the change event. In strict
-mode (the default), they run twice to verify idempotency.
+Normalizers run after mutations and before the change event, and once
+when the document is constructed or restored so invariants hold from the
+start. Nothing done during construction enters undo history. In strict
+mode (the default), normalizers run twice to verify idempotency.
+
+`Extension(normalize=fn)` is a shorthand for registering one normalizer
+that does not need a reference to the document.
+
+## Node IDs
+
+Document IDs are lowercase ULIDs by default, and child nodes get compact
+IDs derived from the root's creation timestamp. Supply a
+`NodeIdGenerator` to change this:
+
+```python
+from atomdoc import NodeIdGenerator
+
+gen = NodeIdGenerator(
+    generate=lambda: str(uuid.uuid4()),
+    validate=lambda s: len(s) == 36,
+)
+doc = Doc(Page(), node_id_generator=gen)
+```
+
+Without `extract_time`, `generate` is used for every node and every ID is
+validated on `Doc.restore`. With `extract_time` (returning milliseconds
+since the epoch), child nodes keep the compact scheme and only the
+document ID is validated.
+
+All peers of a document must use the same ID scheme. Node IDs travel
+inside operations, and a validating generator rejects operations that
+carry IDs it does not recognize: `Doc.restore` raises, and
+`apply_operations` drops the offending operation set.
 
 ## Development
 

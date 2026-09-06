@@ -40,7 +40,12 @@ class Session:
         undo_manager: UndoManager | None = None,
     ) -> None:
         self._doc = doc
-        self._undo = undo_manager or UndoManager(doc)
+        if undo_manager is not None:
+            self._undo = undo_manager
+        elif doc.undo_manager.is_enabled:
+            self._undo = doc.undo_manager
+        else:
+            self._undo = UndoManager(doc)
         self._clients: dict[str, ClientConnection] = {}
         self._version: int = 0
         self._transport: Transport | None = None

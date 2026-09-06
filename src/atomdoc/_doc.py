@@ -2,21 +2,32 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator, Iterator
-from typing import Any
+import warnings
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager
+from typing import Annotated, Any, ForwardRef
 
-from pydantic import BaseModel
-from ulid import ULID
+from pydantic import BaseModel, TypeAdapter
+from pydantic_core import PydanticUndefined
 
-from ._id import node_id_factory
+from ._id import (
+    CompactIdFactory,
+    NodeIdGenerator,
+    default_node_id_generator,
+    node_id_factory,
+    session_prefix,
+)
 from ._node import AtomNode, _MISSING
+from ._ref import RefIntegrityError, ref_ids
 from ._types import (
     ChangeEvent,
     Diff,
     JsonDoc,
     LifeCycleStage,
     Operations,
+    TransactionFlags,
 )
+from ._undo import UndoManager, UndoManagerConfig
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +62,16 @@ def node(cls_or_name: type | str | None = None) -> Any:
         return _make_node_from_class(cls_or_name, cls_or_name.__name__)
 
 
+def _is_resolved_annotation(field_info: Any) -> bool:
+    """True if Pydantic resolved this field's annotation to a real type."""
+    ann = field_info.annotation
+    return (
+        ann is not None
+        and not isinstance(ann, (str, ForwardRef))
+        and not field_info.metadata
+    )
+
+
 def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNode]:
     """Create a AtomNode subclass from any annotated class."""
 
@@ -74,7 +95,23 @@ def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNod
         for field_name, field_info in source_cls.model_fields.items():  # type: ignore[attr-defined]
             if field_name not in annotations:
                 annotations[field_name] = field_info.annotation
-            if field_info.default is not None and field_name not in defaults:
+            elif isinstance(annotations[field_name], str) and _is_resolved_annotation(field_info):
+                # Under ``from __future__ import annotations`` the raw
+                # annotation is a string.  Pydantic has already resolved it
+                # (it can see function-local names through the defining
+                # frame, which __init_subclass__ cannot), so prefer its
+                # result.  Skipped when the field carries constraint
+                # metadata, because Pydantic strips ``Annotated[...]`` into
+                # ``field_info.metadata`` and the per-field adapter would
+                # lose those constraints.
+                annotations[field_name] = field_info.annotation
+            if field_name in defaults:
+                continue
+            if field_info.metadata:
+                # ``Field(ge=..., le=...)`` or ``Annotated[...]`` constraints:
+                # hand the FieldInfo through so the node keeps them.
+                defaults[field_name] = field_info
+            elif field_info.default is not None and field_info.default is not PydanticUndefined:
                 defaults[field_name] = field_info.default
 
     # Build namespace for the new class.
@@ -103,6 +140,12 @@ def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNod
     if is_pydantic:
         new_cls._validator_model = source_cls  # type: ignore[attr-defined]
 
+    # A self-reference (``Ref["Volume"]`` inside ``class Volume(BaseModel)``)
+    # resolves to the source class; point it at the node class instead.
+    for ref_def in new_cls._ref_defs.values():
+        if ref_def.target is source_cls:
+            ref_def.target = new_cls
+
     return new_cls
 
 
@@ -111,15 +154,23 @@ def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNod
 # ---------------------------------------------------------------------------
 
 class Extension:
-    """Bundle of node types and optional normalization hooks."""
+    """Bundle of node types and optional registration / normalization hooks.
+
+    ``register`` runs during document construction (the ``init`` stage). It
+    may call ``doc.on_normalize`` and may mutate the document; those
+    mutations are committed, and normalizers run, before the constructor
+    returns. ``normalize`` is a shorthand for registering one normalizer.
+    """
 
     def __init__(
         self,
         nodes: list[type[AtomNode]] | None = None,
         normalize: Callable[[Diff], None] | None = None,
+        register: Callable[[Doc], None] | None = None,
     ) -> None:
         self.nodes = nodes or []
         self.normalize = normalize
+        self.register = register
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +191,10 @@ def _discover_node_types(root_cls: type[AtomNode]) -> dict[str, type[AtomNode]]:
         for slot_def in getattr(cls, "_slot_defs", {}).values():
             if slot_def.allowed_type is not None and slot_def.allowed_type not in result.values():
                 pending.append(slot_def.allowed_type)
+        for ref_def in getattr(cls, "_ref_defs", {}).values():
+            target = ref_def.target
+            if isinstance(target, type) and hasattr(target, "_node_type") and target not in result.values():
+                pending.append(target)  # type: ignore[arg-type]
     return result
 
 
@@ -154,7 +209,16 @@ class Doc:
         *,
         doc_id: str | None = None,
         strict_mode: bool = True,
+        undo_manager: UndoManagerConfig | None = None,
+        node_id_generator: NodeIdGenerator | None = None,
+        _defer_init: bool = False,
     ) -> None:
+        """Create a document.
+
+        ``undo_manager`` configures the built-in undo manager (disabled by
+        default). ``node_id_generator`` overrides how document and node IDs
+        are generated and validated (default: lowercase ULIDs).
+        """
         # Resolve root_type: accept an instance (snapshot), a class, or a string
         root_snapshot: AtomNode | None = None
         if isinstance(root_type, AtomNode):
@@ -200,26 +264,40 @@ class Doc:
             new_root_cls = _make_root_class(root_type_str)
             self._node_types[root_type_str] = new_root_cls
 
+        self._node_id_generator = node_id_generator or default_node_id_generator()
         if doc_id is not None:
+            if not self._node_id_generator.validate(doc_id):
+                raise ValueError(f"Invalid document id: {doc_id!r}")
             self._id = doc_id
         else:
-            self._id = str(ULID()).lower()
+            self._id = self._node_id_generator.generate()
 
         self._node_map: dict[str, AtomNode] = {}
+        # Reverse reference index: target id -> {(referrer id, field): None}.
+        # Derived state — never serialized, rebuilt on restore.
+        self._ref_index: dict[str, dict[tuple[str, str], None]] = {}
         self._strict_mode = strict_mode
         self._lifecycle_stage: LifeCycleStage = "idle"
         self._operations: Operations = ([], {})
         self._inverse_operations: Operations = ([], {})
+        self._transaction_flags = TransactionFlags()
         self._diff = Diff()
         self._change_listeners: list[Callable[[ChangeEvent], None]] = []
         self._normalize_listeners: list[Callable[[Diff], None]] = []
+        self._undo_config = undo_manager or UndoManagerConfig()
+        self._undo_manager: UndoManager | None = None
 
         # Create root node
         root_node_cls = self._node_types[root_type_str]
         self._root = root_node_cls(_id=self._id, _doc=self)
         self._node_map[self._id] = self._root
 
-        self._id_gen = node_id_factory(self)
+        extract_time = self._node_id_generator.extract_time
+        self._id_gen: Callable[[], str] = (
+            node_id_factory(self, extract_time)
+            if extract_time is not None
+            else self._node_id_generator.generate
+        )
 
         # If a snapshot was provided, populate the tree from it
         if root_snapshot is not None:
@@ -229,7 +307,39 @@ class Doc:
         for ext in all_extensions:
             if ext.normalize is not None:
                 self._normalize_listeners.append(ext.normalize)
+            if ext.register is not None:
+                ext.register(self)
         self._lifecycle_stage = "idle"
+
+        if not _defer_init:
+            self._finish_init()
+
+    def _finish_init(self) -> None:
+        """Commit init-stage mutations, run normalizers, and attach undo.
+
+        Normalizers run even when nothing changed so extensions can
+        establish invariants (e.g. a default child) on a fresh document.
+        Nothing done here enters undo history.
+        """
+        self._lifecycle_stage = "idle"
+        self._rebuild_ref_index()
+        self._force_commit(ignore_empty_diff=True)
+        self._undo_manager = UndoManager(
+            self,
+            max_steps=self._undo_config.max_steps,
+            merge_interval=self._undo_config.merge_interval,
+        )
+
+    @property
+    def undo_manager(self) -> UndoManager:
+        """The document's built-in undo manager (see ``UndoManagerConfig``)."""
+        if self._undo_manager is None:
+            raise RuntimeError("Document initialization has not finished")
+        return self._undo_manager
+
+    @property
+    def node_id_generator(self) -> NodeIdGenerator:
+        return self._node_id_generator
 
     def _apply_snapshot(self, live_node: AtomNode, snapshot: AtomNode) -> None:
         """Populate a live node tree from a snapshot (user-constructed node)."""
@@ -342,7 +452,9 @@ class Doc:
                 node._state[name] = default
         for name, value in state.items():
             adapter = node_cls._field_adapters.get(name)
-            if adapter is not None:
+            if name in node_cls._ref_defs:
+                node._state[name] = adapter.validate_python(value, doc=self)  # type: ignore[union-attr]
+            elif adapter is not None:
                 node._state[name] = adapter.validate_python(value)
             else:
                 node._state[name] = value
@@ -364,6 +476,8 @@ class Doc:
             node._state[key] = value
             if is_attached:
                 ops.on_set_state_forward(self, node, key)
+                if key in node._ref_defs:
+                    self._refs_update(node, key, current, value)
 
         with_transaction(self, _do)
 
@@ -469,28 +583,50 @@ class Doc:
         if parent.id in self._node_map:
             for desc in _descendants_inclusive_iter(node):
                 self._node_map[desc.id] = desc
+                self._refs_add(desc)
 
     # --- Transaction API ---
 
-    def transaction(self) -> Generator[None, None, None]:
+    def transaction(self, *, skip_undo: bool = False) -> AbstractContextManager[None]:
+        """Batch mutations into one change event.
+
+        ``skip_undo`` marks the transaction so the undo manager ignores it.
+        Such a transaction is always isolated: if one is already open it is
+        committed first, so the caller's own edits stay undoable and only the
+        flagged work is excluded. Edits made after the block exits start a
+        new transaction.
+        """
         from ._transaction import transaction_context
-        return transaction_context(self)  # type: ignore[return-value]
+
+        flags = TransactionFlags(skip_undo=True) if skip_undo else None
+        return transaction_context(self, flags)
 
     def force_commit(self) -> None:
+        """Commit the current transaction synchronously, firing events."""
+        self._force_commit()
+
+    def _force_commit(self, ignore_empty_diff: bool = False) -> None:
         from . import _operations as ops
 
         if self._lifecycle_stage == "change":
             raise RuntimeError("Cannot trigger an update inside a change event")
 
-        # Validate updated/inserted nodes against their validator model
-        self._validate_changed_nodes()
-
+        # Validation of inserted/updated nodes happens in
+        # maybe_trigger_listeners, after normalizers have run, so nodes a
+        # normalizer inserts or edits are validated too.
         self._inverse_operations[0].reverse()
         self._lifecycle_stage = "idle"
-        ops.maybe_trigger_listeners(self)
-
+        try:
+            ops.maybe_trigger_listeners(self, ignore_empty_diff)
+        except Exception:
+            # Validation or a listener failed. Reopen the transaction and
+            # leave the recorded operations in place so the caller
+            # (with_transaction / transaction_context) can roll back.
+            self._lifecycle_stage = "update"
+            raise
         self._operations = ([], {})
         self._inverse_operations = ([], {})
+        self._transaction_flags = TransactionFlags()
         self._diff = Diff()
         self._lifecycle_stage = "idle"
 
@@ -523,6 +659,123 @@ class Doc:
 
             validator.model_validate(data)
 
+    # --- References ---
+
+    def referrers(self, node: AtomNode, *, field: str | None = None) -> list[AtomNode]:
+        """Nodes holding a reference to ``node``, optionally only via ``field``.
+
+        Backed by the document's reverse index: O(1) per referrer.
+        """
+        result: list[AtomNode] = []
+        seen: set[str] = set()
+        for referrer_id, field_name in self._ref_index.get(node.id, {}):
+            if field is not None and field_name != field:
+                continue
+            if referrer_id in seen:
+                continue
+            referrer = self._node_map.get(referrer_id)
+            if referrer is not None:
+                seen.add(referrer_id)
+                result.append(referrer)
+        return result
+
+    def _refs_add(self, node: AtomNode) -> None:
+        for name in type(node)._ref_defs:
+            for target_id in ref_ids(node, name):
+                self._ref_index.setdefault(target_id, {})[(node.id, name)] = None
+
+    def _refs_remove(self, node: AtomNode) -> None:
+        for name in type(node)._ref_defs:
+            for target_id in ref_ids(node, name):
+                self._refs_discard(target_id, node.id, name)
+
+    def _refs_discard(self, target_id: str, referrer_id: str, name: str) -> None:
+        entries = self._ref_index.get(target_id)
+        if entries is None:
+            return
+        entries.pop((referrer_id, name), None)
+        if not entries:
+            del self._ref_index[target_id]
+
+    def _refs_update(self, node: AtomNode, name: str, old: Any, new: Any) -> None:
+        """Re-index reference field ``name`` of an attached node."""
+        old_ids = old if isinstance(old, list) else ([old] if isinstance(old, str) else [])
+        new_ids = new if isinstance(new, list) else ([new] if isinstance(new, str) else [])
+        for target_id in old_ids:
+            if target_id not in new_ids:
+                self._refs_discard(target_id, node.id, name)
+        for target_id in new_ids:
+            if isinstance(target_id, str):
+                self._ref_index.setdefault(target_id, {})[(node.id, name)] = None
+
+    def _rebuild_ref_index(self) -> None:
+        self._ref_index.clear()
+        for node in self._node_map.values():
+            self._refs_add(node)
+
+    def _dangling_refs(self) -> list[tuple[AtomNode, str, str]]:
+        """(referrer, field, target id) for every reference that does not resolve."""
+        result: list[tuple[AtomNode, str, str]] = []
+        for target_id, entries in self._ref_index.items():
+            if target_id in self._node_map:
+                continue
+            for referrer_id, name in entries:
+                referrer = self._node_map.get(referrer_id)
+                if referrer is not None:
+                    result.append((referrer, name, target_id))
+        return result
+
+    def _check_ref_integrity(self) -> None:
+        """Commit-time referential integrity for this transaction.
+
+        Every reference written by an inserted or updated node must resolve
+        to a node of the declared type, and no deleted node may still be
+        referenced by a live one (delete policy ``restrict``). Raises
+        ``RefIntegrityError``; the transaction is then rolled back.
+        """
+        diff = self._diff
+        for node_id in diff.inserted | diff.updated:
+            node = self._node_map.get(node_id)
+            if node is None:
+                continue
+            for name, rdef in type(node)._ref_defs.items():
+                for target_id in ref_ids(node, name):
+                    target = self._node_map.get(target_id)
+                    if target is None:
+                        raise RefIntegrityError(
+                            f"{type(node).__name__}.{name} on node '{node_id}' "
+                            f"references '{target_id}', which is not in the document"
+                        )
+                    if not rdef.accepts(type(target), self._node_types):
+                        raise RefIntegrityError(
+                            f"{type(node).__name__}.{name} on node '{node_id}' "
+                            f"references {type(target).__name__} '{target_id}', "
+                            f"expected {rdef.target_name}"
+                        )
+        for deleted_id in diff.deleted:
+            for referrer_id, name in self._ref_index.get(deleted_id, {}):
+                referrer = self._node_map.get(referrer_id)
+                if referrer is not None:
+                    raise RefIntegrityError(
+                        f"Cannot delete node '{deleted_id}': still referenced by "
+                        f"{type(referrer).__name__}.{name} on node '{referrer_id}'"
+                    )
+
+    def _reseed_id_factory(self) -> None:
+        """Re-mint the ID session if it collides with one already in the tree.
+
+        ``restore`` mints the session before the nodes are loaded. With every
+        existing ID in hand this is a deterministic check, not a probability.
+        """
+        gen = self._id_gen
+        if not isinstance(gen, CompactIdFactory):
+            return
+        existing = {p for p in map(session_prefix, self._node_map) if p is not None}
+        if gen.session_id in existing:
+            self._id_gen = node_id_factory(
+                self, self._node_id_generator.extract_time, existing
+            )
+
     def abort(self) -> None:
         from . import _operations as ops
 
@@ -533,6 +786,7 @@ class Doc:
         ops.on_apply_operations(self, inverse)
         self._operations = ([], {})
         self._inverse_operations = ([], {})
+        self._transaction_flags = TransactionFlags()
         self._diff = Diff()
         self._lifecycle_stage = "idle"
 
@@ -565,6 +819,7 @@ class Doc:
         operations: Operations | list[Operations],
         *,
         limit: int | None = None,
+        skip_undo: bool = False,
     ) -> list[Operations]:
         """Apply operations. Returns any unapplied operations.
 
@@ -572,6 +827,10 @@ class Doc:
         (a journal). ``limit`` controls how many entries to apply from a
         journal. Returns the remaining unapplied entries (empty list if all
         applied).
+
+        ``skip_undo`` applies the operations in their own transaction(s)
+        flagged so the undo manager ignores them — use it for operations
+        received from a remote peer. Any open transaction is committed first.
         """
         from . import _operations as ops
         from ._transaction import with_transaction
@@ -590,12 +849,17 @@ class Doc:
             to_apply = journal
             remaining = []
 
+        flags = TransactionFlags(skip_undo=True) if skip_undo else None
+
         for single_ops in to_apply:
             def _do(op: Operations = single_ops) -> None:
                 if not op[0] and not op[1]:
                     return
                 ops.on_apply_operations(self, op)
-            with_transaction(self, _do, is_apply_operations=True)
+            with_transaction(self, _do, is_apply_operations=True, flags=flags)
+
+        if skip_undo and self._lifecycle_stage == "update":
+            self.force_commit()
 
         return remaining
 
@@ -606,6 +870,7 @@ class Doc:
             )
         self._change_listeners.clear()
         self._normalize_listeners.clear()
+        self._ref_index.clear()
         self._lifecycle_stage = "disposed"
 
     # --- Clean JSON (user-facing, no IDs) ---
@@ -613,7 +878,11 @@ class Doc:
     def to_json(
         self, node: AtomNode | None = None, *, include_defaults: bool = False,
     ) -> dict[str, Any]:
-        """Return clean JSON for a node (default: root). No internal IDs.
+        """Return clean JSON for a node (default: root).
+
+        Node IDs are omitted; the tree is nested data. The one exception is
+        a ``Ref[T]`` field, whose value *is* a node ID and is emitted as
+        such. For a format that round-trips, use ``dump()``.
 
         If ``include_defaults`` is True, fields with default values are
         included in the output.
@@ -643,8 +912,14 @@ class Doc:
         nodes: list[type[AtomNode]] | None = None,
         extensions: list[Extension] | None = None,
         strict_mode: bool = True,
+        undo_manager: UndoManagerConfig | None = None,
+        node_id_generator: NodeIdGenerator | None = None,
     ) -> Doc:
-        """Restore a document from wire format (dump output)."""
+        """Restore a document from wire format (dump output).
+
+        Normalizers run once the tree is loaded, and the result is not
+        recorded in undo history.
+        """
         doc_id = data[0]
         root_type_str = data[1]
 
@@ -656,6 +931,9 @@ class Doc:
             extensions=extensions,
             doc_id=doc_id,
             strict_mode=strict_mode,
+            undo_manager=undo_manager,
+            node_id_generator=node_id_generator,
+            _defer_init=True,
         )
 
         root = doc._create_node_from_json(data)
@@ -666,12 +944,36 @@ class Doc:
         if len(data) > 3 and data[3]:
             _deserialize_slots(doc, root, data[3])
 
+        doc._reseed_id_factory()
+
+        doc._rebuild_ref_index()
+        dangling = doc._dangling_refs()
+        if dangling:
+            referrer, name, target_id = dangling[0]
+            message = (
+                f"{len(dangling)} unresolved reference(s) in restored document, "
+                f"e.g. {type(referrer).__name__}.{name} on node "
+                f"'{referrer.id}' -> '{target_id}'"
+            )
+            if strict_mode:
+                raise RefIntegrityError(message)
+            warnings.warn(message, stacklevel=2)
+
+        # Normalizers see the restored tree; nothing here is undoable.
+        doc._finish_init()
         return doc
 
     def _create_node_from_json(self, json_node: JsonDoc) -> AtomNode:
         node_id = json_node[0]
         node_type = json_node[1]
         state_dict = json_node[2] if len(json_node) > 2 else {}
+
+        # With a time-extracting generator, non-root IDs use the compact
+        # scheme and only the root is validated (in the constructor).
+        if self._node_id_generator.extract_time is None and not (
+            isinstance(node_id, str) and self._node_id_generator.validate(node_id)
+        ):
+            raise ValueError(f"Invalid node id: {node_id!r}")
 
         node_cls = self._node_types.get(node_type)
         if node_cls is None:
@@ -710,17 +1012,40 @@ class Doc:
         for type_name, node_cls in self._node_types.items():
             entry: dict[str, Any] = {}
 
-            # JSON Schema from field adapters (avoids _schema_model rebuild issues)
+            # JSON Schema per field (avoids _schema_model rebuild issues).
+            # ``Field(...)`` constraints ride along via Annotated metadata.
             properties: dict[str, Any] = {}
             for fname, adapter in node_cls._field_adapters.items():
                 try:
-                    properties[fname] = adapter.json_schema()
+                    info = node_cls._field_infos.get(fname)
+                    if info is not None and info.metadata and fname not in node_cls._ref_defs:
+                        ann = node_cls._field_annotations[fname]
+                        prop = TypeAdapter(Annotated[(ann, *info.metadata)]).json_schema()
+                    else:
+                        prop = adapter.json_schema()
                 except Exception:
-                    properties[fname] = {}
+                    prop = {}
+                fdefault = node_cls._field_defaults.get(fname, _MISSING)
+                if fdefault is not _MISSING and "default" not in prop:
+                    try:
+                        prop["default"] = _json_safe(fdefault)
+                    except Exception:
+                        pass
+                properties[fname] = prop
             entry["json_schema"] = {"type": "object", "properties": properties}
 
             # Field tiers
             entry["field_tiers"] = dict(node_cls._field_tiers)
+
+            # References: target type, cardinality, delete policy
+            entry["refs"] = {
+                fname: {
+                    "target_type": rdef.target_name,
+                    "many": rdef.many,
+                    "policy": rdef.policy,
+                }
+                for fname, rdef in node_cls._ref_defs.items()
+            }
 
             # Slots
             slots: dict[str, Any] = {}
@@ -740,10 +1065,7 @@ class Doc:
             for fname, fdefault in node_cls._field_defaults.items():
                 if fdefault is _MISSING:
                     continue
-                if isinstance(fdefault, BaseModel):
-                    defaults[fname] = fdefault.model_dump(mode="json")
-                else:
-                    defaults[fname] = fdefault
+                defaults[fname] = _json_safe(fdefault)
             entry["field_defaults"] = defaults
 
             node_types[type_name] = entry
@@ -776,6 +1098,17 @@ class Doc:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _json_safe(value: Any) -> Any:
+    """A JSON-compatible copy of a field default."""
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, bytes):
+        import base64
+
+        return base64.b64encode(value).decode()
+    return value
 
 
 def _node_to_wire(node: AtomNode, include_defaults: bool = False) -> JsonDoc:

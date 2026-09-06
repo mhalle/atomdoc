@@ -2,12 +2,15 @@
 
 from ._array import Array
 from ._doc import Doc, Extension, node
+from ._id import NodeIdGenerator, default_node_id_generator
 from ._node import AtomNode
+from ._operations import merge_operations
 from ._protocol import operations_from_wire, operations_to_wire
+from ._ref import Ref, RefIntegrityError
 from ._session import Session
 from ._transport import ClientConnection, Transport
-from ._types import ChangeEvent, Diff, Operations
-from ._undo import UndoManager
+from ._types import ChangeEvent, Diff, Operations, TransactionFlags
+from ._undo import UndoHistory, UndoManager, UndoManagerConfig
 
 __all__ = [
     "Array",
@@ -15,12 +18,20 @@ __all__ = [
     "AtomNode",
     "Extension",
     "UndoManager",
+    "UndoManagerConfig",
+    "UndoHistory",
     "ChangeEvent",
     "ClientConnection",
     "Diff",
+    "NodeIdGenerator",
     "Operations",
+    "Ref",
+    "RefIntegrityError",
     "Session",
+    "TransactionFlags",
     "Transport",
+    "default_node_id_generator",
+    "merge_operations",
     "node",
     "operations_from_wire",
     "operations_to_wire",

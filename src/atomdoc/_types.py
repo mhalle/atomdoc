@@ -1,7 +1,8 @@
-"""Type aliases, Diff, ChangeEvent, Operations."""
+"""Type aliases, Diff, ChangeEvent, TransactionFlags, Operations."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
@@ -35,6 +36,17 @@ StatePatch = dict[str, dict[str, Any]]
 Operations = tuple[list[OrderedOperation], StatePatch]
 
 
+@dataclass(frozen=True)
+class TransactionFlags:
+    """Per-transaction flags, delivered to change listeners.
+
+    ``skip_undo`` marks a transaction that must not enter undo history —
+    typically one that applies operations received from a remote peer.
+    """
+
+    skip_undo: bool = False
+
+
 class Diff:
     """Summary of changes during a transaction."""
 
@@ -50,17 +62,19 @@ class Diff:
 class ChangeEvent:
     """Emitted after a transaction commits."""
 
-    __slots__ = ("operations", "inverse_operations", "diff")
+    __slots__ = ("operations", "inverse_operations", "diff", "flags")
 
     def __init__(
         self,
         operations: Operations,
         inverse_operations: Operations,
         diff: Diff,
+        flags: TransactionFlags | None = None,
     ) -> None:
         self.operations = operations
         self.inverse_operations = inverse_operations
         self.diff = diff
+        self.flags = flags if flags is not None else TransactionFlags()
 
 
 # JSON document format (new — dict-based children):

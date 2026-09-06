@@ -214,3 +214,37 @@ class TestPlainClassNoValidation:
             x: int = 0
 
         assert PlainNode._validator_model is None
+
+
+def test_plain_class_field_default_is_unwrapped():
+    from pydantic import Field
+
+    from atomdoc import Doc, node
+
+    @node
+    class Plain:
+        opacity: float = Field(ge=0.0, le=1.0, default=1.0)
+
+    doc = Doc(Plain)
+    assert doc.root.opacity == 1.0
+    assert Plain._field_defaults["opacity"] == 1.0
+
+
+def test_plain_class_field_constraints_enforced_at_commit():
+    import pytest
+    from pydantic import Field, ValidationError
+
+    from atomdoc import Doc, node
+
+    @node
+    class Plain:
+        opacity: float = Field(ge=0.0, le=1.0, default=1.0)
+
+    doc = Doc(Plain)
+    with pytest.raises(ValidationError):
+        with doc.transaction():
+            doc.root.opacity = 5.0
+    assert doc.root.opacity == 1.0
+    with doc.transaction():
+        doc.root.opacity = 0.5
+    assert doc.root.opacity == 0.5

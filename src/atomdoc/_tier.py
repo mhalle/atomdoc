@@ -1,4 +1,4 @@
-"""Field classification: mergeable / atomic / opaque."""
+"""Field classification: mergeable / atomic / opaque / ref."""
 
 from __future__ import annotations
 
@@ -6,7 +6,9 @@ from typing import Any, Literal, get_args, get_origin
 
 from pydantic import BaseModel
 
-Tier = Literal["mergeable", "atomic", "opaque"]
+from ._ref import parse_ref_annotation
+
+Tier = Literal["mergeable", "atomic", "opaque", "ref"]
 
 
 def _is_frozen_model(ann: Any) -> bool:
@@ -24,10 +26,13 @@ def _is_frozen_model(ann: Any) -> bool:
 def classify_field(annotation: Any) -> Tier:
     """Classify a field annotation into its tier.
 
+    - Ref[T] / list[Ref[T]] → ref
     - bytes → opaque
     - frozen BaseModel → atomic
     - everything else → mergeable
     """
+    if parse_ref_annotation(annotation) is not None:
+        return "ref"
     # Unwrap Optional / Union with None
     origin = get_origin(annotation)
     if origin is not None:

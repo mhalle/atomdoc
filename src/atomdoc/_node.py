@@ -2,19 +2,92 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from typing import Any, ClassVar, get_type_hints
 
 from pydantic import BaseModel, TypeAdapter, create_model
+from pydantic.fields import FieldInfo
+from pydantic_core import PydanticUndefined
 
-from ._array import get_array_element_type
+from ._array import Array, get_array_element_type
 from ._children import ChildrenView
-from ._descriptors import StateDescriptor
+from ._descriptors import RefDescriptor, StateDescriptor
 from ._range import NodeRange
+from ._ref import Ref, RefAdapter, RefDef, parse_ref_annotation
 from ._tier import Tier, classify_field
 
 # Sentinel for "no default"
 _MISSING = object()
+
+# A string annotation that (probably) declares an ``Array[...]`` slot or a
+# ``Ref[...]`` field.
+_MARKER_LIKE = re.compile(r"\b(?:Array|Ref)\s*\[")
+
+
+def _resolve_annotations(
+    cls: type, annotations: dict[str, Any], owners: dict[str, type]
+) -> dict[str, Any]:
+    """Resolve string annotations left by ``from __future__ import annotations``.
+
+    ``typing.get_type_hints`` is tried first.  Passing only ``localns`` makes
+    it evaluate each class in the MRO against that class's *own* module
+    globals, so mixin bases from other modules and AtomNode's internals all
+    resolve.  ``localns`` adds the atomdoc names a field may reference
+    without importing them under the same name, plus the class itself so
+    self-referential slots (``children: Array[Tree]``) resolve before the
+    module-level name is bound.
+
+    ``get_type_hints`` raises as a whole when any one name is unresolvable,
+    so on failure each field is evaluated on its own (against the globals of
+    the class that declared it) and the rest still resolve.  A field that is
+    still a string and looks like ``Array[...]`` or ``Ref[...]`` raises
+    TypeError: left alone it would silently become an ordinary state field
+    (a plain Python list, or a bare string) and the document would never
+    record its children or track the reference.
+    """
+    localns: dict[str, Any] = {
+        "Array": Array, "Ref": Ref, "AtomNode": AtomNode, cls.__name__: cls,
+    }
+    # Inherited slot annotations are re-resolved on every subclass, so a
+    # base node class must be findable by name even when it is function-local.
+    for base in cls.__mro__[1:]:
+        if base is AtomNode or base is object:
+            continue
+        localns.setdefault(base.__name__, base)
+    resolved = dict(annotations)
+
+    try:
+        hints = get_type_hints(cls, localns=localns, include_extras=True)
+    except Exception:
+        hints = {}
+    for name in annotations:
+        if name in hints:
+            resolved[name] = hints[name]
+
+    for name, ann in resolved.items():
+        if not isinstance(ann, str):
+            continue
+        owner = owners[name]
+        module = sys.modules.get(owner.__module__, None)
+        globalns = module.__dict__ if module is not None else {}
+        try:
+            resolved[name] = eval(ann, globalns, localns)  # noqa: S307
+        except Exception as exc:
+            if _MARKER_LIKE.search(ann):
+                raise TypeError(
+                    f"{cls.__qualname__}.{name}: cannot resolve the "
+                    f"annotation {ann!r} ({type(exc).__name__}: {exc}). "
+                    f"Array[...] and Ref[...] target types must be resolvable from the "
+                    f"globals of module {owner.__module__!r} (plus atomdoc names "
+                    f"and the node class itself); a class defined inside a "
+                    f"function cannot be found from a string annotation. Define "
+                    f"the element type at module level, or drop "
+                    f"'from __future__ import annotations' in that module."
+                ) from exc
+            # Non-slot fields keep the string; Pydantic gets a chance to
+            # resolve it when the schema model is built.
+    return resolved
 
 
 class SlotDef:
@@ -61,6 +134,9 @@ class AtomNode:
     _validator_model: ClassVar[type[BaseModel] | None]  # source BaseModel with validators
     _field_defaults: ClassVar[dict[str, Any]]
     _field_tiers: ClassVar[dict[str, Tier]]
+    _field_annotations: ClassVar[dict[str, Any]] = {}
+    _field_infos: ClassVar[dict[str, FieldInfo]] = {}
+    _ref_defs: ClassVar[dict[str, RefDef]] = {}
     _field_adapters: ClassVar[dict[str, TypeAdapter[Any]]]
     _slot_defs: ClassVar[dict[str, SlotDef]]
     _slot_order: ClassVar[list[str]]
@@ -90,9 +166,12 @@ class AtomNode:
         if not hasattr(cls, "_validator_model"):
             cls._validator_model = None
 
-        # Walk MRO to collect annotations + defaults
+        # Walk MRO to collect annotations + defaults, remembering which
+        # class declared each field so its string annotations can be
+        # resolved against that class's module.
         annotations: dict[str, Any] = {}
         defaults: dict[str, Any] = {}
+        owners: dict[str, type] = {}
 
         for base in reversed(cls.__mro__):
             if base is AtomNode or base is object:
@@ -102,29 +181,20 @@ class AtomNode:
                 if name.startswith("_"):
                     continue
                 annotations[name] = ann
+                owners[name] = base
                 if hasattr(base, name):
                     val = getattr(base, name)
                     if not isinstance(val, (StateDescriptor, SlotDescriptor)):
                         defaults[name] = val
 
         # Resolve string annotations (needed for ``from __future__ import
-        # annotations``).  We only resolve the user-declared field names,
-        # not the full MRO, to avoid needing atomdoc internals in the
-        # namespace.
-        module = sys.modules.get(cls.__module__, None)
-        if module is not None:
-            globalns = module.__dict__
-            for name in list(annotations):
-                ann = annotations[name]
-                if isinstance(ann, str):
-                    try:
-                        annotations[name] = eval(ann, globalns)  # noqa: S307
-                    except Exception:
-                        pass
+        # annotations``).  Raises TypeError for an unresolvable Array slot.
+        annotations = _resolve_annotations(cls, annotations, owners)
 
         # Separate Array fields (slots) from state fields
         state_annotations: dict[str, Any] = {}
         state_defaults: dict[str, Any] = {}
+        field_infos: dict[str, FieldInfo] = {}
         slot_defs: dict[str, SlotDef] = {}
         slot_order: list[str] = []
 
@@ -138,10 +208,23 @@ class AtomNode:
             else:
                 state_annotations[name] = ann
                 if name in defaults:
-                    state_defaults[name] = defaults[name]
+                    default = defaults[name]
+                    if isinstance(default, FieldInfo):
+                        # ``x: float = Field(ge=0, default=1.0)`` on a plain
+                        # class: keep the constraints, unwrap the default.
+                        field_infos[name] = default
+                        if default.default is not PydanticUndefined:
+                            state_defaults[name] = default.default
+                        elif default.default_factory is not None:
+                            state_defaults[name] = default.default_factory()  # type: ignore[call-arg]
+                    else:
+                        state_defaults[name] = default
 
         cls._slot_defs = slot_defs
         cls._slot_order = slot_order
+        cls._field_annotations = dict(state_annotations)
+        cls._field_infos = field_infos
+        cls._ref_defs = {}
 
         # Build Pydantic schema model from state fields only
         if not state_annotations:
@@ -153,7 +236,9 @@ class AtomNode:
 
         model_fields: dict[str, Any] = {}
         for name, ann in state_annotations.items():
-            if name in state_defaults:
+            if name in field_infos:
+                model_fields[name] = (ann, field_infos[name])
+            elif name in state_defaults:
                 model_fields[name] = (ann, state_defaults[name])
             else:
                 model_fields[name] = (ann, ...)
@@ -170,18 +255,32 @@ class AtomNode:
 
         for name, ann in state_annotations.items():
             default = state_defaults.get(name, _MISSING)
+            cls._field_defaults[name] = default
+
+            ref_spec = parse_ref_annotation(ann)
+            if ref_spec is not None:
+                target, many, optional = ref_spec
+                rdef = RefDef(name, target, many, optional)
+                cls._ref_defs[name] = rdef
+                cls._field_tiers[name] = "ref"
+                ref_adapter = RefAdapter(rdef)
+                cls._field_adapters[name] = ref_adapter  # type: ignore[assignment]
+                setattr(cls, name, RefDescriptor(name, ref_adapter))
+                continue
+
             tier = classify_field(ann)
             cls._field_tiers[name] = tier
             adapter = TypeAdapter(ann)
             cls._field_adapters[name] = adapter
 
-            if default is not _MISSING:
-                cls._field_defaults[name] = default
-            else:
-                cls._field_defaults[name] = _MISSING
-
-            desc = StateDescriptor(name, ann, default if default is not _MISSING else _MISSING)
+            desc = StateDescriptor(name, ann, default)
             setattr(cls, name, desc)
+
+        # Constraints declared with ``Field(...)`` on a plain class are
+        # enforced at commit, like validators on a BaseModel source.
+        if field_infos and any(fi.metadata for fi in field_infos.values()):
+            if getattr(cls, "_validator_model", None) is None:
+                cls._validator_model = cls._schema_model
 
     def __init__(self, _id: str | None = None, _doc: Any = None, **kwargs: Any) -> None:
         if _id is not None:
@@ -246,6 +345,13 @@ class AtomNode:
     def __repr__(self) -> str:
         return f"<{type(self).__name__} id={self.id!r}>"
 
+    def ref_id(self, name: str) -> str | list[str] | None:
+        """The stored ID (or IDs) of reference field ``name``, unresolved."""
+        if name not in self._ref_defs:
+            raise AttributeError(f"'{name}' is not a reference field")
+        value = self._state.get(name)
+        return list(value) if isinstance(value, list) else value
+
     # --- Range ---
 
     def to(self, later_sibling: AtomNode) -> NodeRange:
@@ -258,9 +364,15 @@ class AtomNode:
         """Delete this node and all its descendants."""
         self.to(self).delete()
 
-    def move(self, target: AtomNode, slot_name: str, position: str = "append") -> None:
-        """Move this node to a slot on target."""
-        self.to(self).move(target, slot_name, position)  # type: ignore[arg-type]
+    def move(
+        self,
+        target: AtomNode,
+        slot_name: str | None = None,
+        position: str = "append",
+    ) -> None:
+        """Move this node to a slot on ``target`` (append/prepend) or next to
+        a sibling ``target`` (before/after)."""
+        self.to(self).move(target, slot_name, position)
 
     def insert_after(self, *nodes: AtomNode) -> None:
         """Insert nodes after this node in the same slot."""
