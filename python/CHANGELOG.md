@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **`@node` classes could not inherit from each other.** A derived
+  `@node` class was built directly on `AtomNode`, so it was not a
+  subclass of its base, an `Array[Base]` slot refused it, it had to be
+  registered by hand, and only subclassing `AtomNode` directly worked —
+  losing the base's `@model_validator`. A `@node` class now derives from
+  its base's node class (or the node class made from a base source
+  class), inherits its fields, is discovered with it, and a derived
+  Pydantic source keeps the base's validators.
+- **Inherited fields lost their defaults, factories and `Field`
+  constraints, and an inherited `Ref[T] | None` got a descriptor object
+  as its default** (which then reached `json.dumps`). The base's
+  processed declarations are recovered instead of its descriptors.
+- **`dump()`, `to_json()` and patches did not serialize collections of
+  frozen models** (`list[Color]`, `dict[str, Color]`); only a top-level
+  model was dumped. Containers are now walked.
+
 ## [0.4.3] - 2026-09-07
 
 First release from the monorepo; atomdoc-ts 0.4.3 is the same code as

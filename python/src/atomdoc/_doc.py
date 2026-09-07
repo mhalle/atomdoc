@@ -77,10 +77,43 @@ def _is_resolved_annotation(field_info: Any) -> bool:
     )
 
 
+# Source class (the class ``@node`` was applied to) -> the node class made
+# from it, so a class deriving from a source derives from its node class.
+_NODE_FOR_SOURCE: weakref.WeakKeyDictionary[type, type[AtomNode]] = weakref.WeakKeyDictionary()
+
+
+def _node_bases_of(source_cls: type) -> tuple[type, ...]:
+    """The node classes a ``@node`` class inherits from.
+
+    A base that is itself a node class is used as is; a base that was the
+    source of one (``@node class Base(BaseModel)`` then
+    ``@node class Derived(Base)``) maps to that node class. So the derived
+    node class is a real subclass: it inherits fields, ``isinstance``
+    holds, and an ``Array[Base]`` slot accepts it.
+    """
+    bases: list[type] = []
+    for base in source_cls.__bases__:
+        node_base: type | None = None
+        if isinstance(base, type) and issubclass(base, AtomNode) and base is not AtomNode:
+            node_base = base
+        else:
+            node_base = _NODE_FOR_SOURCE.get(base)
+        if node_base is not None and node_base not in bases:
+            bases.append(node_base)
+    return tuple(bases) or (AtomNode,)
+
+
 def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNode]:
     """Create a AtomNode subclass from any annotated class."""
 
-    # Extract annotations and defaults
+    node_bases = _node_bases_of(source_cls)
+    inherited_fields: set[str] = set()
+    for nb in node_bases:
+        inherited_fields.update(getattr(nb, "_field_annotations", {}))
+        inherited_fields.update(getattr(nb, "_slot_defs", {}))
+
+    # Extract the class's own annotations and defaults. Fields of a node
+    # base are inherited through that base, not re-declared here.
     annotations: dict[str, Any] = {}
     defaults: dict[str, Any] = {}
 
@@ -98,6 +131,8 @@ def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNod
     is_pydantic = isinstance(source_cls, type) and issubclass(source_cls, BaseModel)
     if is_pydantic:
         for field_name, field_info in source_cls.model_fields.items():  # type: ignore[attr-defined]
+            if field_name in inherited_fields and field_name not in annotations:
+                continue  # declared by a node base; inherited from it
             if field_name not in annotations:
                 annotations[field_name] = field_info.annotation
             elif isinstance(annotations[field_name], str) and _is_resolved_annotation(field_info):
@@ -135,22 +170,27 @@ def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNod
     # Create the AtomNode subclass
     new_cls = type(
         source_cls.__name__,
-        (AtomNode,),
+        node_bases,
         ns,
         node_type=node_type_name,
     )
+    _NODE_FOR_SOURCE[source_cls] = new_cls
 
     # If the source is a BaseModel, store it as the validator model.
     # This preserves @field_validator, @model_validator, Field constraints, etc.
-    # At commit time, updated nodes are validated against this model.
+    # At commit time, updated nodes are validated against this model. A
+    # plain class deriving from a node class keeps that class's validator.
     if is_pydantic:
         new_cls._validator_model = source_cls  # type: ignore[attr-defined]
 
-    # A self-reference (``Ref["Volume"]`` inside ``class Volume(BaseModel)``)
-    # resolves to the source class; point it at the node class instead.
+    # A reference to a source class (``Ref["Volume"]`` inside
+    # ``class Volume(BaseModel)``, or ``Ref[Base]`` where ``Base`` was a
+    # source) resolves to the source; point it at the node class instead.
     for ref_def in new_cls._ref_defs.values():
         if ref_def.target is source_cls:
             ref_def.target = new_cls
+        elif isinstance(ref_def.target, type) and ref_def.target in _NODE_FOR_SOURCE:
+            ref_def.target = _NODE_FOR_SOURCE[ref_def.target]
 
     return new_cls
 
@@ -224,6 +264,11 @@ def _discover_node_types(root_cls: type[AtomNode]) -> dict[str, type[AtomNode]]:
             target = ref_def.target
             if isinstance(target, type) and hasattr(target, "_node_type") and target not in result.values():
                 pending.append(target)  # type: ignore[arg-type]
+        # A slot typed ``Array[Base]`` accepts subclasses of Base, so every
+        # node class deriving from a discovered one is part of the document.
+        for sub in cls.__subclasses__():
+            if hasattr(sub, "_node_type") and not sub._is_abstract and sub not in result.values():
+                pending.append(sub)
     return result
 
 
@@ -704,26 +749,35 @@ class Doc:
             node = self._node_map.get(node_id)
             if node is None:
                 continue
-            validator = getattr(type(node), "_validator_model", None)
-            if validator is None:
+            cls = type(node)
+            validator = getattr(cls, "_validator_model", None)
+            constraint = getattr(cls, "_constraint_model", None)
+            if (
+                constraint is not None
+                and validator is not None
+                and cls._constrained_fields <= set(getattr(validator, "model_fields", {}))
+            ):
+                constraint = None  # the source model enforces them itself
+            models = [m for m in (validator, constraint) if m is not None]
+            if not models:
                 continue
 
-            # Build a data dict for the validator model.
+            # Build a data dict for the models.
             # State fields get their current values; Array fields get empty lists.
             data: dict[str, Any] = {}
-            for name, default in type(node)._field_defaults.items():
+            for name, default in cls._field_defaults.items():
                 if default is not _MISSING:
                     data[name] = node._state.get(name, default)
                 elif name in node._state:
                     data[name] = node._state[name]
 
-            # Fill Array fields with empty lists so the model doesn't complain
-            for name in getattr(validator, "__annotations__", {}):
-                ann = validator.__annotations__[name]
-                if get_array_element_type(ann) is not None and name not in data:
-                    data[name] = []
-
-            validator.model_validate(data)
+            for model in models:
+                # Fill Array fields with empty lists so the model doesn't complain
+                for name in getattr(model, "__annotations__", {}):
+                    ann = model.__annotations__[name]
+                    if get_array_element_type(ann) is not None and name not in data:
+                        data[name] = []
+                model.model_validate(data)
 
     # --- References ---
 

@@ -9,6 +9,7 @@ import sys
 from collections.abc import Callable
 from typing import Any, ClassVar, get_type_hints
 
+from pydantic_core import to_jsonable_python
 from pydantic import BaseModel, ConfigDict, TypeAdapter, create_model
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined
@@ -126,6 +127,27 @@ def _copy_container(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
+def _value_to_json(value: Any) -> Any:
+    """A state value as native JSON.
+
+    Models (frozen values, handles) dump in JSON mode; ``bytes`` (the
+    opaque tier) are base64; a container is walked so a ``list[Color]`` or
+    ``dict[str, Color]`` serializes its models too; JSON scalars pass
+    through.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, bytes):
+        import base64
+
+        return base64.b64encode(value).decode()
+    if isinstance(value, (list, tuple, dict, set, frozenset)):
+        return to_jsonable_python(value)
+    return value
+
+
 class SlotDescriptor:
     """Property descriptor that returns a ChildrenView for a named slot.
 
@@ -170,6 +192,8 @@ class AtomNode:
     _node_type: ClassVar[str]
     _schema_model: ClassVar[type[BaseModel] | None]
     _validator_model: ClassVar[type[BaseModel] | None]  # source BaseModel with validators
+    _constraint_model: ClassVar[type[BaseModel] | None] = None  # schema model, for Field constraints
+    _constrained_fields: ClassVar[set[str]] = set()
     _field_defaults: ClassVar[dict[str, Any]]
     _field_tiers: ClassVar[dict[str, Tier]]
     _field_annotations: ClassVar[dict[str, Any]] = {}
@@ -223,7 +247,19 @@ class AtomNode:
                 owners[name] = base
                 if hasattr(base, name):
                     val = getattr(base, name)
-                    if not isinstance(val, (StateDescriptor, SlotDescriptor)):
+                    if isinstance(val, (StateDescriptor, RefDescriptor, SlotDescriptor)):
+                        # A node base has already replaced its declaration
+                        # with a descriptor; recover what it was built from
+                        # so the field inherits its default, factory and
+                        # constraints rather than the descriptor object.
+                        info = getattr(base, "_field_infos", {}).get(name)
+                        if info is not None:
+                            defaults[name] = info
+                        else:
+                            inherited = getattr(base, "_field_defaults", {}).get(name, _MISSING)
+                            if inherited is not _MISSING:
+                                defaults[name] = inherited
+                    else:
                         defaults[name] = val
 
         # Resolve string annotations (needed for ``from __future__ import
@@ -325,11 +361,13 @@ class AtomNode:
             desc = StateDescriptor(name, ann, default)
             setattr(cls, name, desc)
 
-        # Constraints declared with ``Field(...)`` on a plain class are
-        # enforced at commit, like validators on a BaseModel source.
-        if field_infos and any(fi.metadata for fi in field_infos.values()):
-            if getattr(cls, "_validator_model", None) is None:
-                cls._validator_model = cls._schema_model
+        # Constraints declared with ``Field(...)`` (own or inherited) are
+        # enforced at commit through the schema model, unless the class's
+        # validator model already covers those fields (a BaseModel source
+        # validates its own constraints).
+        constrained = {name for name, fi in field_infos.items() if fi.metadata}
+        cls._constraint_model = cls._schema_model if constrained else None
+        cls._constrained_fields = constrained
 
     @classmethod
     def _fresh_default(cls, name: str) -> Any:
@@ -502,8 +540,6 @@ class AtomNode:
         Falls back to the field's default if unset, or ``None`` if no
         default is defined.
         """
-        from pydantic import BaseModel as _BM
-
         if key not in self._state:
             default = self._field_defaults.get(key, _MISSING)
             if default is _MISSING:
@@ -512,13 +548,7 @@ class AtomNode:
         else:
             value = self._state[key]
 
-        if isinstance(value, _BM):
-            return value.model_dump(mode="json")
-        elif isinstance(value, bytes):
-            import base64
-            return base64.b64encode(value).decode()
-        else:
-            return value
+        return _value_to_json(value)
 
     def _parse_state_key(self, key: str, json_val: Any) -> Any:
         """Parse a native JSON state value into its Python type."""
@@ -532,21 +562,13 @@ class AtomNode:
         If ``include_defaults`` is False (default), fields matching their
         default value are omitted.
         """
-        from pydantic import BaseModel as _BM
-
         result: dict[str, Any] = {}
         for key, value in self._state.items():
             if not include_defaults:
                 default = self._field_defaults.get(key, _MISSING)
                 if default is not _MISSING and value == default:
                     continue
-            if isinstance(value, _BM):
-                result[key] = value.model_dump(mode="json")
-            elif isinstance(value, bytes):
-                import base64
-                result[key] = base64.b64encode(value).decode()
-            else:
-                result[key] = value
+            result[key] = _value_to_json(value)
         return result
 
     def _parse_json_value(self, key: str, json_val: Any) -> Any:

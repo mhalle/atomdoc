@@ -682,6 +682,32 @@ class MyNode:
 
 The node type name defaults to the class name.
 
+Node classes inherit. A `@node` class whose base is another `@node`
+class (or the class that one was made from) becomes a real subclass of
+that node type: it inherits the base's fields with their defaults,
+factories and `Field` constraints, `isinstance` holds, and a slot typed
+`Array[Base]` accepts it. A derived Pydantic source keeps the base's
+validators and adds its own. Subclasses are discovered with their base,
+so they need no separate registration.
+
+```python
+@node
+class Shape(BaseModel):
+    name: str = ""
+    opacity: float = Field(default=1.0, ge=0.0, le=1.0)
+
+@node
+class Circle(Shape):
+    radius: float = Field(default=1.0, gt=0)
+
+@node
+class Canvas:
+    shapes: Array[Shape] = []      # accepts Shape and Circle
+```
+
+Subclassing `AtomNode` directly with `node_type=` works the same way for
+inheritance; use `@node` on a `BaseModel` when you want validators.
+
 ## Tree navigation
 
 Navigation goes through the doc:
