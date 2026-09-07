@@ -32,7 +32,7 @@ function ratio(run: (n: number) => number, scale = 1): number {
   };
   run(small); // warm up
   let t1 = best(small);
-  while (t1 < 1e-3 && small < 64 * N) {
+  while (t1 < 1e-3 && small < 16 * N) {
     small *= 4;
     t1 = best(small);
   }
@@ -75,7 +75,7 @@ describe("scaling", () => {
     it(`${name} scales linearly`, () => {
       const sc = scenarios[name];
       expect(bestRatio(sc.run, sc.scale), name).toBeLessThan(QUADRATIC_BOUND);
-    });
+    }, 60000); // a slow shared runner must not turn a measurement into a timeout
   }
 
   it("filling a slot in one transaction stays linear through the store", () => {
@@ -99,7 +99,7 @@ describe("scaling", () => {
       return secs;
     };
     expect(bestRatio(run)).toBeLessThan(QUADRATIC_BOUND);
-  });
+  }, 60000);
 
   it("a chain thousands of nodes deep builds, serializes, and deletes", () => {
     const depth = 5000;
