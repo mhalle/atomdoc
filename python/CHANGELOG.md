@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **A validator on a derived `@node` class could not use the class's
+  `ClassVar` members or helper methods**: they were carried onto the
+  node type but not onto the validator model built for the class. The
+  model now gets the same members.
+
+### Added
+
+- `validation_causes(exc)`: the original exceptions a validator raised,
+  recovered from a Pydantic `ValidationError`, so an application can
+  re-raise its own exception type with the original as the cause.
+
 ## [0.4.6] - 2026-09-07
 
 `@node` keeps the source class's behavior. No wire or schema changes;

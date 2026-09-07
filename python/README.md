@@ -656,6 +656,32 @@ with doc.transaction():
 
 If validation fails at commit, the entire transaction rolls back.
 
+### Validators and the class's members
+
+A validator may use the class's `ClassVar` tables, constants and helper
+methods: they are carried onto the node type and onto the validator
+model alike, so `self.ARITY[self.kind]` or `cls._normalize(v)` work
+inside a validator as they would on the original class.
+
+### Recovering your own exception
+
+Pydantic reports a `ValueError` raised inside a validator as an entry of
+its `ValidationError`, but keeps the original exception object.
+`validation_causes(exc)` returns those originals, so an application can
+raise one exception type for all of its rules, with the document already
+rolled back:
+
+```python
+from atomdoc import validation_causes
+
+try:
+    with doc.transaction():
+        node.kind = "deformable"
+except ValidationError as exc:
+    cause = validation_causes(exc)[0]
+    raise InvariantError(str(cause)) from cause
+```
+
 ### Plain classes skip validation
 
 `@node` on a plain class (not a `BaseModel`) works without model-level

@@ -94,3 +94,58 @@ def test_shadowing_the_node_api_is_an_error():
 
             def delete(self) -> None:  # pragma: no cover
                 pass
+
+
+
+# --- validators see class members; original exceptions are recoverable ---
+
+
+class InvariantError(ValueError):
+    pass
+
+
+@node
+class Transform(BaseModel):
+    kind: str = "rigid"
+
+
+@node
+class Warp(Transform):
+    ARITY: ClassVar[dict[str, int]] = {"rigid": 0, "deformable": 1}
+    fields: list[str] = []
+
+    def _needed(self) -> int:
+        return self.ARITY[self.kind]
+
+    @model_validator(mode="after")
+    def enough_fields(self):
+        if len(self.fields) < self._needed():
+            raise InvariantError(f"{self.kind} needs {self._needed()} field(s)")
+        return self
+
+
+@node
+class WRoot:
+    transforms: Array[Transform] = []
+
+
+def test_validator_on_derived_class_uses_classvars_and_helpers():
+    from pydantic import ValidationError
+
+    from atomdoc import validation_causes
+
+    doc = Doc(WRoot)
+    w = doc.create_node(Warp)
+    doc.root.transforms.append(w)
+    with pytest.raises(ValidationError) as info:
+        w.kind = "deformable"
+    assert w.kind == "rigid"  # rolled back
+    causes = validation_causes(info.value)
+    assert len(causes) == 1
+    assert isinstance(causes[0], InvariantError)
+    assert str(causes[0]) == "deformable needs 1 field(s)"
+    assert validation_causes(RuntimeError("x")) == []
+    with doc.transaction():
+        w.fields = ["f"]
+        w.kind = "deformable"
+    assert w.kind == "deformable"

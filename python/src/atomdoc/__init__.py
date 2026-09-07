@@ -3,7 +3,7 @@
 from ._array import Array
 from pydantic import JsonValue
 
-from ._doc import Doc, Extension, node
+from ._doc import validation_causes, Doc, Extension, node
 from ._handle import Handle
 from ._id import NodeIdGenerator, default_node_id_generator
 from ._node import AtomNode
@@ -16,6 +16,7 @@ from ._types import ChangeEvent, Diff, ListenerError, Operations, TransactionFla
 from ._undo import UndoHistory, UndoManager, UndoManagerConfig
 
 __all__ = [
+    "validation_causes",
     "Array",
     "Doc",
     "AtomNode",

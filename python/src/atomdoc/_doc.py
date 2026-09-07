@@ -80,6 +80,30 @@ def _is_resolved_annotation(field_info: Any) -> bool:
     )
 
 
+def validation_causes(error: BaseException) -> list[BaseException]:
+    """The exceptions a validator raised, recovered from a Pydantic
+    ``ValidationError``.
+
+    Pydantic reports a ``ValueError`` (or subclass) raised inside a
+    validator as one entry of a ``ValidationError``, but keeps the
+    original exception object. This returns those originals, in order,
+    so an application can re-raise its own exception type — typically as
+    ``raise MyError(str(cause)) from cause`` around a transaction — while
+    the document has already rolled back. Any other exception returns an
+    empty list.
+    """
+    errors = getattr(error, "errors", None)
+    if not callable(errors):
+        return []
+    found: list[BaseException] = []
+    for entry in errors():
+        ctx = entry.get("ctx") if isinstance(entry, dict) else None
+        cause = ctx.get("error") if isinstance(ctx, dict) else None
+        if isinstance(cause, BaseException):
+            found.append(cause)
+    return found
+
+
 def _rebind_class_cell(member: Any, old_cls: type, new_cls: type) -> None:
     """Point the ``__class__`` closure cell of a function (or of the
     functions inside a property / classmethod / staticmethod) from the
@@ -264,12 +288,21 @@ def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNod
                 else:
                     default = new_cls._field_defaults.get(name, _MISSING)
                     own_fields[name] = (ann, ... if default is _MISSING else default)
-            new_cls._validator_model = create_model(  # type: ignore[call-overload]
+            validator_model = create_model(  # type: ignore[call-overload]
                 f"{source_cls.__name__}Validator",
                 __base__=base_model,
                 __validators__=own_validators,
                 **own_fields,
             )
+            # Validators may refer to the class's members (a ClassVar
+            # lookup table, a helper method): give the model the same
+            # members the node type carries, where BaseModel has none.
+            for name, value in ns.items():
+                if name in annotations or name in defaults or name.startswith("__"):
+                    continue
+                if not hasattr(BaseModel, name) and not hasattr(validator_model, name):
+                    setattr(validator_model, name, value)
+            new_cls._validator_model = validator_model
 
     # A reference to a source class (``Ref["Volume"]`` inside
     # ``class Volume(BaseModel)``, or ``Ref[Base]`` where ``Base`` was a
