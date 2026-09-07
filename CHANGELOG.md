@@ -91,7 +91,7 @@ nodes. The operations wire format is unchanged; the schema export gains a
 - **Two node classes sharing a `node_type` were silently merged** when
   discovered through slots; this now raises like the explicit `nodes=`
   path does.
-- **Session: `create`, `undo` and `redo` patches were labelled as the
+- **Session: `create`, `undo` and `redo` patches were labeled as the
   requester's echo** although the requester never applied those
   operations locally, so a thick client dropped them. Only an `op` whose
   operations the commit carries verbatim is an echo; every patch
@@ -105,7 +105,7 @@ nodes. The operations wire format is unchanged; the schema export gains a
   a resync snapshot ignored them. They are now flushed as they happen;
   pending broadcasts go out before a resync snapshot.
 - **Session: a malformed frame could leave the request context set**,
-  labelling later host-side commits as that client's echo.
+  labeling later host-side commits as that client's echo.
 - **The same node twice in one insert linked it to itself**, hanging every
   later traversal. Rejected now, as is a duplicate ID within an adopted
   fragment or a dump. Adopting the same fragment twice in one call yields
@@ -134,7 +134,7 @@ nodes. The operations wire format is unchanged; the schema export gains a
   client that had connected after it (and already had it in its snapshot).
   Every commit is broadcast, to the clients connected when it happened.
 - **Session: a normalizer's additions were invisible to the sender.** A
-  patch that carries more than the client sent is no longer labelled as
+  patch that carries more than the client sent is no longer labeled as
   that client's echo.
 - **Session: a non-object frame dropped the connection** instead of
   returning `invalid_op`.
@@ -168,7 +168,7 @@ nodes. The operations wire format is unchanged; the schema export gains a
   client's `undo`/`redo` means: `"per-client"` (default) keeps a history
   per connected client and reverts only that client's own commits, which
   is what a thick client does locally; `"global"` is the previous
-  behaviour (any client reverts the document's last commit, whoever made
+  behavior (any client reverts the document's last commit, whoever made
   it), right for one user with several views; `"none"` refuses the
   requests with error code `unsupported`. A per-client step that no
   longer applies is answered with `rejected` (no snapshot) and kept for

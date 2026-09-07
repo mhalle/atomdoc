@@ -56,7 +56,7 @@ class _Unsupported(Exception):
 
 
 class _Request:
-    """The client request being handled, for labelling its commits."""
+    """The client request being handled, for labeling its commits."""
 
     __slots__ = ("client_id", "ref", "ops")
 
@@ -64,7 +64,7 @@ class _Request:
         self.client_id = client_id
         self.ref = ref
         # JSON-normalized operations of an ``op`` request, so a commit
-        # that equals them can be labelled as the sender's echo.
+        # that equals them can be labeled as the sender's echo.
         self.ops = ops
 
 

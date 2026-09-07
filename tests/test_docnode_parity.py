@@ -1,4 +1,4 @@
-"""Tests for behaviour ported from DocNode v0.4.
+"""Tests for behavior ported from DocNode v0.4.
 
 Covers: move replay keeping position, undo eviction order, Extension.register,
 normalizers on init, transaction flags (skip_undo), the doc-owned undo manager,
@@ -938,7 +938,7 @@ class TestFunctionLocalNodeClasses:
 
     def test_unresolvable_non_array_string_is_left_alone(self):
         # Only Array-looking annotations are required to resolve here; other
-        # strings keep the old behaviour (left for Pydantic to interpret).
+        # strings keep the old behavior (left for Pydantic to interpret).
         with pytest.raises(TypeError, match=r"Array\[") as info:
             class LocalBoard(AtomNode, node_type="local_board_mixed"):
                 notes: Array[NoSuchName] = []  # noqa: F821

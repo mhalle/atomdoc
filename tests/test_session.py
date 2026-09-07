@@ -468,7 +468,7 @@ async def settle(session: Session) -> None:
 
 
 @pytest.mark.asyncio
-async def test_undo_and_redo_patches_are_not_labelled_as_echo():
+async def test_undo_and_redo_patches_are_not_labeled_as_echo():
     session, transport, a, b, t, v = await setup_scene_session()
     await transport.send_message(a, {
         "type": MSG_OP, "ref": "r1",
