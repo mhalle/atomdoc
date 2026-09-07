@@ -25,3 +25,14 @@ The TypeScript suite includes end-to-end tests that start the Python
 server from `python/` with `uv`, so both toolchains are needed to run it
 in full. Performance sweeps: `python/benchmarks/bench.py` and
 `BENCH=1 npx vitest run test/perf/bench.test.ts` under `typescript/`.
+
+## Releasing
+
+Both packages carry the same version. To release:
+
+1. Set the version in `python/pyproject.toml` and `typescript/package.json`
+   (then `npm install --package-lock-only` under `typescript/`), and turn
+   each package's Unreleased changelog section into a dated one.
+2. Commit, tag `vX.Y.Z`, push `master` and the tag. CI runs both suites.
+3. Publish: `uv build && uv publish` under `python/`; `npm publish`
+   under `typescript/`.
