@@ -476,15 +476,170 @@ async def test_undo_and_redo_patches_are_not_labelled_as_echo():
     })
     a.messages.clear()
     b.messages.clear()
-    await transport.send_message(b, {"type": MSG_UNDO, "ref": "u1"})
-    patch = next(m for m in b.messages if m["type"] == MSG_PATCH)
-    assert patch["source_client"] is None
-    assert patch["ref"] == "u1"
+    await transport.send_message(a, {"type": MSG_UNDO, "ref": "u1"})
+    for client in (a, b):
+        patch = next(m for m in client.messages if m["type"] == MSG_PATCH)
+        assert patch["source_client"] is None
+        assert patch["ref"] == "u1"
     a.messages.clear()
     await transport.send_message(a, {"type": MSG_REDO, "ref": "d1"})
     patch = next(m for m in a.messages if m["type"] == MSG_PATCH)
     assert patch["source_client"] is None
     assert patch["ref"] == "d1"
+
+
+# --- undo policy ---
+
+
+def _set_name(client_ref: str, node_id: str, name: str) -> dict[str, Any]:
+    return {
+        "type": MSG_OP, "ref": client_ref,
+        "operations": {"ordered": [], "state": {node_id: {"name": name}}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_per_client_undo_reverts_only_own_commits():
+    session, transport, a, b, t, v = await setup_scene_session()
+    assert session.undo_policy == "per-client"
+    node = session.doc.get_node_by_id(t.id)
+    await transport.send_message(a, _set_name("a1", t.id, "from a"))
+    await transport.send_message(b, _set_name("b1", t.id, "from b"))
+    a.messages.clear()
+    b.messages.clear()
+
+    # b has nothing of a's to undo; a's undo reverts a's own commit only.
+    await transport.send_message(a, {"type": MSG_UNDO, "ref": "ua"})
+    assert node.name == "t"  # a's inverse restores the value a saw
+    assert [m["type"] for m in a.messages] == [MSG_PATCH]
+    assert [m["type"] for m in b.messages] == [MSG_PATCH]
+    a.messages.clear()
+    b.messages.clear()
+
+    # b's undo reverts b's commit, which a's undo did not touch.
+    await transport.send_message(b, {"type": MSG_UNDO, "ref": "ub"})
+    assert [m["type"] for m in b.messages] == [MSG_PATCH]
+    assert node.name == "from a"
+
+    # Nothing left for b: a no-op, no patch, no error.
+    b.messages.clear()
+    await transport.send_message(b, {"type": MSG_UNDO, "ref": "ub2"})
+    assert b.messages == []
+
+
+@pytest.mark.asyncio
+async def test_per_client_redo_survives_other_clients_edits():
+    session, transport, a, b, t, v = await setup_scene_session()
+    node = session.doc.get_node_by_id(t.id)
+    await transport.send_message(a, _set_name("a1", t.id, "from a"))
+    await transport.send_message(a, {"type": MSG_UNDO, "ref": "ua"})
+    assert node.name == "t"
+    # Another client edits a different node; a keeps its redo.
+    await transport.send_message(b, _set_name("b1", v.id, "vol"))
+    a.messages.clear()
+    await transport.send_message(a, {"type": MSG_REDO, "ref": "ra"})
+    assert node.name == "from a"
+    assert [m["type"] for m in a.messages] == [MSG_PATCH]
+
+
+@pytest.mark.asyncio
+async def test_per_client_undo_conflict_is_rejected_without_resync_and_kept():
+    session, transport, a, b, t, v = await setup_scene_session()
+    # a creates a node, b references it, a's undo (delete) can't apply.
+    await transport.send_message(a, {
+        "type": MSG_CREATE, "ref": "c1", "node_type": "Transform",
+        "state": {"name": "new"}, "slot": "transforms",
+    })
+    patch = next(m for m in a.messages if m["type"] == MSG_PATCH)
+    new_id = patch["operations"]["ordered"][0][1][0][0]
+    await transport.send_message(b, {
+        "type": MSG_OP, "ref": "b1",
+        "operations": {"ordered": [], "state": {v.id: {"transform": new_id}}},
+    })
+    a.messages.clear()
+    b.messages.clear()
+    await transport.send_message(a, {"type": MSG_UNDO, "ref": "ua"})
+    assert [m["type"] for m in a.messages] == [MSG_ERROR]
+    assert a.messages[0]["code"] == "rejected"
+    assert a.messages[0]["ref"] == "ua"
+    assert b.messages == []
+    assert session.doc.get_node_by_id(new_id) is not None
+    # Once the reference is gone the kept step applies.
+    await transport.send_message(b, {
+        "type": MSG_OP, "ref": "b2",
+        "operations": {"ordered": [], "state": {v.id: {"transform": t.id}}},
+    })
+    a.messages.clear()
+    await transport.send_message(a, {"type": MSG_UNDO, "ref": "ua2"})
+    assert [m["type"] for m in a.messages] == [MSG_PATCH]
+    assert session.doc.get_node_by_id(new_id) is None
+
+
+@pytest.mark.asyncio
+async def test_per_client_history_is_dropped_on_disconnect():
+    session, transport, a, b, t, v = await setup_scene_session()
+    await transport.send_message(a, _set_name("a1", t.id, "from a"))
+    await transport.disconnect_client(a)
+    assert "a" not in session._client_undo
+    a2 = MockClient("a")
+    await transport.connect_client(a2)
+    a2.messages.clear()
+    await transport.send_message(a2, {"type": MSG_UNDO, "ref": "u"})
+    assert a2.messages == []
+    assert session.doc.get_node_by_id(t.id).name == "from a"
+
+
+@pytest.mark.asyncio
+async def test_global_undo_policy_reverts_anyones_commit():
+    doc = Doc(root_type=Scene)
+    with doc.transaction():
+        t = doc.create_node(Transform, name="t")
+        doc.root.transforms.append(t)
+    session = Session(doc, undo="global")
+    transport = MockTransport()
+    await session.bind(transport)
+    a, b = MockClient("a"), MockClient("b")
+    await transport.connect_client(a)
+    await transport.connect_client(b)
+    await transport.send_message(a, _set_name("a1", t.id, "from a"))
+    await transport.send_message(b, {"type": MSG_UNDO, "ref": "ub"})
+    assert doc.get_node_by_id(t.id).name == "t"
+    # Host edits are on the global stack too.
+    with doc.transaction():
+        doc.get_node_by_id(t.id).name = "host"
+    await transport.send_message(a, {"type": MSG_UNDO, "ref": "ua"})
+    assert doc.get_node_by_id(t.id).name == "t"
+
+
+@pytest.mark.asyncio
+async def test_undo_none_policy_is_unsupported():
+    doc = Doc(root_type=Scene)
+    session = Session(doc, undo="none")
+    transport = MockTransport()
+    await session.bind(transport)
+    a = MockClient("a")
+    await transport.connect_client(a)
+    a.messages.clear()
+    await transport.send_message(a, {"type": MSG_UNDO, "ref": "u"})
+    assert a.messages[0]["type"] == MSG_ERROR
+    assert a.messages[0]["code"] == "unsupported"
+    assert a.messages[0]["ref"] == "u"
+    await transport.send_message(a, {"type": MSG_REDO, "ref": "r"})
+    assert a.messages[1]["code"] == "unsupported"
+
+
+@pytest.mark.asyncio
+async def test_undo_steps_must_be_a_positive_integer():
+    session, transport, a, b, t, v = await setup_scene_session()
+    await transport.send_message(a, {"type": MSG_UNDO, "ref": "u", "steps": 0})
+    assert a.messages[0]["code"] == "invalid_op"
+    await transport.send_message(a, {"type": MSG_UNDO, "ref": "u", "steps": "3"})
+    assert a.messages[1]["code"] == "invalid_op"
+
+
+def test_unknown_undo_policy_rejected():
+    with pytest.raises(ValueError, match="undo policy"):
+        Session(Doc(root_type=Scene), undo="everyone")  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio

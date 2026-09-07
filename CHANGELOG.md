@@ -233,6 +233,15 @@ nodes. The operations wire format is unchanged; the schema export gains a
 
 ### Added
 
+- **Session undo policy.** `Session(doc, undo=...)` chooses what a
+  client's `undo`/`redo` means: `"per-client"` (default) keeps a history
+  per connected client and reverts only that client's own commits, which
+  is what a thick client does locally; `"global"` is the previous
+  behaviour (any client reverts the document's last commit, whoever made
+  it), right for one user with several views; `"none"` refuses the
+  requests with error code `unsupported`. A per-client step that no
+  longer applies is answered with `rejected` (no snapshot) and kept for
+  a retry. `UndoManager` gained an `accept` filter to support this.
 - **References.** `Ref[T]` (one target), `list[Ref[T]]` (many), either
   `| None`. Reading resolves to the node; assigning accepts a node or an
   ID; the stored value is the target's ID. The document keeps a reverse

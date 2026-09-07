@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from ._doc import Doc
 from ._protocol import (
@@ -26,6 +26,8 @@ from ._undo import UndoManager
 
 logger = logging.getLogger(__name__)
 
+UndoPolicy = Literal["per-client", "global", "none"]
+
 
 def _normalize(value: Any) -> Any:
     """JSON-normalize an operations payload for comparison (tuples vs
@@ -37,11 +39,20 @@ def _normalize(value: Any) -> Any:
 
 
 class _Rejected(Exception):
-    """A well-formed request the document refused to apply."""
+    """A well-formed request the document refused to apply.
 
-    def __init__(self, cause: BaseException) -> None:
+    ``resync`` says whether the requester applied the request
+    optimistically and must be sent a fresh snapshot.
+    """
+
+    def __init__(self, cause: BaseException, *, resync: bool = True) -> None:
         super().__init__(str(cause))
         self.cause = cause
+        self.resync = resync
+
+
+class _Unsupported(Exception):
+    """A request kind this session does not serve."""
 
 
 class _Request:
@@ -63,20 +74,48 @@ class Session:
     The session is the single authority for a document.  Clients connect
     via a :class:`Transport`, receive the schema and a snapshot, then
     send operations which the session applies and broadcasts.
+
+    ``undo`` sets what a client's ``undo``/``redo`` request means:
+
+    - ``"per-client"`` (default): a client reverts only commits it
+      requested itself. A step that no longer applies because someone
+      else edited in between is rejected and kept. This is what a thick
+      client does locally, so thin and thick clients agree.
+    - ``"global"``: any client reverts the document's last commit,
+      whoever made it — right for one user looking at the document
+      through several views, wrong for several users.
+    - ``"none"``: the requests are refused (error code ``unsupported``).
+
+    Passing ``undo_manager`` selects the global policy with that manager.
+    The host's own ``doc.undo_manager`` is unaffected by any of this.
     """
 
     def __init__(
         self,
         doc: Doc,
         undo_manager: UndoManager | None = None,
+        *,
+        undo: UndoPolicy = "per-client",
+        undo_steps: int = 100,
     ) -> None:
         self._doc = doc
         if undo_manager is not None:
-            self._undo = undo_manager
-        elif doc.undo_manager.is_enabled:
-            self._undo = doc.undo_manager
-        else:
-            self._undo = UndoManager(doc)
+            undo = "global"
+        if undo not in ("per-client", "global", "none"):
+            raise ValueError(f"Unknown undo policy: {undo!r}")
+        self._undo_policy: UndoPolicy = undo
+        self._undo_steps = undo_steps
+        self._undo: UndoManager | None = None
+        if undo == "global":
+            if undo_manager is not None:
+                self._undo = undo_manager
+            elif doc.undo_manager.is_enabled:
+                self._undo = doc.undo_manager
+            else:
+                self._undo = UndoManager(doc, undo_steps)
+        # Per-client undo managers, created when a client starts its
+        # handshake and disposed when it leaves.
+        self._client_undo: dict[str, UndoManager] = {}
         self._clients: dict[str, ClientConnection] = {}
         # Clients whose handshake (schema + snapshot) is in flight. A
         # commit that lands meanwhile is newer than their snapshot, so it
@@ -112,6 +151,35 @@ class Session:
     def clients(self) -> dict[str, ClientConnection]:
         return dict(self._clients)
 
+    @property
+    def undo_policy(self) -> UndoPolicy:
+        return self._undo_policy
+
+    def _undo_for(self, client_id: str) -> UndoManager | None:
+        """The undo manager a client's ``undo``/``redo`` request acts on."""
+        if self._undo_policy == "global":
+            return self._undo
+        if self._undo_policy == "per-client":
+            return self._client_undo.get(client_id)
+        return None
+
+    def _make_client_undo(self, client_id: str) -> None:
+        if self._undo_policy != "per-client" or client_id in self._client_undo:
+            return
+
+        def mine(event: ChangeEvent, cid: str = client_id) -> bool:
+            request = self._request
+            return request is not None and request.client_id == cid
+
+        self._client_undo[client_id] = UndoManager(
+            self._doc, self._undo_steps, accept=mine
+        )
+
+    def _drop_client_undo(self, client_id: str) -> None:
+        manager = self._client_undo.pop(client_id, None)
+        if manager is not None:
+            manager.dispose()
+
     # --- Transport binding ---
 
     async def bind(self, transport: Transport) -> None:
@@ -130,6 +198,8 @@ class Session:
             self._transport = None
         self._clients.clear()
         self._connecting.clear()
+        for client_id in list(self._client_undo):
+            self._drop_client_undo(client_id)
 
     # --- Doc change listener (synchronous) ---
 
@@ -191,12 +261,14 @@ class Session:
         # snapshot and is buffered for delivery after it.
         buffer: list[dict[str, Any]] = []
         self._connecting[client.client_id] = (client, buffer)
+        self._make_client_undo(client.client_id)
         snapshot = self._snapshot_message(client, with_client_id=True)
         try:
             await client.send({"type": MSG_SCHEMA, "schema": self._cached_schema})
             await client.send(snapshot)
         except BaseException:
             self._connecting.pop(client.client_id, None)
+            self._drop_client_undo(client.client_id)
             raise
         if self._connecting.pop(client.client_id, None) is None:
             return  # disconnected during the handshake
@@ -272,7 +344,16 @@ class Session:
                 "code": "rejected",
                 "message": str(rejected),
             })
-            await self._send_snapshot(client)
+            if rejected.resync:
+                await self._send_snapshot(client)
+            return
+        except _Unsupported as unsupported:
+            await client.send({
+                "type": MSG_ERROR,
+                "ref": ref,
+                "code": "unsupported",
+                "message": str(unsupported),
+            })
             return
         except Exception as exc:
             logger.exception("Error handling message from %s", client.client_id)
@@ -294,6 +375,7 @@ class Session:
     async def _handle_disconnect(self, client: ClientConnection) -> None:
         self._clients.pop(client.client_id, None)
         self._connecting.pop(client.client_id, None)
+        self._drop_client_undo(client.client_id)
 
     # --- Message handlers ---
 
@@ -356,18 +438,31 @@ class Session:
             raise _Rejected(exc) from exc
 
     def _handle_undo(self, client: ClientConnection, msg: dict[str, Any]) -> None:
-        steps = msg.get("steps", 1)
-        for _ in range(steps):
-            if not self._undo.can_undo:
-                break
-            self._undo.undo()
+        self._step_history(client, msg, "undo")
 
     def _handle_redo(self, client: ClientConnection, msg: dict[str, Any]) -> None:
+        self._step_history(client, msg, "redo")
+
+    def _step_history(
+        self, client: ClientConnection, msg: dict[str, Any], direction: str
+    ) -> None:
+        manager = self._undo_for(client.client_id)
+        if manager is None:
+            raise _Unsupported(f"{direction} is disabled on this session")
         steps = msg.get("steps", 1)
+        if not isinstance(steps, int) or steps < 1:
+            raise ValueError("'steps' must be a positive integer")
+        step = manager.undo if direction == "undo" else manager.redo
         for _ in range(steps):
-            if not self._undo.can_redo:
+            if not (manager.can_undo if direction == "undo" else manager.can_redo):
                 break
-            self._undo.redo()
+            try:
+                step()
+            except Exception as exc:
+                # The step no longer applies (someone else edited what it
+                # would revert). It is kept for a retry; nothing was
+                # applied optimistically, so no resync.
+                raise _Rejected(exc, resync=False) from exc
 
     # --- Broadcasting ---
 

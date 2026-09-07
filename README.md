@@ -504,6 +504,22 @@ async def main():
 asyncio.run(main())
 ```
 
+A client's `undo` and `redo` requests act on history the session keeps
+for it, chosen by the `undo` policy:
+
+```python
+Session(doc)                    # "per-client": a client reverts only its own commits
+Session(doc, undo="global")     # any client reverts the document's last commit
+Session(doc, undo="none")       # undo/redo requests are refused
+```
+
+Per-client is the default because it is what a thick client does locally,
+so both client kinds agree, and because it is safe with several users: a
+step that no longer applies (someone else edited what it would revert) is
+rejected and kept for a retry. Global is right when one user looks at the
+document through several views. The host's own `doc.undo_manager` is
+separate from all of this.
+
 ### Wire protocol
 
 Messages from server to client:
@@ -513,7 +529,7 @@ Messages from server to client:
 | `schema` | JSON Schema with `x-atomdoc` extensions (sent on connect) |
 | `snapshot` | Full document state (sent on connect) |
 | `patch` | Incremental operations (broadcast after each change). `ref` is the `ref` of the client request that produced it (`null` for a host-side change). `source_client` is set only when the patch is the verbatim echo of that client's `op`; a `create`, `undo` or `redo` result, or an `op` a normalizer changed, has `source_client: null` because the requester never applied those operations locally. |
-| `error` | Error response. `code` is `unknown_type` or `invalid_op` for a malformed request, or `rejected` when a well-formed request is invalid against the current document (a dangling reference, a validation failure, a node that is gone). A rejected request is rolled back and not broadcast; the sender then receives a fresh `snapshot` to replace its local copy. |
+| `error` | Error response. `code` is `unknown_type` or `invalid_op` for a malformed request, `unsupported` for a request kind the session refuses (undo under `undo="none"`), or `rejected` when a well-formed request is invalid against the current document (a dangling reference, a validation failure, a node that is gone, an undo step that no longer applies). A rejected request is rolled back and not broadcast; the sender of a rejected `op` or `create` then receives a fresh `snapshot` to replace its local copy (an undo step applied nothing optimistically, so no snapshot follows). |
 
 Messages from client to server:
 
@@ -521,7 +537,7 @@ Messages from client to server:
 |---------|-------------|
 | `op` | Apply operations to the document |
 | `create` | Create a new node and insert it into a slot |
-| `undo` | Undo one or more steps |
+| `undo` | Undo one or more steps of the requester's history (see the `undo` policy) |
 | `redo` | Redo one or more steps |
 
 ### Custom transports

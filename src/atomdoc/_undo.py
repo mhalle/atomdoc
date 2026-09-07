@@ -66,11 +66,18 @@ class UndoManager:
         merge_interval: float = 0.0,
         *,
         clock: Callable[[], float] = time.time,
+        accept: Callable[[ChangeEvent], bool] | None = None,
     ) -> None:
+        """``accept`` filters the change events this manager records: a
+        manager that only tracks one client's commits on a shared
+        document, say. An event it declines leaves the stacks untouched;
+        the redo stack is not cleared either, so another party's edit
+        does not take away this party's redo."""
         self._doc = doc
         self._max_steps = max_steps
         self._merge_interval = merge_interval
         self._clock = clock
+        self._accept = accept
         self._undo_stack: list[UndoStackItem] = []
         self._redo_stack: list[UndoStackItem] = []
         self._tx_type: str = "update"  # "undo" | "redo" | "update"
@@ -98,6 +105,8 @@ class UndoManager:
     def _on_change(self, event: ChangeEvent) -> None:
         self._last_change = None
         if event.flags.skip_undo:
+            return
+        if self._accept is not None and not self._accept(event):
             return
         item = UndoStackItem(operations=event.inverse_operations)
         if self._tx_type == "update":

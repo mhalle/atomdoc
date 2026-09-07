@@ -403,16 +403,22 @@ class TestDocOwnedUndo:
             assert doc.root.value == "a"
         assert doc.root.value == "a"
 
-    def test_session_uses_enabled_doc_manager(self):
+    def test_global_session_uses_enabled_doc_manager(self):
         doc = make_doc(undo_manager=UNDO)
-        session = Session(doc)
+        session = Session(doc, undo="global")
         assert session._undo is doc.undo_manager
 
-    def test_session_falls_back_to_standalone_when_disabled(self):
+    def test_global_session_falls_back_to_standalone_when_disabled(self):
         doc = make_doc()
-        session = Session(doc)
+        session = Session(doc, undo="global")
         assert session._undo is not doc.undo_manager
         assert session._undo.is_enabled
+
+    def test_per_client_session_leaves_doc_manager_alone(self):
+        doc = make_doc(undo_manager=UNDO)
+        session = Session(doc)
+        assert session._undo is None
+        assert session.undo_policy == "per-client"
 
     def test_dispose_stops_recording(self):
         doc = make_doc(undo_manager=UNDO)
