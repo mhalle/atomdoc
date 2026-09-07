@@ -173,8 +173,14 @@ class Scene:
 
 Reading a reference resolves it to the node; assigning accepts a node or
 its ID. On the wire and in `dump()` the value is the target's node ID; in
-`to_json()`, which carries no IDs, it is the target's document path
-(`"/transforms/2"`), or `null` if it does not resolve.
+`to_json()`, which carries no IDs, it is the target's document path as a
+bare JSON Pointer (RFC 6901) relative to the export root
+(`"/transforms/2"`), or `null` if it does not resolve. The pointer
+resolves against the exported document with any JSON Pointer library. It
+is not self-describing: a reader without the schema sees a plain string.
+If that matters to consumers, a future option could select the syntax,
+for example a JSON Reference object (`{"$ref": "#/transforms/2"}`) that
+marks references on sight at the cost of a different value shape.
 
 ```python
 with doc.transaction():

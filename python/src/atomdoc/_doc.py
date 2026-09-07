@@ -1026,9 +1026,12 @@ class Doc:
         """Return clean JSON for a node (default: root).
 
         Node IDs are omitted; the tree is nested data. A ``Ref[T]`` field
-        is emitted as the target's *document path*, ``"/slot/index/..."``
-        from the root (``"/transforms/2"``), which names the node without
-        an identifier; a reference that does not resolve is ``null``.
+        is emitted as the target's *document path*, a bare JSON Pointer
+        (RFC 6901) relative to the export root (``"/transforms/2"``),
+        which names the node without an identifier; a reference that does
+        not resolve is ``null``. Bare pointers are not self-describing;
+        a ``refs=`` option choosing another syntax (a JSON Reference
+        object, say) may be added if consumers need one.
         Paths are always absolute, even when exporting a subtree, so a
         reference out of the subtree still points somewhere. For a format
         that round-trips, use ``dump()``.
