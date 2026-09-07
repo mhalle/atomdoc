@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Generic, TypeVar, get_args, get_origin
+import types
+
+from typing import Union, Any, Generic, TypeVar, get_args, get_origin
 
 T = TypeVar("T")
 
@@ -46,10 +48,27 @@ def _is_array_subclass(annotation: object) -> bool:
     return origin is Array
 
 
-def get_array_element_type(annotation: object) -> type | None:
-    """Extract T from ``Array[T]``, or None if not an Array type."""
+def is_array_annotation(annotation: object) -> bool:
+    """Whether an annotation declares a slot: ``Array[T]`` or bare ``Array``."""
+    return annotation is Array or get_origin(annotation) is Array
+
+
+def get_array_element_type(annotation: object) -> Any:
+    """The T of ``Array[T]`` (a class or a union of classes); None for a
+    bare ``Array`` (any node) or for something that is not an Array."""
     origin = get_origin(annotation)
     if origin is Array:
         args = get_args(annotation)
         return args[0] if args else None
     return None
+
+
+def slot_member_types(allowed: Any) -> tuple[Any, ...]:
+    """The classes a slot's ``allowed_type`` names: one for ``Array[T]``,
+    several for ``Array[A | B]``, none for a bare ``Array``."""
+    if allowed is None:
+        return ()
+    origin = get_origin(allowed)
+    if origin is Union or origin is types.UnionType:
+        return tuple(a for a in get_args(allowed) if a is not type(None))
+    return (allowed,)

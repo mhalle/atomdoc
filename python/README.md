@@ -705,8 +705,22 @@ class Canvas:
     shapes: Array[Shape] = []      # accepts Shape and Circle
 ```
 
-Subclassing `AtomNode` directly with `node_type=` works the same way for
-inheritance; use `@node` on a `BaseModel` when you want validators.
+A derived class declares its own `@model_validator` and `@field_validator`
+rules too, even though it is no longer a `BaseModel` itself; they run at
+commit alongside the inherited ones. Subclassing `AtomNode` directly with
+`node_type=` works the same way for inheritance.
+
+A slot may accept several node types, or any node:
+
+```python
+@node
+class Scene:
+    shapes: Array[Circle | Square] = []   # either type
+    attachments: Array = []               # any node type
+```
+
+The schema export lists a slot's accepted types under `allowed_types`
+(`allowed_type` names the one type when there is exactly one).
 
 ## Tree navigation
 

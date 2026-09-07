@@ -165,3 +165,92 @@ def test_collections_of_models_serialize_and_round_trip():
     assert rp.by_name == {"a": Color(r=3)}
     assert rp.nested == {"k": [Color(r=4)]}
     assert restored.to_json()["palettes"][0]["by_name"] == {"a": {"r": 3}}
+
+
+# --- validators on a derived plain class; union and bare slots ---
+
+
+@node
+class Transform(BaseModel):
+    name: str = ""
+
+    @model_validator(mode="after")
+    def one_line(self):
+        if "\n" in self.name:
+            raise ValueError("single line")
+        return self
+
+
+@node
+class Deformable(Transform):
+    kind: str = "rigid"
+    field: str = ""
+    scale: float = Field(default=1.0, gt=0)
+
+    @model_validator(mode="after")
+    def needs_field(self):
+        if self.kind == "deformable" and not self.field:
+            raise ValueError("a deformable transform needs a field")
+        return self
+
+
+@node
+class TRoot:
+    transforms: Array[Transform] = []
+
+
+def test_model_validator_on_a_derived_node_class_runs():
+    doc = Doc(TRoot)
+    d = doc.create_node(Deformable, name="d")
+    doc.root.transforms.append(d)
+    with pytest.raises(ValidationError, match="needs a field"):
+        d.kind = "deformable"
+    assert d.kind == "rigid"
+    with doc.transaction():
+        d.field = "warp"
+        d.kind = "deformable"
+    assert d.kind == "deformable"
+    with pytest.raises(ValidationError, match="single line"):
+        d.name = "two\nlines"  # the base's rule still applies
+    with pytest.raises(ValidationError):
+        d.scale = 0.0  # the derived Field constraint is enforced too
+
+
+@node
+class A:
+    x: int = 0
+
+
+@node
+class B:
+    y: int = 0
+
+
+@node
+class C:
+    z: int = 0
+
+
+@node
+class Mixed:
+    either: Array[A | B] = []
+    anything: Array = []
+
+
+def test_union_and_bare_array_slots():
+    # A bare Array names no type, so C is registered explicitly.
+    doc = Doc(Mixed, nodes=[C])
+    assert {"A", "B", "C", "Mixed"} <= set(doc._node_types)
+    a, b, c = doc.create_node(A), doc.create_node(B), doc.create_node(C)
+    doc.root.either.append(a)
+    doc.root.either.append(b)
+    with pytest.raises(TypeError, match="accepts A | B, not C"):
+        doc.root.either.append(c)
+    doc.root.anything.append(c)  # bare Array: any node
+    assert [type(n).__name__ for n in doc.root.either] == ["A", "B"]
+    slots = doc.atomdoc_schema()["node_types"]["Mixed"]["slots"]
+    assert slots["either"] == {"allowed_type": None, "allowed_types": ["A", "B"]}
+    assert slots["anything"] == {"allowed_type": None, "allowed_types": []}
+    restored = Doc.restore(doc.dump(), root_type=Mixed, nodes=[C])
+    assert [type(n).__name__ for n in restored.root.either] == ["A", "B"]
+    assert type(restored.root.anything[0]).__name__ == "C"

@@ -168,7 +168,13 @@ export interface NodeTypeDef {
   json_schema: Record<string, unknown>;
   /** Field name → "mergeable" | "atomic" | "opaque" | "ref". */
   field_tiers: Record<string, string>;
-  slots: Record<string, { allowed_type: string | null }>;
+  /**
+   * Per slot: the one accepted node type, or null when any node (bare
+   * `Array`) or several (`Array[A | B]`) are accepted; `allowed_types`
+   * lists them all (empty for any node). Servers before atomdoc 0.4.5
+   * send only `allowed_type`.
+   */
+  slots: Record<string, { allowed_type: string | null; allowed_types?: string[] }>;
   field_defaults: Record<string, unknown>;
   /** Reference fields (tier "ref"), keyed by field name. */
   refs?: Record<string, RefDef>;

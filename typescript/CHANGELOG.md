@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Schema: each slot carries `allowed_types` (all accepted node types;
+  empty for any node) alongside `allowed_type`, which is `null` when there
+  is not exactly one. `defineNode` exports both.
+
 ## 0.4.4
 
 No changes; released in step with atomdoc 0.4.4 (node inheritance,

@@ -56,7 +56,7 @@ Sent once on connect. Contains the full document schema.
         },
         "field_tiers": { "title": "mergeable" },
         "slots": {
-          "annotations": { "allowed_type": "Annotation" }
+          "annotations": { "allowed_type": "Annotation", "allowed_types": ["Annotation"] }
         },
         "field_defaults": { "title": "" }
       },

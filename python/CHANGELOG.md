@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **A `@model_validator` or `@field_validator` declared on a derived
+  `@node` class never ran.** The derived class stops being a `BaseModel`
+  once its base is the node class, so no validator model was built for
+  it and it silently used the base's. A model is now built from the
+  base's model plus the derived class's own fields and validators; the
+  inherited rules still run.
+- **`Array[A | B]` broke node-type discovery and the schema export.**
+  Union slots are supported: both types are discovered, inserts of any
+  other type are refused, and the export carries the accepted types.
+- **A bare `Array` silently became a state field.** It is now a slot that
+  accepts any node type.
+
+### Added
+
+- Schema export: each slot carries `allowed_types` (all accepted node
+  types; empty for any node) alongside `allowed_type`, which is now
+  `null` when there is not exactly one.
+
 ## [0.4.4] - 2026-09-07
 
 Node inheritance and serialization fixes requested by the MRML-successor

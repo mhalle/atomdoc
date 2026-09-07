@@ -32,7 +32,7 @@ export class SchemaRegistry {
 
   getSlots(
     nodeType: string,
-  ): Record<string, { allowed_type: string | null }> {
+  ): Record<string, { allowed_type: string | null; allowed_types?: string[] }> {
     return this.nodeTypes.get(nodeType)?.slots ?? {};
   }
 

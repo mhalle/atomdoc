@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, create_model
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined
 
-from ._array import Array, get_array_element_type
+from ._array import Array, get_array_element_type, is_array_annotation
 from ._children import ChildrenView
 from ._descriptors import _MISSING, RefDescriptor, StateDescriptor
 from ._range import NodeRange
@@ -275,8 +275,8 @@ class AtomNode:
         slot_order: list[str] = []
 
         for name, ann in annotations.items():
-            elem_type = get_array_element_type(ann)
-            if elem_type is not None:
+            if is_array_annotation(ann):
+                elem_type = get_array_element_type(ann)  # None: any node
                 slot_defs[name] = SlotDef(name, elem_type)
                 slot_order.append(name)
                 # Install slot descriptor

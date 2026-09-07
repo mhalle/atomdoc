@@ -8,7 +8,8 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from typing import Annotated, Any, ForwardRef
 
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, TypeAdapter, create_model
+from pydantic._internal._decorators import PydanticDescriptorProxy
 from pydantic_core import PydanticUndefined, to_jsonable_python
 
 from ._id import (
@@ -18,6 +19,7 @@ from ._id import (
     node_id_factory,
     session_prefix,
 )
+from ._array import slot_member_types
 from ._handle import Handle, is_handle_type
 from ._node import AtomNode, _MISSING
 from ._range import _descendants, _descendants_inclusive
@@ -178,10 +180,45 @@ def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNod
 
     # If the source is a BaseModel, store it as the validator model.
     # This preserves @field_validator, @model_validator, Field constraints, etc.
-    # At commit time, updated nodes are validated against this model. A
-    # plain class deriving from a node class keeps that class's validator.
+    # At commit time, updated nodes are validated against this model.
     if is_pydantic:
         new_cls._validator_model = source_cls  # type: ignore[attr-defined]
+    else:
+        # A class deriving from a node class is no longer a BaseModel, so
+        # validators it declares would be lost. Build it a model: the
+        # base's validator (or schema) model as the base, so inherited
+        # rules still run, plus this class's own fields and validators.
+        own_validators = {
+            name: value
+            for name, value in vars(source_cls).items()
+            if isinstance(value, PydanticDescriptorProxy)
+        }
+        if own_validators:
+            base_model: type[BaseModel] | None = next(
+                (
+                    m for nb in node_bases
+                    for m in (getattr(nb, "_validator_model", None), getattr(nb, "_schema_model", None))
+                    if m is not None
+                ),
+                None,
+            )
+            own_fields: dict[str, Any] = {}
+            for name in annotations:
+                if name in new_cls._slot_defs:
+                    continue
+                ann = new_cls._field_annotations[name]
+                info = new_cls._field_infos.get(name)
+                if info is not None:
+                    own_fields[name] = (ann, info)
+                else:
+                    default = new_cls._field_defaults.get(name, _MISSING)
+                    own_fields[name] = (ann, ... if default is _MISSING else default)
+            new_cls._validator_model = create_model(  # type: ignore[call-overload]
+                f"{source_cls.__name__}Validator",
+                __base__=base_model,
+                __validators__=own_validators,
+                **own_fields,
+            )
 
     # A reference to a source class (``Ref["Volume"]`` inside
     # ``class Volume(BaseModel)``, or ``Ref[Base]`` where ``Base`` was a
@@ -226,17 +263,21 @@ class Extension:
 def _check_allowed(
     allowed: Any, node: AtomNode, slot_name: str, parent: AtomNode
 ) -> None:
-    """Raise unless ``node`` may live in a slot that accepts ``allowed``."""
-    if allowed is None or not isinstance(allowed, type):
+    """Raise unless ``node`` may live in a slot that accepts ``allowed``
+    (a class, a union of classes, or None for any node)."""
+    members = [m for m in slot_member_types(allowed) if isinstance(m, type)]
+    if not members:
         return
-    if isinstance(node, allowed):
-        return
-    allowed_type = getattr(allowed, "_node_type", None)
-    if allowed_type is not None and node._node_type == allowed_type:
-        return
+    for member in members:
+        if isinstance(node, member):
+            return
+        member_type = getattr(member, "_node_type", None)
+        if member_type is not None and node._node_type == member_type:
+            return
+    names = " | ".join(getattr(m, "__name__", str(m)) for m in members)
     raise TypeError(
         f"Slot '{slot_name}' of {type(parent).__name__} accepts "
-        f"{getattr(allowed, '__name__', allowed)}, not {type(node).__name__}"
+        f"{names}, not {type(node).__name__}"
     )
 
 
@@ -258,8 +299,9 @@ def _discover_node_types(root_cls: type[AtomNode]) -> dict[str, type[AtomNode]]:
             )
         result[cls._node_type] = cls
         for slot_def in getattr(cls, "_slot_defs", {}).values():
-            if slot_def.allowed_type is not None and slot_def.allowed_type not in result.values():
-                pending.append(slot_def.allowed_type)
+            for member in slot_member_types(slot_def.allowed_type):
+                if member not in result.values():
+                    pending.append(member)
         for ref_def in getattr(cls, "_ref_defs", {}).values():
             target = ref_def.target
             if isinstance(target, type) and hasattr(target, "_node_type") and target not in result.values():
@@ -743,7 +785,7 @@ class Doc:
 
     def _validate_changed_nodes(self) -> None:
         """Run Pydantic model validation on nodes changed in this transaction."""
-        from ._array import get_array_element_type
+        from ._array import is_array_annotation
 
         for node_id in self._diff.updated | self._diff.inserted:
             node = self._node_map.get(node_id)
@@ -775,7 +817,7 @@ class Doc:
                 # Fill Array fields with empty lists so the model doesn't complain
                 for name in getattr(model, "__annotations__", {}):
                     ann = model.__annotations__[name]
-                    if get_array_element_type(ann) is not None and name not in data:
+                    if is_array_annotation(ann) and name not in data:
                         data[name] = []
                 model.model_validate(data)
 
@@ -1390,17 +1432,18 @@ class Doc:
                     }
             entry["handles"] = handles
 
-            # Slots
+            # Slots. ``allowed_type`` is the one accepted type or null
+            # (any node, or several); ``allowed_types`` lists them all.
             slots: dict[str, Any] = {}
             for slot_name, slot_def in node_cls._slot_defs.items():
-                allowed = slot_def.allowed_type
-                if allowed is None:
-                    allowed_name = None
-                elif isinstance(allowed, str):
-                    allowed_name = allowed
-                else:
-                    allowed_name = allowed._node_type
-                slots[slot_name] = {"allowed_type": allowed_name}
+                names = [
+                    m if isinstance(m, str) else m._node_type
+                    for m in slot_member_types(slot_def.allowed_type)
+                ]
+                slots[slot_name] = {
+                    "allowed_type": names[0] if len(names) == 1 else None,
+                    "allowed_types": names,
+                }
             entry["slots"] = slots
 
             # Field defaults (JSON-safe)

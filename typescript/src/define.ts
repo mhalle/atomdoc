@@ -217,9 +217,12 @@ function nodeDefToTypeDef(node: NodeDef): NodeTypeDef {
     }
   }
 
-  const slots: Record<string, { allowed_type: string | null }> = {};
+  const slots: Record<string, { allowed_type: string | null; allowed_types: string[] }> = {};
   for (const [name, allowedType] of Object.entries(node.slots)) {
-    slots[name] = { allowed_type: allowedType };
+    slots[name] = {
+      allowed_type: allowedType,
+      allowed_types: allowedType === null ? [] : [allowedType],
+    };
   }
 
   return {
