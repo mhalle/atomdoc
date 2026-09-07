@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.4
+
+No changes; released in step with atomdoc 0.4.4 (node inheritance,
+inherited declarations, containers of models in dumps and patches).
+
 ## 0.4.3
 
 No changes; released from the monorepo in step with atomdoc 0.4.3

@@ -2,7 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.4.4] - 2026-09-07
+
+Node inheritance and serialization fixes requested by the MRML-successor
+client. Wire format and schema export shape unchanged; atomdoc-ts 0.4.4 is
+the same code as 0.4.3, re-tagged to keep the versions in step.
 
 ### Fixed
 
