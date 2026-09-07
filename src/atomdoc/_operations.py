@@ -430,9 +430,9 @@ def on_apply_operations(doc: Doc, operations: Operations, *, strict: bool = Fals
                     f"{type(node).__name__} has no field {key!r}"
                 )
             if not inserted_same_tx:
-                if not current_inv_patch.get(node_id, {}).get(key):
+                if key not in current_inv_patch.get(node_id, {}):
                     original = node._state_key_to_json(key)
-                    current_inv_patch.setdefault(node_id, {}).setdefault(key, original)
+                    current_inv_patch.setdefault(node_id, {})[key] = original
             old_value = node._state.get(key)
             if json_val is None and node._field_defaults.get(key, _MISSING) is _MISSING:
                 # ``null`` for a field without a default means "unset"
