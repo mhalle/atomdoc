@@ -2,7 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.4.3] - 2026-09-07
+
+First release from the monorepo; atomdoc-ts 0.4.3 is the same code as
+0.4.2, re-tagged to keep the versions in step.
 
 ### Changed
 

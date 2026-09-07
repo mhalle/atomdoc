@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.3
+
+No changes; released from the monorepo in step with atomdoc 0.4.3
+(whose `to_json()` now exports references as document paths).
+
 ## 0.4.2
 
 Fixes from a fourth adversarial review and an end-to-end integration
