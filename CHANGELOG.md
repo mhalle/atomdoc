@@ -2,7 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.4.2] - 2026-09-07
+
+Fixes from a fourth adversarial review and an end-to-end integration
+pass. Adds a performance suite. Wire format unchanged; a thick client
+now receives slot-order corrections after moves (atomdoc-ts >= 0.4.2
+applies them; older clients apply them as ordinary patches).
 
 ### Fixed
 
