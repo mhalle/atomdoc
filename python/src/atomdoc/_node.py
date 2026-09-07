@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, create_model
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined
 
-from ._array import Array, get_array_element_type, is_array_annotation
+from ._array import Array, get_array_element_type, is_array_annotation, is_classvar_annotation
 from ._children import ChildrenView
 from ._descriptors import _MISSING, RefDescriptor, StateDescriptor
 from ._range import NodeRange
@@ -241,7 +241,7 @@ class AtomNode:
                 continue
             base_annotations = getattr(base, "__annotations__", {})
             for name, ann in base_annotations.items():
-                if name.startswith("_"):
+                if name.startswith("_") or is_classvar_annotation(ann):
                     continue
                 annotations[name] = ann
                 owners[name] = base

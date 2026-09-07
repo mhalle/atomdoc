@@ -680,7 +680,11 @@ class MyNode:
     title: str = ""
 ```
 
-The node type name defaults to the class name.
+The node type name defaults to the class name. Methods, properties (with
+setters that write through to fields), classmethods, staticmethods and
+class constants declared on the class are kept on the node type; a name
+that would shadow the node API (`delete`, `move`, `id`, ...) raises a
+`TypeError` at class creation.
 
 Node classes inherit. A `@node` class whose base is another `@node`
 class (or the class that one was made from) becomes a real subclass of

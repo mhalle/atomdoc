@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import types
 
-from typing import Union, Any, Generic, TypeVar, get_args, get_origin
+from typing import ClassVar, Union, Any, Generic, TypeVar, get_args, get_origin
 
 T = TypeVar("T")
 
@@ -46,6 +46,14 @@ def _is_array_subclass(annotation: object) -> bool:
     if origin is None:
         return isinstance(annotation, type) and issubclass(annotation, Array)
     return origin is Array
+
+
+def is_classvar_annotation(annotation: object) -> bool:
+    """Whether an annotation is ``ClassVar[...]`` (a class member, not a
+    field), also when it is still a string under postponed evaluation."""
+    if isinstance(annotation, str):
+        return annotation.startswith(("ClassVar", "typing.ClassVar"))
+    return annotation is ClassVar or get_origin(annotation) is ClassVar
 
 
 def is_array_annotation(annotation: object) -> bool:

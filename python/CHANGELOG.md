@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **`@node` silently dropped the source class's methods, properties,
+  classmethods, staticmethods and class constants.** They are now
+  carried onto the node type (property setters write through to
+  fields); a name that would shadow the node API raises a `TypeError`
+  instead of overriding it silently.
+
 ## [0.4.5] - 2026-09-07
 
 Validators on derived node classes, union and bare `Array` slots. The

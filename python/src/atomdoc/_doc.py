@@ -9,6 +9,7 @@ from contextlib import AbstractContextManager
 from typing import Annotated, Any, ForwardRef
 
 from pydantic import BaseModel, TypeAdapter, create_model
+from pydantic.fields import FieldInfo
 from pydantic._internal._decorators import PydanticDescriptorProxy
 from pydantic_core import PydanticUndefined, to_jsonable_python
 
@@ -19,7 +20,7 @@ from ._id import (
     node_id_factory,
     session_prefix,
 )
-from ._array import slot_member_types
+from ._array import is_classvar_annotation, slot_member_types
 from ._handle import Handle, is_handle_type
 from ._node import AtomNode, _MISSING
 from ._range import _descendants, _descendants_inclusive
@@ -79,6 +80,27 @@ def _is_resolved_annotation(field_info: Any) -> bool:
     )
 
 
+def _rebind_class_cell(member: Any, old_cls: type, new_cls: type) -> None:
+    """Point the ``__class__`` closure cell of a function (or of the
+    functions inside a property / classmethod / staticmethod) from the
+    class it was defined in to the class it now lives on."""
+    functions: list[Any] = []
+    if isinstance(member, property):
+        functions = [f for f in (member.fget, member.fset, member.fdel) if f is not None]
+    elif isinstance(member, (classmethod, staticmethod)):
+        functions = [member.__func__]
+    elif callable(member) and hasattr(member, "__code__"):
+        functions = [member]
+    for fn in functions:
+        code = getattr(fn, "__code__", None)
+        closure = getattr(fn, "__closure__", None)
+        if code is None or not closure:
+            continue
+        for var, cell in zip(code.co_freevars, closure):
+            if var == "__class__" and cell.cell_contents is old_cls:
+                cell.cell_contents = new_cls
+
+
 # Source class (the class ``@node`` was applied to) -> the node class made
 # from it, so a class deriving from a source derives from its node class.
 _NODE_FOR_SOURCE: weakref.WeakKeyDictionary[type, type[AtomNode]] = weakref.WeakKeyDictionary()
@@ -120,8 +142,8 @@ def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNod
     defaults: dict[str, Any] = {}
 
     for name, ann in getattr(source_cls, "__annotations__", {}).items():
-        if name.startswith("_"):
-            continue
+        if name.startswith("_") or is_classvar_annotation(ann):
+            continue  # a ClassVar is a class member, carried over below
         annotations[name] = ann
         if hasattr(source_cls, name):
             val = getattr(source_cls, name)
@@ -169,6 +191,29 @@ def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNod
     for name, val in defaults.items():
         ns[name] = val
 
+    # Everything else the class declares — methods, properties,
+    # classmethods, staticmethods, constants — comes along: a node is a
+    # data model and may carry behavior. Dunders, Pydantic's own
+    # machinery and validators (which feed the validator model instead)
+    # are left out. A name that would shadow the node API is an error
+    # rather than a silent override.
+    reserved = set(vars(AtomNode))
+    for name, value in vars(source_cls).items():
+        if name in annotations or name in defaults:
+            continue
+        if name.startswith("__") and name.endswith("__"):
+            continue
+        if name.startswith(("__pydantic", "model_")) or name in ("__slots__",):
+            continue
+        if isinstance(value, (PydanticDescriptorProxy, FieldInfo)):
+            continue
+        if name in reserved:
+            raise TypeError(
+                f"{source_cls.__qualname__}.{name} would shadow AtomNode.{name}; "
+                "choose another name"
+            )
+        ns[name] = value
+
     # Create the AtomNode subclass
     new_cls = type(
         source_cls.__name__,
@@ -177,6 +222,12 @@ def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNod
         node_type=node_type_name,
     )
     _NODE_FOR_SOURCE[source_cls] = new_cls
+    # A copied method's zero-argument ``super()`` refers to the class it
+    # was written in through a closure cell; point that cell at the node
+    # class so ``super()`` resolves against the node hierarchy.
+    for name, value in ns.items():
+        if name not in annotations and name not in defaults:
+            _rebind_class_cell(value, source_cls, new_cls)
 
     # If the source is a BaseModel, store it as the validator model.
     # This preserves @field_validator, @model_validator, Field constraints, etc.
