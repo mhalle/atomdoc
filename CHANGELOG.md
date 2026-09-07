@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] - 2026-09-07
+
+Fixes from an outside review of the synchronization layer. No wire
+format changes; works with atomdoc-ts >= 0.4.1 (whose thick client
+relies on every patch carrying the request `ref`).
+
+### Changed
+
+- **Change listeners are post-commit observers.** A listener that raises
+  no longer rolls the commit back; failures surface afterwards as
+  `ListenerError`. See the first Fixed entry.
+
+### Fixed
+
+- **A failing change listener rolled back a commit that other listeners
+  had already acted on.** A session had already queued the broadcast, so
+  other clients received a change the server then reverted; the undo
+  manager kept an entry for it; and events exposed live internal buffers
+  that the rollback rewrote. Change listeners are now post-commit
+  observers: every listener runs, the commit stands, events are copies,
+  and the failures are raised afterwards as `ListenerError` (with
+  `errors` and `__cause__`). Validation that should veto a commit belongs
+  in model validators or normalizers, which run before.
+- **A broadcast patch carried the client's raw values, not the validated
+  ones.** Sending `"7"` to an `int` field stored `7` and broadcast
+  `"7"`. Forward patches now serialize the value as stored. Such a commit
+  is not the sender's verbatim echo, so it goes out with `source_client:
+  null` and the sender applies it too.
+
 ## [0.4.0] - 2026-09-06
 
 Ports the DocNode v0.4 lifecycle and undo improvements from
@@ -57,20 +86,6 @@ nodes. The operations wire format is unchanged; the schema export gains a
 - **Unknown state keys, unknown operation codes, and nodes of the wrong
   type for a slot were accepted** from operations and from the local
   API. All three now raise; `Array[T]` is enforced on insert and move.
-- **A failing change listener rolled back a commit that other listeners
-  had already acted on.** A session had already queued the broadcast, so
-  other clients received a change the server then reverted; the undo
-  manager kept an entry for it; and events exposed live internal buffers
-  that the rollback rewrote. Change listeners are now post-commit
-  observers: every listener runs, the commit stands, events are copies,
-  and the failures are raised afterwards as `ListenerError` (with
-  `errors` and `__cause__`). Validation that should veto a commit belongs
-  in model validators or normalizers, which run before.
-- **A broadcast patch carried the client's raw values, not the validated
-  ones.** Sending `"7"` to an `int` field stored `7` and broadcast
-  `"7"`. Forward patches now serialize the value as stored. Such a commit
-  is not the sender's verbatim echo, so it goes out with `source_client:
-  null` and the sender applies it too.
 - **Handles nested in a composite frozen value (a handle inside a
   material) were invisible** to `doc.handles()` and the schema export.
 - **Two node classes sharing a `node_type` were silently merged** when
