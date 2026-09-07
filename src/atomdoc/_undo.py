@@ -128,7 +128,13 @@ class UndoManager:
         self._tx_type = "undo"
         self._last_update = None
         try:
-            self._doc.apply_operations(item.operations)
+            self._doc.apply_operations(item.operations, raise_on_error=True)
+        except Exception:
+            # The step could not be applied (for example it would delete a
+            # node that is now referenced). Keep it so the user can retry
+            # after fixing the cause, instead of silently losing it.
+            self._undo_stack.append(item)
+            raise
         finally:
             self._tx_type = "update"
 
@@ -141,7 +147,10 @@ class UndoManager:
         self._tx_type = "redo"
         self._last_update = None
         try:
-            self._doc.apply_operations(item.operations)
+            self._doc.apply_operations(item.operations, raise_on_error=True)
+        except Exception:
+            self._redo_stack.append(item)
+            raise
         finally:
             self._tx_type = "update"
 

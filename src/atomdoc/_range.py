@@ -90,6 +90,13 @@ class NodeRange:
                 raise ValueError(
                     f"Slot '{slot}' does not exist on {type(new_parent).__name__}"
                 )
+            # A move keeps the node alive in the document, so the new
+            # parent must be in the document: moving into a detached node
+            # would orphan the range while it stays in the node map.
+            if new_parent.id not in doc._node_map:
+                raise ValueError(
+                    f"Cannot move into {new_parent!r}: it is not in the document"
+                )
 
             nodes_in_range = set(_iter_range(self._start, self._end))
             if new_parent in nodes_in_range:

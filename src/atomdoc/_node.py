@@ -4,21 +4,20 @@ from __future__ import annotations
 
 import re
 import sys
+import copy
+from collections.abc import Callable
 from typing import Any, ClassVar, get_type_hints
 
-from pydantic import BaseModel, TypeAdapter, create_model
+from pydantic import BaseModel, ConfigDict, TypeAdapter, create_model
 from pydantic.fields import FieldInfo
 from pydantic_core import PydanticUndefined
 
 from ._array import Array, get_array_element_type
 from ._children import ChildrenView
-from ._descriptors import RefDescriptor, StateDescriptor
+from ._descriptors import _MISSING, RefDescriptor, StateDescriptor
 from ._range import NodeRange
 from ._ref import Ref, RefAdapter, RefDef, parse_ref_annotation
 from ._tier import Tier, classify_field
-
-# Sentinel for "no default"
-_MISSING = object()
 
 # A string annotation that (probably) declares an ``Array[...]`` slot or a
 # ``Ref[...]`` field.
@@ -136,6 +135,7 @@ class AtomNode:
     _field_tiers: ClassVar[dict[str, Tier]]
     _field_annotations: ClassVar[dict[str, Any]] = {}
     _field_infos: ClassVar[dict[str, FieldInfo]] = {}
+    _field_factories: ClassVar[dict[str, Callable[[], Any]]] = {}
     _ref_defs: ClassVar[dict[str, RefDef]] = {}
     _field_adapters: ClassVar[dict[str, TypeAdapter[Any]]]
     _slot_defs: ClassVar[dict[str, SlotDef]]
@@ -195,6 +195,7 @@ class AtomNode:
         state_annotations: dict[str, Any] = {}
         state_defaults: dict[str, Any] = {}
         field_infos: dict[str, FieldInfo] = {}
+        field_factories: dict[str, Callable[[], Any]] = {}
         slot_defs: dict[str, SlotDef] = {}
         slot_order: list[str] = []
 
@@ -216,6 +217,11 @@ class AtomNode:
                         if default.default is not PydanticUndefined:
                             state_defaults[name] = default.default
                         elif default.default_factory is not None:
+                            # The factory runs once per node (see
+                            # ``_fresh_default``); this value is the
+                            # representative default for export and
+                            # "is it still the default" comparisons.
+                            field_factories[name] = default.default_factory  # type: ignore[assignment]
                             state_defaults[name] = default.default_factory()  # type: ignore[call-arg]
                     else:
                         state_defaults[name] = default
@@ -224,6 +230,7 @@ class AtomNode:
         cls._slot_order = slot_order
         cls._field_annotations = dict(state_annotations)
         cls._field_infos = field_infos
+        cls._field_factories = field_factories
         cls._ref_defs = {}
 
         # Build Pydantic schema model from state fields only
@@ -245,6 +252,9 @@ class AtomNode:
 
         cls._schema_model = create_model(  # type: ignore[call-overload]
             f"{cls.__name__}Schema",
+            # Commit validation feeds the model by field name even when a
+            # field declares an alias.
+            __config__=ConfigDict(populate_by_name=True),
             **model_fields,
         )
 
@@ -281,6 +291,29 @@ class AtomNode:
         if field_infos and any(fi.metadata for fi in field_infos.values()):
             if getattr(cls, "_validator_model", None) is None:
                 cls._validator_model = cls._schema_model
+
+    @classmethod
+    def _fresh_default(cls, name: str) -> Any:
+        """A default value for ``name`` that is safe to hand to one node.
+
+        ``default_factory`` runs per node; a mutable literal default (list,
+        dict, set) is copied so nodes never share one object. Returns the
+        ``_MISSING`` sentinel when the field has no default.
+        """
+        factory = cls._field_factories.get(name)
+        if factory is not None:
+            return factory()
+        default = cls._field_defaults.get(name, _MISSING)
+        if isinstance(default, (list, dict, set)):
+            return copy.deepcopy(default)
+        return default
+
+    @classmethod
+    def _apply_defaults(cls, state: dict[str, Any]) -> None:
+        """Fill every unset field of ``state`` that has a default."""
+        for name, default in cls._field_defaults.items():
+            if default is not _MISSING and name not in state:
+                state[name] = cls._fresh_default(name)
 
     def __init__(self, _id: str | None = None, _doc: Any = None, **kwargs: Any) -> None:
         if _id is not None:
@@ -323,9 +356,7 @@ class AtomNode:
         slots: dict[str, list[AtomNode]] = {}
 
         # Apply defaults for state fields
-        for name, default in self._field_defaults.items():
-            if default is not _MISSING:
-                state[name] = default
+        self._apply_defaults(state)
 
         # Process kwargs
         for name, value in kwargs.items():
@@ -478,6 +509,10 @@ class AtomNode:
 
     def _parse_json_value(self, key: str, json_val: Any) -> Any:
         """Parse a plain JSON value back to its Python type (for deserialization)."""
+        if json_val is None:
+            # ``null`` is "unset or None" for any field type; a required
+            # field's inverse op carries it and must round-trip.
+            return None
         tier = self._field_tiers.get(key)
         if tier == "opaque" and isinstance(json_val, str):
             import base64

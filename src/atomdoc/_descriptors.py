@@ -6,6 +6,9 @@ from typing import Any
 
 from pydantic import TypeAdapter
 
+# Sentinel for "no default"
+_MISSING = object()
+
 
 class StateDescriptor:
     """Descriptor installed on AtomNode subclasses for each declared field.
@@ -28,7 +31,10 @@ class StateDescriptor:
     def __get__(self, obj: Any, objtype: type | None = None) -> Any:
         if obj is None:
             return self
-        return obj._state.get(self.name, self.default)
+        value = obj._state.get(self.name, self.default)
+        # A required field that has not been set reads as None; the
+        # sentinel never leaks to user code.
+        return None if value is _MISSING else value
 
     def __set__(self, obj: Any, value: Any) -> None:
         validated = self.adapter.validate_python(value)

@@ -230,7 +230,9 @@ doc.handles(strength="strong")    # [(vol, "data", VoxelData(...))]: the hard
 ```
 
 `Handle` has `uri`, and optional `media_type` and `digest`; subclasses may
-add fields. Strength is exported per field (`handles` in the schema), so a
+add fields. Declare `strength` as a plain class attribute, not an
+annotated field. Declare `strength` as a plain class attribute, not an
+annotated field. Strength is exported per field (`handles` in the schema), so a
 service can answer "can I open this?" from the schema and a dump alone.
 
 ### Heterogeneous values

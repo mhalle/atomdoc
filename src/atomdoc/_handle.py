@@ -43,6 +43,11 @@ class Handle(BaseModel, frozen=True):
     digest: str = ""
 
     def __init_subclass__(cls, **kwargs: object) -> None:
+        if "strength" in cls.__dict__.get("__annotations__", {}):
+            raise TypeError(
+                f"{cls.__name__}: declare strength as a plain class attribute "
+                f"(strength = \"strong\"), not as an annotated field"
+            )
         super().__init_subclass__(**kwargs)
         strength = cls.__dict__.get("strength", None)
         if strength is not None and strength not in ("weak", "strong"):

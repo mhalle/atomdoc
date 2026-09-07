@@ -20,6 +20,106 @@ nodes. The operations wire format is unchanged; the schema export gains a
   Field(ge=0.0, le=1.0)` exported as `{"type": "number"}` for both plain
   and `BaseModel` nodes. Bounds and other `Annotated` metadata now appear
   in `json_schema`, and each property carries its `default`.
+- **Rollback applied inverse operations in the wrong order.** A
+  transaction body that raised after inserting a node and moving an
+  existing node into it deleted the existing node for good. `abort()` now
+  rolls back in reverse and always returns the document to idle, even if
+  an inverse operation fails.
+- **Rolling back a write to a required `Ref[T]` wedged the document.** An
+  unset required field serializes as `null`, which the reference adapter
+  refused on the way back. `null` now round-trips as "unset" for every
+  field type, and an unset required field reads as `None` rather than an
+  internal sentinel.
+- **`Field(default_factory=...)` ran once per class**, so every node shared
+  one mutable default and mutating it corrupted the class default and the
+  schema export. Factories now run per node, mutable literal defaults are
+  copied per node, and `default_factory` / `default=None` on a `BaseModel`
+  source are no longer dropped.
+- **`Field(alias=...)` with a constraint disabled commit validation.**
+- **Non-JSON defaults (`datetime`, `Decimal`, `Enum`, `set`) broke the
+  schema export**, which broke the WebSocket handshake.
+- **The same node twice in one insert linked it to itself**, hanging every
+  later traversal. Rejected now, as is a duplicate ID within an adopted
+  fragment or a dump. Adopting the same fragment twice in one call yields
+  two distinct copies, and `adopt()` reseeds the ID session.
+- **Moving a node into a detached parent** orphaned it while it stayed in
+  the node map and the reference index. Rejected now.
+- **`Doc(snapshot)` never checked references**, so dangling ones could be
+  born at construction. Checked now, like restore.
+- **`UndoManager.undo()` dropped a step it could not apply** (for example
+  one that would delete a node a peer has since referenced). The step is
+  kept and the error propagates.
+- **`doc.handles()` missed handles inside lists and dicts**, and a union
+  of handle types exported the first one's strength rather than the
+  strongest.
+- **Same-named value types from different modules** silently overwrote
+  each other in the export. Now an error.
+- **Exported schemas leaked `$defs` for recursive value types** and a
+  stranded `discriminator.mapping`.
+- **Session: a well-formed `op` that failed was dropped in silence.**
+  `apply_operations` swallowed the failure inside the transaction the
+  session wrapped around it, so no `rejected` error, no snapshot, and no
+  patch went out. The session now applies strictly: a missing target is a
+  failure, and any failure is a rejection with a resync snapshot.
+- **Session: a multi-step undo broadcast only the last patch**, and a
+  change committed outside any request was either dropped or sent to a
+  client that had connected after it (and already had it in its snapshot).
+  Every commit is broadcast, to the clients connected when it happened.
+- **Session: a normalizer's additions were invisible to the sender.** A
+  patch that carries more than the client sent is no longer labelled as
+  that client's echo.
+- **Session: a non-object frame dropped the connection** instead of
+  returning `invalid_op`.
+- **Rollback applied inverse operations in the wrong order.** A
+  transaction body that raised after inserting a node and moving an
+  existing node into it deleted the existing node for good. `abort()` now
+  rolls back in reverse and always returns the document to idle, even if
+  an inverse operation fails.
+- **Rolling back a write to a required `Ref[T]` wedged the document.** An
+  unset required field serializes as `null`, which the reference adapter
+  refused on the way back. `null` now round-trips as "unset" for every
+  field type, and an unset required field reads as `None` rather than an
+  internal sentinel.
+- **`Field(default_factory=...)` ran once per class**, so every node shared
+  one mutable default and mutating it corrupted the class default and the
+  schema export. Factories now run per node, mutable literal defaults are
+  copied per node, and `default_factory` / `default=None` on a `BaseModel`
+  source are no longer dropped.
+- **`Field(alias=...)` with a constraint disabled commit validation.**
+- **Non-JSON defaults (`datetime`, `Decimal`, `Enum`, `set`) broke the
+  schema export**, which broke the WebSocket handshake.
+- **The same node twice in one insert linked it to itself**, hanging every
+  later traversal. Rejected now, as is a duplicate ID within an adopted
+  fragment or a dump. Adopting the same fragment twice in one call yields
+  two distinct copies, and `adopt()` reseeds the ID session.
+- **Moving a node into a detached parent** orphaned it while it stayed in
+  the node map and the reference index. Rejected now.
+- **`Doc(snapshot)` never checked references**, so dangling ones could be
+  born at construction. Checked now, like restore.
+- **`UndoManager.undo()` dropped a step it could not apply** (for example
+  one that would delete a node a peer has since referenced). The step is
+  kept and the error propagates.
+- **`doc.handles()` missed handles inside lists and dicts**, and a union
+  of handle types exported the first one's strength rather than the
+  strongest.
+- **Same-named value types from different modules** silently overwrote
+  each other in the export. Now an error.
+- **Exported schemas leaked `$defs` for recursive value types** and a
+  stranded `discriminator.mapping`.
+- **Session: a well-formed `op` that failed was dropped in silence.**
+  `apply_operations` swallowed the failure inside the transaction the
+  session wrapped around it, so no `rejected` error, no snapshot, and no
+  patch went out. The session now applies strictly: a missing target is a
+  failure, and any failure is a rejection with a resync snapshot.
+- **Session: a multi-step undo broadcast only the last patch**, and a
+  change committed outside any request was either dropped or sent to a
+  client that had connected after it (and already had it in its snapshot).
+  Every commit is broadcast, to the clients connected when it happened.
+- **Session: a normalizer's additions were invisible to the sender.** A
+  patch that carries more than the client sent is no longer labelled as
+  that client's echo.
+- **Session: a non-object frame dropped the connection** instead of
+  returning `invalid_op`.
 - **Node ID sessions carry 5 random characters instead of 3.** Two
   sessions minted in the same millisecond now collide with probability
   1 in ~1.07 billion rather than 1 in 262,144. IDs grow by two
@@ -75,6 +175,12 @@ nodes. The operations wire format is unchanged; the schema export gains a
   `invalid_op`.
 - Exported JSON schemas are self-contained: local `$defs` are inlined
   (a recursive definition becomes `{}`).
+- `apply_operations(..., strict=..., raise_on_error=...)`: `strict` makes a
+  missing target a failure (what a server wants); `raise_on_error`
+  propagates a failure after the rollback instead of skipping the entry.
+- `apply_operations(..., strict=..., raise_on_error=...)`: `strict` makes a
+  missing target a failure (what a server wants); `raise_on_error`
+  propagates a failure after the rollback instead of skipping the entry.
 - `mint_session_id(created_at_ms, existing)`, `session_prefix(node_id)`,
   and `node_id_factory(..., existing_sessions=...)` in `atomdoc._id`.
 - **Doc-owned undo manager.** Every `Doc` has `doc.undo_manager`, configured

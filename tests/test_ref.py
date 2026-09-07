@@ -337,7 +337,7 @@ def test_schema_export_describes_refs():
         "sources": {"target_type": "Volume", "many": True, "policy": "restrict"},
     }
     props = vol["json_schema"]["properties"]
-    assert props["transform"] == {"anyOf": [{"type": "string"}, {"type": "null"}]}
+    assert props["transform"] == {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None}
     assert props["sources"] == {"type": "array", "items": {"type": "string"}, "default": []}
     assert doc.atomdoc_schema()["node_types"]["Scene"]["refs"] == {}
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -24,6 +25,15 @@ from ._types import ChangeEvent
 from ._undo import UndoManager
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize(value: Any) -> Any:
+    """JSON-normalize an operations payload for comparison (tuples vs
+    lists, ints vs floats)."""
+    try:
+        return json.loads(json.dumps(value))
+    except (TypeError, ValueError):
+        return value
 
 
 class _Rejected(Exception):
@@ -58,10 +68,17 @@ class Session:
         self._version: int = 0
         self._transport: Transport | None = None
 
-        # Pending broadcast data set synchronously by the on_change callback
-        # and consumed by the async message handler.
-        self._pending_broadcast: dict[str, Any] | None = None
+        # Pending broadcasts set synchronously by the on_change callback
+        # and consumed by the async message handler. One request can
+        # commit more than once (a multi-step undo), hence a list. Each
+        # entry records the clients connected at commit time: a client
+        # that connects later gets the change in its snapshot instead.
+        self._pending_broadcasts: list[tuple[dict[str, Any], list[str]]] = []
         self._current_client_id: str | None = None
+        # The operations the current request sent, JSON-normalized, so a
+        # commit that differs from them (a normalizer added or changed
+        # something) is not tagged as the sender's own echo.
+        self._current_request_ops: Any = None
 
         # Cache the schema so we don't rebuild it on every connect.
         self._cached_schema: dict[str, Any] | None = None
@@ -103,12 +120,23 @@ class Session:
     def _on_doc_change(self, event: ChangeEvent) -> None:
         """Called synchronously by Doc after a transaction commits."""
         self._version += 1
-        self._pending_broadcast = {
-            "type": MSG_PATCH,
-            "version": self._version,
-            "operations": operations_to_wire(event.operations),
-            "source_client": self._current_client_id,
-        }
+        wire = operations_to_wire(event.operations)
+        source = self._current_client_id
+        if source is not None and self._current_request_ops is not None:
+            if _normalize(wire) != self._current_request_ops:
+                # The commit carries more than the client sent (a
+                # normalizer ran). A thick client skips its own echoes, so
+                # do not label this one as an echo.
+                source = None
+        self._pending_broadcasts.append((
+            {
+                "type": MSG_PATCH,
+                "version": self._version,
+                "operations": wire,
+                "source_client": source,
+            },
+            list(self._clients),
+        ))
 
     # --- Transport callbacks ---
 
@@ -139,6 +167,14 @@ class Session:
     async def _handle_message(
         self, client: ClientConnection, msg: dict[str, Any]
     ) -> None:
+        if not isinstance(msg, dict):
+            await client.send({
+                "type": MSG_ERROR,
+                "ref": None,
+                "code": "invalid_op",
+                "message": f"Expected a JSON object, got {type(msg).__name__}",
+            })
+            return
         msg_type = msg.get("type")
         ref = msg.get("ref")
 
@@ -199,16 +235,17 @@ class Session:
     def _apply_op(self, client: ClientConnection, msg: dict[str, Any]) -> None:
         ops = operations_from_wire(msg["operations"])
         self._current_client_id = client.client_id
+        self._current_request_ops = _normalize(msg["operations"])
         try:
-            # apply_operations swallows failures inside the transaction and
-            # rolls back; run it in an explicit transaction so the failure
-            # surfaces here as a rejection.
-            with self._doc.transaction():
-                self._doc.apply_operations(ops)
+            # Strict: a missing target is a failure, and any failure is
+            # rolled back and raised here as a rejection. The server must
+            # never silently drop what a client applied optimistically.
+            self._doc.apply_operations(ops, strict=True)
         except Exception as exc:
             raise _Rejected(exc) from exc
         finally:
             self._current_client_id = None
+            self._current_request_ops = None
 
     def _handle_create(self, client: ClientConnection, msg: dict[str, Any]) -> None:
         node_type = msg["node_type"]
@@ -271,20 +308,25 @@ class Session:
     # --- Broadcasting ---
 
     async def _flush_broadcast(self, exclude: str | None = None) -> None:
-        """Send pending broadcast if one was produced by the Doc change."""
-        broadcast = self._pending_broadcast
-        if broadcast is None:
+        """Send every pending broadcast produced by the Doc changes, in order."""
+        broadcasts = self._pending_broadcasts
+        if not broadcasts:
             return
-        self._pending_broadcast = None
-        await self._broadcast(broadcast, exclude=exclude)
+        self._pending_broadcasts = []
+        for broadcast, recipients in broadcasts:
+            await self._broadcast(broadcast, exclude=exclude, only=recipients)
 
     async def _broadcast(
-        self, message: dict[str, Any], exclude: str | None = None
+        self,
+        message: dict[str, Any],
+        exclude: str | None = None,
+        only: list[str] | None = None,
     ) -> None:
-        """Send a message to all connected clients, optionally excluding one."""
+        """Send a message to connected clients (``only`` those, if given),
+        optionally excluding one."""
         tasks = []
         for cid, client in self._clients.items():
-            if cid == exclude:
+            if cid == exclude or (only is not None and cid not in only):
                 continue
             tasks.append(self._safe_send(client, message))
         if tasks:

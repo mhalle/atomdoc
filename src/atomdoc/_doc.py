@@ -8,7 +8,7 @@ from contextlib import AbstractContextManager
 from typing import Annotated, Any, ForwardRef
 
 from pydantic import BaseModel, TypeAdapter
-from pydantic_core import PydanticUndefined
+from pydantic_core import PydanticUndefined, to_jsonable_python
 
 from ._id import (
     CompactIdFactory,
@@ -109,11 +109,12 @@ def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNod
                 annotations[field_name] = field_info.annotation
             if field_name in defaults:
                 continue
-            if field_info.metadata:
-                # ``Field(ge=..., le=...)`` or ``Annotated[...]`` constraints:
-                # hand the FieldInfo through so the node keeps them.
+            if field_info.metadata or field_info.default_factory is not None:
+                # Constraints (``Field(ge=...)``, ``Annotated[...]``) or a
+                # ``default_factory``: hand the FieldInfo through so the
+                # node keeps them.
                 defaults[field_name] = field_info
-            elif field_info.default is not None and field_info.default is not PydanticUndefined:
+            elif field_info.default is not PydanticUndefined:
                 defaults[field_name] = field_info.default
 
     # Build namespace for the new class.
@@ -325,6 +326,7 @@ class Doc:
         """
         self._lifecycle_stage = "idle"
         self._rebuild_ref_index()
+        self._check_dangling_refs()
         self._force_commit(ignore_empty_diff=True)
         self._undo_manager = UndoManager(
             self,
@@ -365,9 +367,7 @@ class Doc:
                 for key, value in child_snapshot._state.items():
                     child._state[key] = value
                 # Apply defaults not in state
-                for name, default in child_cls._field_defaults.items():
-                    if default is not _MISSING and name not in child._state:
-                        child._state[name] = default
+                child_cls._apply_defaults(child._state)
                 # Link into tree
                 prev = live_node._slot_last.get(slot_name)
                 child._parent = live_node
@@ -449,9 +449,11 @@ class Doc:
             )
         node_id = self._id_gen()
         node = node_cls(_id=node_id, _doc=self)
-        for name, default in node_cls._field_defaults.items():
-            if default is not _MISSING and name not in state:
-                node._state[name] = default
+        for name in node_cls._field_defaults:
+            if name not in state:
+                default = node_cls._fresh_default(name)
+                if default is not _MISSING:
+                    node._state[name] = default
         for name, value in state.items():
             adapter = node_cls._field_adapters.get(name)
             if name in node_cls._ref_defs:
@@ -506,15 +508,18 @@ class Doc:
                     f"Slot '{slot_name}' does not exist on {type(parent).__name__}"
                 )
 
-            # Validate nodes
+            # Validate nodes (also against each other: the same node or ID
+            # twice in one batch would link a node to itself)
+            seen: set[str] = set()
             for top_node in nodes:
                 for desc in _descendants_inclusive_iter(top_node):
                     if desc._doc_ref is not self:
                         raise RuntimeError("Node is from a different document")
-                    if desc.id in self._node_map:
+                    if desc.id in self._node_map or desc.id in seen:
                         raise RuntimeError(
                             f"Node '{desc.id}' already exists in the document"
                         )
+                    seen.add(desc.id)
 
             # Handle position redirects
             if position == "prepend":
@@ -616,7 +621,6 @@ class Doc:
         # Validation of inserted/updated nodes happens in
         # maybe_trigger_listeners, after normalizers have run, so nodes a
         # normalizer inserts or edits are validated too.
-        self._inverse_operations[0].reverse()
         self._lifecycle_stage = "idle"
         try:
             ops.maybe_trigger_listeners(self, ignore_empty_diff)
@@ -693,11 +697,21 @@ class Doc:
         resolved or fetched; the handles are read off the tree.
         """
         result: list[tuple[AtomNode, str, Handle]] = []
+
+        def walk(node: AtomNode, name: str, value: Any) -> None:
+            if isinstance(value, Handle):
+                if strength is None or value.strength == strength:
+                    result.append((node, name, value))
+            elif isinstance(value, (list, tuple, set)):
+                for item in value:
+                    walk(node, name, item)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    walk(node, name, item)
+
         for node in self._node_map.values():
             for name, value in node._state.items():
-                if isinstance(value, Handle):
-                    if strength is None or value.strength == strength:
-                        result.append((node, name, value))
+                walk(node, name, value)
         return result
 
     def _refs_add(self, node: AtomNode) -> None:
@@ -733,6 +747,26 @@ class Doc:
         self._ref_index.clear()
         for node in self._node_map.values():
             self._refs_add(node)
+
+    def _check_dangling_refs(self) -> None:
+        """Raise (strict) or warn on references that do not resolve.
+
+        Runs when a document is built from a snapshot or restored from a
+        dump: those paths write the tree directly and never go through the
+        commit-time check.
+        """
+        dangling = self._dangling_refs()
+        if not dangling:
+            return
+        referrer, name, target_id = dangling[0]
+        message = (
+            f"{len(dangling)} unresolved reference(s) in document, "
+            f"e.g. {type(referrer).__name__}.{name} on node "
+            f"'{referrer.id}' -> '{target_id}'"
+        )
+        if self._strict_mode:
+            raise RefIntegrityError(message)
+        warnings.warn(message, stacklevel=3)
 
     def _dangling_refs(self) -> list[tuple[AtomNode, str, str]]:
         """(referrer, field, target id) for every reference that does not resolve."""
@@ -800,16 +834,22 @@ class Doc:
     def abort(self) -> None:
         from . import _operations as ops
 
+        # Inverse ops are recorded in forward order; roll back in reverse.
         inverse: Operations = (
-            list(self._inverse_operations[0]),
+            list(reversed(self._inverse_operations[0])),
             dict(self._inverse_operations[1]),
         )
-        ops.on_apply_operations(self, inverse)
-        self._operations = ([], {})
-        self._inverse_operations = ([], {})
-        self._transaction_flags = TransactionFlags()
-        self._diff = Diff()
-        self._lifecycle_stage = "idle"
+        try:
+            ops.on_apply_operations(self, inverse)
+        finally:
+            # Whatever happens, the document must not stay in the update
+            # stage: a wedged document can never commit or dump again.
+            self._operations = ([], {})
+            self._inverse_operations = ([], {})
+            self._transaction_flags = TransactionFlags()
+            self._diff = Diff()
+            self._lifecycle_stage = "idle"
+            self._rebuild_ref_index()
 
     # --- Listeners ---
 
@@ -841,6 +881,8 @@ class Doc:
         *,
         limit: int | None = None,
         skip_undo: bool = False,
+        strict: bool = False,
+        raise_on_error: bool | None = None,
     ) -> list[Operations]:
         """Apply operations. Returns any unapplied operations.
 
@@ -852,7 +894,15 @@ class Doc:
         ``skip_undo`` applies the operations in their own transaction(s)
         flagged so the undo manager ignores them — use it for operations
         received from a remote peer. Any open transaction is committed first.
+
+        By default a failing entry is rolled back and silently skipped
+        (best effort, for undo and journals). With ``raise_on_error`` the
+        failure propagates after the rollback. With ``strict`` an operation
+        whose target is missing is itself a failure, and ``raise_on_error``
+        defaults to True — what an authoritative server wants.
         """
+        if raise_on_error is None:
+            raise_on_error = strict
         from . import _operations as ops
         from ._transaction import with_transaction
 
@@ -876,8 +926,10 @@ class Doc:
             def _do(op: Operations = single_ops) -> None:
                 if not op[0] and not op[1]:
                     return
-                ops.on_apply_operations(self, op)
-            with_transaction(self, _do, is_apply_operations=True, flags=flags)
+                ops.on_apply_operations(self, op, strict=strict)
+            with_transaction(
+                self, _do, is_apply_operations=not raise_on_error, flags=flags
+            )
 
         if skip_undo and self._lifecycle_stage == "update":
             self.force_commit()
@@ -958,25 +1010,32 @@ class Doc:
         else:
             entries = [fragment]  # type: ignore[list-item]
 
-        incoming: list[str] = []
-
-        def collect(entry: JsonDoc) -> None:
-            incoming.append(entry[0])
+        def collect(entry: JsonDoc, into: list[str]) -> None:
+            into.append(entry[0])
             if len(entry) > 3 and entry[3]:
                 for children in entry[3].values():
                     for child in children:
-                        collect(child)
+                        collect(child, into)
 
+        # IDs already present in the document, plus those taken by earlier
+        # entries of this call: the same fragment adopted twice yields two
+        # distinct copies.
+        taken: set[str] = set(self._node_map)
+        nodes: list[AtomNode] = []
         for entry in entries:
-            collect(entry)
+            incoming: list[str] = []
+            collect(entry, incoming)
+            if len(set(incoming)) != len(incoming):
+                dup = next(i for i in incoming if incoming.count(i) > 1)
+                raise ValueError(f"Fragment contains node id {dup!r} more than once")
+            remap = {i: self._id_gen() for i in incoming if i in taken}
+            taken.update(remap.get(i, i) for i in incoming)
+            nodes.append(self._build_fragment_node(entry, remap))
 
-        remap: dict[str, str] = {}
-        for node_id in incoming:
-            if node_id in self._node_map and node_id not in remap:
-                remap[node_id] = self._id_gen()
-
-        nodes = [self._build_fragment_node(entry, remap) for entry in entries]
         self._insert_into_slot(parent, slot_name, position, nodes, target=target)
+        # The fragment may carry this document's own session prefix (a copy
+        # of an earlier dump); make sure new IDs cannot walk into it.
+        self._reseed_id_factory()
         return nodes
 
     def _build_fragment_node(self, entry: JsonDoc, remap: dict[str, str]) -> AtomNode:
@@ -1051,20 +1110,8 @@ class Doc:
 
         doc._reseed_id_factory()
 
-        doc._rebuild_ref_index()
-        dangling = doc._dangling_refs()
-        if dangling:
-            referrer, name, target_id = dangling[0]
-            message = (
-                f"{len(dangling)} unresolved reference(s) in restored document, "
-                f"e.g. {type(referrer).__name__}.{name} on node "
-                f"'{referrer.id}' -> '{target_id}'"
-            )
-            if strict_mode:
-                raise RefIntegrityError(message)
-            warnings.warn(message, stacklevel=2)
-
         # Normalizers see the restored tree; nothing here is undoable.
+        # Unresolved references raise (strict) or warn in _finish_init.
         doc._finish_init()
         return doc
 
@@ -1085,10 +1132,7 @@ class Doc:
             raise ValueError(f"Unknown node type: '{node_type}'")
 
         node = node_cls(_id=node_id, _doc=self)
-
-        for name, default in node_cls._field_defaults.items():
-            if default is not _MISSING:
-                node._state[name] = default
+        node_cls._apply_defaults(node._state)
 
         for key, json_val in state_dict.items():
             node._state[key] = node._parse_json_value(key, json_val)
@@ -1111,6 +1155,7 @@ class Doc:
         """
         node_types: dict[str, Any] = {}
         value_types: dict[str, Any] = {}
+        value_type_classes: dict[str, type] = {}
 
         for type_name, node_cls in self._node_types.items():
             entry: dict[str, Any] = {}
@@ -1157,9 +1202,15 @@ class Doc:
             for fname, ann in node_cls._field_annotations.items():
                 handle_types = [m for m in frozen_models_in(ann) if is_handle_type(m)]
                 if handle_types:
+                    # A field that may hold several handle types is as strong
+                    # as its strongest option.
+                    chosen = next(
+                        (h for h in handle_types if h.strength == "strong"),  # type: ignore[attr-defined]
+                        handle_types[0],
+                    )
                     handles[fname] = {
-                        "value_type": handle_types[0].__name__,
-                        "strength": handle_types[0].strength,  # type: ignore[attr-defined]
+                        "value_type": chosen.__name__,
+                        "strength": chosen.strength,  # type: ignore[attr-defined]
                     }
             entry["handles"] = handles
 
@@ -1190,8 +1241,16 @@ class Doc:
             # (including members of unions and Optional).
             for fname, ann in node_cls._field_annotations.items():
                 for vtype in frozen_models_in(ann):
-                    if vtype.__name__ in value_types:
+                    seen_type = value_type_classes.get(vtype.__name__)
+                    if seen_type is vtype:
                         continue
+                    if seen_type is not None:
+                        raise ValueError(
+                            f"Two value types named {vtype.__name__!r} "
+                            f"({seen_type.__module__} and {vtype.__module__}); "
+                            f"the schema export keys value types by name"
+                        )
+                    value_type_classes[vtype.__name__] = vtype
                     ventry: dict[str, Any] = {
                         "json_schema": _inline_defs(vtype.model_json_schema()),
                         "frozen": True,
@@ -1232,9 +1291,15 @@ def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
                 if name in stack or name not in defs:
                     return {}
                 resolved = resolve(defs[name], stack + (name,))
-                extra = {k: v for k, v in obj.items() if k != "$ref"}
+                extra = {k: v for k, v in obj.items() if k not in ("$ref", "$defs")}
                 return {**resolved, **extra} if isinstance(resolved, dict) else resolved
-            return {k: resolve(v, stack) for k, v in obj.items() if k != "$defs"}
+            out = {k: resolve(v, stack) for k, v in obj.items() if k != "$defs"}
+            disc = out.get("discriminator")
+            if isinstance(disc, dict) and "mapping" in disc:
+                # The mapping pointed into $defs, which no longer exist;
+                # the variants are inlined in order under oneOf/anyOf.
+                out["discriminator"] = {k: v for k, v in disc.items() if k != "mapping"}
+            return out
         if isinstance(obj, list):
             return [resolve(v, stack) for v in obj]
         return obj
@@ -1243,14 +1308,15 @@ def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def _json_safe(value: Any) -> Any:
-    """A JSON-compatible copy of a field default."""
+    """A JSON-compatible copy of a field default (models, bytes, datetimes,
+    enums, decimals, sets, ...)."""
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")
     if isinstance(value, bytes):
         import base64
 
         return base64.b64encode(value).decode()
-    return value
+    return to_jsonable_python(value)
 
 
 def _node_to_wire(node: AtomNode, include_defaults: bool = False) -> JsonDoc:
@@ -1311,6 +1377,8 @@ def _deserialize_slots(doc: Doc, parent: AtomNode, slots_data: dict[str, list[Js
 
         prev: AtomNode | None = None
         for child_json in children_data:
+            if child_json[0] in doc._node_map:
+                raise ValueError(f"Duplicate node id in document: {child_json[0]!r}")
             child = doc._create_node_from_json(child_json)
             child._parent = parent
             child._slot_name = slot_name

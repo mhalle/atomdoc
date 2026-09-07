@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from ._descriptors import _MISSING
 from ._range import _descendants
 
 if TYPE_CHECKING:
@@ -319,8 +320,21 @@ def on_move_range(
 # --- Apply remote operations ---
 
 
-def on_apply_operations(doc: Doc, operations: Operations) -> None:
+def on_apply_operations(doc: Doc, operations: Operations, *, strict: bool = False) -> None:
+    """Apply an operation set to the document.
+
+    With ``strict`` an operation whose target is missing (a parent, a node
+    to delete or move, a node to patch) raises instead of being skipped.
+    The lenient mode is for undo and rollback, where a target may have
+    legitimately gone; the strict mode is for an authoritative server that
+    must not silently drop what a client applied optimistically.
+    """
     from typing import Any as _Any
+
+    def missing(what: str, node_id: object) -> None:
+        if strict:
+            raise ValueError(f"{what} not found: {node_id!r}")
+
     ordered_op: _Any
     for ordered_op in operations[0]:
         op = ordered_op
@@ -337,6 +351,7 @@ def on_apply_operations(doc: Doc, operations: Operations) -> None:
 
             parent = doc.get_node_by_id(str(parent_id)) if parent_id else doc.root
             if parent is None:
+                missing("Parent node", parent_id)
                 continue
 
             if prev_id:
@@ -353,14 +368,17 @@ def on_apply_operations(doc: Doc, operations: Operations) -> None:
 
         elif op[0] == 1:
             # Delete: (1, start_id, end_id)
+            start = doc.get_node_by_id(op[1])
+            end_id = op[2] or op[1]
+            end = doc.get_node_by_id(str(end_id))
+            if start is None or end is None:
+                missing("Node to delete", op[1] if start is None else end_id)
+                continue
             try:
-                start = doc.get_node_by_id(op[1])
-                end_id = op[2] or op[1]
-                end = doc.get_node_by_id(str(end_id))
-                if start and end:
-                    start.to(end).delete()
+                start.to(end).delete()
             except Exception:
-                pass
+                if strict:
+                    raise
 
         elif op[0] == 2:
             # Move: (2, start_id, end_id, parent_id, slot_name, prev_id, next_id)
@@ -368,6 +386,7 @@ def on_apply_operations(doc: Doc, operations: Operations) -> None:
             end_id = op[2] or op[1]
             end = doc.get_node_by_id(str(end_id))
             if not start or not end:
+                missing("Node to move", op[1] if not start else end_id)
                 continue
             try:
                 parent_id = op[3]
@@ -383,10 +402,13 @@ def on_apply_operations(doc: Doc, operations: Operations) -> None:
                     start.to(end).move(nxt, position="before")
                     continue
                 parent = doc.get_node_by_id(str(parent_id)) if parent_id else doc.root
-                if parent:
-                    start.to(end).move(parent, slot_name, "append")
+                if parent is None:
+                    missing("Parent node", parent_id)
+                    continue
+                start.to(end).move(parent, slot_name, "append")
             except Exception:
-                pass
+                if strict:
+                    raise
 
     # Apply state patches
     to_apply = operations[1]
@@ -396,6 +418,7 @@ def on_apply_operations(doc: Doc, operations: Operations) -> None:
     for node_id, patches in to_apply.items():
         node = doc.get_node_by_id(node_id)
         if node is None:
+            missing("Node to update", node_id)
             continue
         current_patch[node_id] = {**current_patch.get(node_id, {}), **patches}
         if node_id not in doc._diff.inserted:
@@ -407,9 +430,17 @@ def on_apply_operations(doc: Doc, operations: Operations) -> None:
                     original = node._state_key_to_json(key)
                     current_inv_patch.setdefault(node_id, {}).setdefault(key, original)
             old_value = node._state.get(key)
-            node._state[key] = node._parse_state_key(key, json_val)
+            if json_val is None and node._field_defaults.get(key, _MISSING) is _MISSING:
+                # ``null`` for a field without a default means "unset"
+                # (that is how an unset field serializes), so restore it
+                # to unset rather than storing None.
+                node._state.pop(key, None)
+                new_value = None
+            else:
+                new_value = node._parse_state_key(key, json_val)
+                node._state[key] = new_value
             if key in node._ref_defs:
-                doc._refs_update(node, key, old_value, node._state[key])
+                doc._refs_update(node, key, old_value, new_value)
 
 
 # --- Trigger listeners ---
@@ -454,9 +485,15 @@ def maybe_trigger_listeners(doc: Doc, ignore_empty_diff: bool = False) -> None:
     from ._types import ChangeEvent
 
     doc._lifecycle_stage = "change"
+    # Inverse ops are recorded in forward order; the event (and the undo
+    # manager) get them in application order.
+    inverse: Operations = (
+        list(reversed(doc._inverse_operations[0])),
+        doc._inverse_operations[1],
+    )
     event = ChangeEvent(
         operations=doc._operations,
-        inverse_operations=doc._inverse_operations,
+        inverse_operations=inverse,
         diff=doc._diff,
         flags=doc._transaction_flags,
     )
