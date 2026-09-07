@@ -20,6 +20,11 @@ nodes. The operations wire format is unchanged; the schema export gains a
   Field(ge=0.0, le=1.0)` exported as `{"type": "number"}` for both plain
   and `BaseModel` nodes. Bounds and other `Annotated` metadata now appear
   in `json_schema`, and each property carries its `default`.
+- **Node ID sessions carry 5 random characters instead of 3.** Two
+  sessions minted in the same millisecond now collide with probability
+  1 in ~1.07 billion rather than 1 in 262,144. IDs grow by two
+  characters; old and new widths coexist, IDs are opaque strings.
+  This diverges from DocuKit's generator, which is intentional.
 - **`Doc.restore` could mint a colliding ID session.** The session was
   minted before the nodes were loaded; if it matched a session already in
   the dump, new nodes would silently overwrite existing ones. Restore now

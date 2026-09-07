@@ -75,14 +75,23 @@ def test_node_id_format(doc):
 def test_mint_session_id_avoids_existing(monkeypatch):
     from atomdoc import _id
 
-    monkeypatch.setattr(_id, "random_base64", lambda n: "AAA")
+    monkeypatch.setattr(_id, "random_base64", lambda n: "A" * n)
     monkeypatch.setattr(_id.time, "time", lambda: 1.0)
     fresh = _id.mint_session_id(0)
-    assert fresh == number_to_base64(1000) + "AAA"
+    assert fresh == number_to_base64(1000) + "AAAAA"
     # Same millisecond, same suffix: the collision is detected and resolved.
     again = _id.mint_session_id(0, existing={fresh})
     assert again != fresh
-    assert again.endswith("AAA")
+    assert again.endswith("AAAAA")
+
+
+def test_session_random_suffix_is_five_chars():
+    import time
+
+    from atomdoc import _id
+
+    session = _id.mint_session_id(int(time.time() * 1000))
+    assert len(session) == 6  # 1 ms digit + 5 random
 
 
 def test_restore_reseeds_colliding_session(monkeypatch):
@@ -96,7 +105,7 @@ def test_restore_reseeds_colliding_session(monkeypatch):
     class Root:
         items: Array[Item] = []
 
-    monkeypatch.setattr(_id, "random_base64", lambda n: "AAA")
+    monkeypatch.setattr(_id, "random_base64", lambda n: "A" * n)
     monkeypatch.setattr(_id.time, "time", lambda: 1_700_000_000.0)
 
     doc = Doc(Root)

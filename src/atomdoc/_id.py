@@ -117,9 +117,9 @@ def session_prefix(node_id: str) -> str | None:
 def mint_session_id(created_at_ms: int, existing: Collection[str] = ()) -> str:
     """Mint a session ID that is not in ``existing``.
 
-    The session is ``{ms since root creation}{3 random chars}``. Two
+    The session is ``{ms since root creation}{5 random chars}``. Two
     sessions minted in the same millisecond collide only if they draw the
-    same random suffix; when ``existing`` holds the sessions already present
+    same 30-bit suffix (1 in ~1.07 billion); when ``existing`` holds the sessions already present
     in a document (see ``Doc.restore``), a collision is detected outright
     and a fresh suffix is drawn. If the suffix keeps colliding the
     millisecond component is bumped, so this always terminates.
@@ -128,7 +128,7 @@ def mint_session_id(created_at_ms: int, existing: Collection[str] = ()) -> str:
     taken = set(existing)
     while True:
         for _ in range(16):
-            session_id = number_to_base64(ms_passed) + random_base64(3)
+            session_id = number_to_base64(ms_passed) + random_base64(5)
             if session_id not in taken:
                 return session_id
         ms_passed += 1
