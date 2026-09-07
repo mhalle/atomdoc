@@ -102,7 +102,13 @@ class UndoManager:
     def _on_change(self, event: ChangeEvent) -> None:
         if event.flags.skip_undo:
             return
-        if self._accept is not None and not self._accept(event):
+        # The commit of this manager's own undo/redo always counts,
+        # whatever the filter says: it must land on the opposite stack.
+        if (
+            self._tx_type == "update"
+            and self._accept is not None
+            and not self._accept(event)
+        ):
             return
         item = UndoStackItem(operations=event.inverse_operations)
         if self._tx_type == "update":

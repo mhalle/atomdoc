@@ -6,6 +6,42 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Concurrent moves could leave a thick client's slot order wrong for
+  good.** A remote move anchored at a node the client had a pending move
+  for is vacuous in the client's frame while real on the server, and a
+  move the server found already satisfied produced no patch at all. The
+  session now follows the echo of every `op` containing a move, and
+  answers every `op` that commits nothing, with a patch to the requester
+  alone at the current version giving the full order of each slot it
+  moved into (and, for a no-op, the values it holds).
+- **The request context leaked across the awaits of an error reply**, so
+  a host-side commit landing meanwhile was labeled with the failed
+  request's `ref`, credited to that client's undo history, and left
+  queued until some later request flushed it. The context now lives only
+  for the synchronous dispatch.
+- **A connecting client could receive versions out of order**: its
+  buffered patches were drained without the flush lock. Promotion and
+  drain now hold it.
+- **An empty state entry (`{"id": {}}`) committed a version** and an
+  undo step. It is ignored.
+- **A listener failure truncated a multi-step undo and a multi-entry
+  journal.** Both now finish and report the failures together.
+- **A `KeyboardInterrupt` in a change listener wedged the document** in
+  the change stage. The commit is closed before it propagates.
+- **The WebSocket transport dropped the connection on a malformed
+  frame** without a word, and swallowed session errors. It replies
+  `invalid_op` and keeps the connection; session errors are logged.
+- **A dead client kept its per-client undo manager** subscribed to the
+  document; `unbind()` left scheduled flushes running.
+- **`children[i]` could return the wrong node after an insert, delete or
+  move** (a regression of the index cursor below): the cursor is now
+  tied to a document-wide tree version and discarded on any structural
+  change. **Per-node default copies shared nested model instances** (a
+  regression of the structural copy below): models inside container
+  defaults are deep-copied again.
+- **An undo manager with an `accept` filter dropped the redo entry for
+  its own undo** when the filter declined that commit.
+
 - **A tree about a thousand levels deep crashed with `RecursionError`**
   on `dump()`, `restore()`, `descendants()`, `adopt()`, and deleting the
   chain. Every tree walk is now iterative. (Serializing such a dump with

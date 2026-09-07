@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import re
 import sys
 from collections.abc import Callable
@@ -98,22 +100,30 @@ class SlotDef:
         self.allowed_type = allowed_type
 
 
+_IMMUTABLE_LEAVES = (str, int, float, bool, bytes, type(None))
+
+
 def _copy_container(value: Any) -> Any:
     """Copy of a default value that shares nothing mutable with it.
 
     Cheaper than ``copy.deepcopy`` for the JSON-like defaults fields hold
     (a 4x4 matrix as a list of floats, say): immutable leaves are shared,
-    only containers are rebuilt.
+    containers are rebuilt, and anything else (a model, whose own list
+    fields are mutable even when the model is frozen) is deep-copied.
     """
+    if isinstance(value, _IMMUTABLE_LEAVES):
+        return value
     if isinstance(value, list):
         return [_copy_container(v) for v in value]
     if isinstance(value, dict):
         return {k: _copy_container(v) for k, v in value.items()}
-    if isinstance(value, set):
-        return set(value)
     if isinstance(value, tuple):
         return tuple(_copy_container(v) for v in value)
-    return value
+    if isinstance(value, (set, frozenset)):
+        return type(value)(_copy_container(v) for v in value)
+    if isinstance(value, BaseModel):
+        return value.model_copy(deep=True)
+    return copy.deepcopy(value)
 
 
 class SlotDescriptor:
@@ -333,9 +343,9 @@ class AtomNode:
         if factory is not None:
             return factory()
         default = cls._field_defaults.get(name, _MISSING)
-        if isinstance(default, (list, dict, set, tuple)):
-            return _copy_container(default)
-        return default
+        if default is _MISSING or isinstance(default, _IMMUTABLE_LEAVES):
+            return default
+        return _copy_container(default)
 
     @classmethod
     def _apply_defaults(cls, state: dict[str, Any]) -> None:
@@ -354,6 +364,9 @@ class AtomNode:
             self._init_snapshot(kwargs)
 
     def _init_internal(self, _id: str, _doc: Any) -> None:
+        # A revived node must not keep slot views (and their cursors)
+        # from its earlier life.
+        self.__dict__.pop("_slot_views", None)
         object.__setattr__(self, "_state", {})
         object.__setattr__(self, "id", _id)
         object.__setattr__(self, "_doc_ref", _doc)

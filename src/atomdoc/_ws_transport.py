@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import uuid4
@@ -16,6 +17,9 @@ except ImportError as exc:
         "The websockets package is required for WebSocketTransport. "
         "Install it with: pip install atomdoc[server]"
     ) from exc
+
+
+logger = logging.getLogger(__name__)
 
 
 class WebSocketClient(ClientConnection):
@@ -61,10 +65,28 @@ class WebSocketTransport(Transport):
             await on_connect(client)
             try:
                 async for raw in ws:
-                    msg = json.loads(raw)
-                    await on_message(client, msg)
+                    try:
+                        msg = json.loads(raw)
+                    except ValueError:
+                        # A malformed frame is the client's problem, not a
+                        # reason to drop the connection.
+                        await client.send({
+                            "type": "error",
+                            "ref": None,
+                            "code": "invalid_op",
+                            "message": "Malformed JSON frame",
+                        })
+                        continue
+                    try:
+                        await on_message(client, msg)
+                    except Exception:
+                        # A session-side failure must be visible, and one
+                        # request must not take the connection down.
+                        logger.exception(
+                            "Error handling message from %s", client.client_id
+                        )
             except Exception:
-                pass
+                logger.debug("Connection %s ended", client.client_id, exc_info=True)
             finally:
                 await on_disconnect(client)
 

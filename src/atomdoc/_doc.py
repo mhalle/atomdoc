@@ -302,6 +302,10 @@ class Doc:
             self._id = self._node_id_generator.generate()
 
         self._node_map: dict[str, AtomNode] = {}
+        # Bumped on every structural change (insert, delete, move, load);
+        # positional caches (ChildrenView cursors) are valid only while it
+        # is unchanged.
+        self._tree_version = 0
         # Node objects removed from the document, by ID, for as long as
         # someone still holds them. A rollback or undo that re-inserts the
         # same ID revives the object, so a handle survives the round trip.
@@ -384,6 +388,7 @@ class Doc:
         Iterative over an explicit work list, so nesting depth is not
         bounded by the interpreter's recursion limit.
         """
+        self._tree_version += 1
         work = [(live_node, snapshot)]
         while work:
             live, snap = work.pop()
@@ -590,6 +595,7 @@ class Doc:
                 ops.on_insert_range_before(self, target, slot_name, nodes)
 
             # Perform tree linking
+            self._tree_version += 1
             if position == "append":
                 current = parent._slot_last.get(slot_name)
                 for nd in nodes:
@@ -981,14 +987,23 @@ class Doc:
 
         flags = TransactionFlags(skip_undo=True) if skip_undo else None
 
+        # A listener failure after one entry's commit must not stop the
+        # journal: the later entries are independent commits. Failures
+        # are collected and raised together once every entry has run.
+        listener_errors: list[BaseException] = []
         for single_ops in to_apply:
             def _do(op: Operations = single_ops) -> None:
                 if not op[0] and not op[1]:
                     return
                 ops.on_apply_operations(self, op, strict=strict)
-            with_transaction(
-                self, _do, is_apply_operations=not raise_on_error, flags=flags
-            )
+            try:
+                with_transaction(
+                    self, _do, is_apply_operations=not raise_on_error, flags=flags
+                )
+            except ListenerError as exc:
+                listener_errors.extend(exc.errors)
+        if listener_errors:
+            raise ListenerError(listener_errors)
 
         return remaining
 
@@ -1481,6 +1496,7 @@ def _node_to_data(node: AtomNode, include_defaults: bool = False) -> dict[str, A
 
 def _deserialize_slots(doc: Doc, parent: AtomNode, slots_data: dict[str, list[JsonDoc]]) -> None:
     """Deserialize slot children, iteratively over an explicit work list."""
+    doc._tree_version += 1
     work: list[tuple[AtomNode, dict[str, list[JsonDoc]]]] = [(parent, slots_data)]
     while work:
         node, slots = work.pop()

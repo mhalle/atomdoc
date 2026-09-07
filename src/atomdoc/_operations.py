@@ -416,6 +416,8 @@ def on_apply_operations(doc: Doc, operations: Operations, *, strict: bool = Fals
     current_inv_patch = doc._inverse_operations[1]
 
     for node_id, patches in to_apply.items():
+        if not patches:
+            continue  # ``{"id": {}}`` changes nothing and must not commit
         node = doc.get_node_by_id(node_id)
         if node is None:
             missing("Node to update", node_id)
@@ -520,11 +522,17 @@ def maybe_trigger_listeners(doc: Doc, ignore_empty_diff: bool = False) -> None:
     # one of them runs, whatever the others do, and failures are reported
     # together afterwards (see ListenerError).
     errors: list[BaseException] = []
-    for change_listener in list(doc._change_listeners):
-        try:
-            change_listener(event)
-        except Exception as exc:
-            errors.append(exc)
+    try:
+        for change_listener in list(doc._change_listeners):
+            try:
+                change_listener(event)
+            except Exception as exc:
+                errors.append(exc)
+    except BaseException:
+        # KeyboardInterrupt and friends propagate, but the commit is
+        # final: the document must not stay in the "change" stage.
+        doc._close_transaction()
+        raise
     if errors:
         raise ListenerError(errors)
 

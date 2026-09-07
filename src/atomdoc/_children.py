@@ -21,11 +21,13 @@ class ChildrenView(Sequence["AtomNode"]):
     def __init__(self, node: AtomNode, slot_name: str) -> None:
         self._node = node
         self._slot_name = slot_name
-        # (index, node) of the last positional lookup. The children are a
-        # linked list, so ``view[i]`` walks from the start; a sequential
-        # scan (``for i in range(n): view[i]``) would be quadratic. The
-        # cursor makes each step from the previous index cost O(1).
-        self._cursor: tuple[int, AtomNode] | None = None
+        # (index, node, tree version) of the last positional lookup. The
+        # children are a linked list, so ``view[i]`` walks from the start;
+        # a sequential scan (``for i in range(n): view[i]``) would be
+        # quadratic. The cursor makes each step from the previous index
+        # O(1). It is valid only while the document's tree has not changed
+        # since (any insert, delete or move bumps ``doc._tree_version``).
+        self._cursor: tuple[int, AtomNode, int] | None = None
 
     def __len__(self) -> int:
         count = 0
@@ -48,17 +50,15 @@ class ChildrenView(Sequence["AtomNode"]):
             return items[index]
         current = self._node._slot_first.get(self._slot_name)
         i = 0
+        doc = self._node._doc_ref
+        version = doc._tree_version if doc is not None else -1
         cursor = self._cursor
-        if (
-            cursor is not None
-            and cursor[0] <= index
-            and cursor[1]._parent is self._node
-            and cursor[1]._slot_name == self._slot_name
-        ):
-            i, current = cursor
+        if cursor is not None and cursor[2] == version and cursor[0] <= index:
+            i, current, _ = cursor
         while current is not None:
             if i == index:
-                self._cursor = (i, current)
+                if doc is not None:
+                    self._cursor = (i, current, version)
                 return current
             current = current._next_sibling
             i += 1

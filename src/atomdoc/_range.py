@@ -55,6 +55,7 @@ class NodeRange:
                     doc._graveyard[desc.id] = desc
                     doc._refs_remove(desc)
             _detach_range(self._start, self._end)
+            doc._tree_version += 1
 
         with_transaction(doc, _do)
 
@@ -155,6 +156,7 @@ class NodeRange:
             )
 
             _detach_range(self._start, self._end)
+            doc._tree_version += 1
 
             # Attach at new position
             self._start._prev_sibling = new_prev

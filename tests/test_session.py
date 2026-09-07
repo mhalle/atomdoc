@@ -823,3 +823,155 @@ async def test_broadcast_carries_coerced_values():
     own = next(m for m in a.messages if m["type"] == MSG_PATCH)
     assert own["source_client"] is None
     assert own["operations"]["state"][c.id]["n"] == 7
+
+
+# --- fourth review: session ordering, no-op echo, hygiene ---
+
+
+@pytest.mark.asyncio
+async def test_request_context_does_not_leak_into_error_replies():
+    """A host commit landing while an error reply is being sent is not
+    attributed to the failed request."""
+    session, transport, a, b, t, v = await setup_scene_session()
+
+    class SlowClient(YieldingClient):
+        async def send(self, message: dict[str, Any]) -> None:
+            # A host commit lands while this reply is in flight.
+            if message["type"] == MSG_ERROR and not getattr(self, "_fired", False):
+                self._fired = True
+                with session.doc.transaction():
+                    session.doc.get_node_by_id(t.id).name = "host"
+            await super().send(message)
+
+    slow = SlowClient("slow")
+    await transport.connect_client(slow)
+    slow.messages.clear()
+    b.messages.clear()
+    await transport.send_message(slow, {
+        "type": MSG_OP, "ref": "bad",
+        "operations": {"ordered": [[1, "nope", 0]], "state": {}},
+    })
+    await settle(session)
+    patch = next(m for m in b.messages if m["type"] == MSG_PATCH)
+    assert patch["ref"] is None and patch["source_client"] is None
+    assert not session._client_undo["slow"].can_undo
+    assert session._request is None
+
+
+@pytest.mark.asyncio
+async def test_handshake_drain_keeps_versions_in_order():
+    session, transport, a, b, t, v = await setup_scene_session()
+
+    class DrainClient(YieldingClient):
+        pass
+
+    newbie = DrainClient("n")
+    connect = asyncio.ensure_future(transport.connect_client(newbie))
+    await asyncio.sleep(0)
+    # Two commits land during the handshake; a third arrives while the
+    # buffered ones are being drained.
+    for i in range(2):
+        await transport.send_message(a, _set_name(f"r{i}", t.id, f"v{i}"))
+    async def late() -> None:
+        await asyncio.sleep(0)
+        await transport.send_message(b, _set_name("late", t.id, "late"))
+    await asyncio.gather(connect, late())
+    await settle(session)
+    versions = _patch_versions(newbie)
+    assert versions == sorted(versions)
+    snapshot = next(m for m in newbie.messages if m["type"] == MSG_SNAPSHOT)
+    assert all(ver > snapshot["version"] for ver in versions)
+
+
+@pytest.mark.asyncio
+async def test_noop_op_is_answered_with_the_servers_placement():
+    session, transport, a, b, t, v = await setup_scene_session()
+    doc = session.doc
+    with doc.transaction():
+        for name in ("x", "y", "z"):
+            doc.root.transforms.append(doc.create_node(Transform, name=name))
+    nodes = {n.name: n.id for n in doc.root.transforms}
+    await settle(session)  # the host commit above reaches both clients
+    a.messages.clear()
+    b.messages.clear()
+    # z is already last: moving it after y commits nothing on the server.
+    await transport.send_message(a, {
+        "type": MSG_OP, "ref": "noop",
+        "operations": {"ordered": [[2, nodes["z"], 0, 0, "transforms", nodes["y"], 0]], "state": {}},
+    })
+    assert b.messages == []
+    assert len(a.messages) == 1
+    echo = a.messages[0]
+    assert echo["type"] == MSG_PATCH and echo["ref"] == "noop"
+    assert echo["version"] == session.version
+    order = [op[1] for op in echo["operations"]["ordered"]]
+    assert order == [n.id for n in doc.root.transforms]
+    assert [op[5] for op in echo["operations"]["ordered"]] == [0, *order[:-1]]
+    # A write of the value already held is answered the same way.
+    a.messages.clear()
+    await transport.send_message(a, _set_name("same", t.id, "t"))
+    assert a.messages[0]["operations"]["state"] == {t.id: {"name": "t"}}
+    # A move that does commit is followed, for the requester only, by the
+    # slot's full order at the same version.
+    a.messages.clear()
+    b.messages.clear()
+    await transport.send_message(a, {
+        "type": MSG_OP, "ref": "mv",
+        "operations": {"ordered": [[2, nodes["z"], 0, 0, "transforms", 0, nodes["x"]]], "state": {}},
+    })
+    assert [m["type"] for m in b.messages] == [MSG_PATCH]
+    assert [(m["type"], m["version"], m["ref"]) for m in a.messages] == [
+        (MSG_PATCH, session.version, "mv"), (MSG_PATCH, session.version, "mv"),
+    ]
+    chain = a.messages[1]["operations"]
+    assert [op[1] for op in chain["ordered"]] == [n.id for n in doc.root.transforms]
+    assert chain["state"] == {}
+
+
+@pytest.mark.asyncio
+async def test_empty_state_patch_commits_nothing():
+    session, transport, a, b, t, v = await setup_scene_session()
+    before = session.version
+    await transport.send_message(a, {
+        "type": MSG_OP, "ref": "e", "operations": {"ordered": [], "state": {t.id: {}}},
+    })
+    assert session.version == before
+    assert b.messages == []
+    assert not session._client_undo["a"].can_undo
+
+
+@pytest.mark.asyncio
+async def test_multi_step_undo_survives_a_listener_failure():
+    session, transport, a, b, t, v = await setup_scene_session()
+    node = session.doc.get_node_by_id(t.id)
+    for i in range(3):
+        await transport.send_message(a, _set_name(f"r{i}", t.id, f"v{i}"))
+    fail = {"on": False}
+    session.doc.on_change(lambda e: 1 / 0 if fail["on"] else None)
+    fail["on"] = True
+    a.messages.clear()
+    await transport.send_message(a, {"type": MSG_UNDO, "ref": "u", "steps": 3})
+    assert node.name == "t"
+    assert [m["type"] for m in a.messages] == [MSG_PATCH] * 3
+
+
+@pytest.mark.asyncio
+async def test_dead_client_loses_its_undo_history():
+    session, transport, a, b, t, v = await setup_scene_session()
+    dead = DeadClient("dead")
+    session._clients["dead"] = dead
+    session._make_client_undo("dead")
+    await transport.send_message(a, _set_name("r", t.id, "x"))
+    assert "dead" not in session.clients
+    assert "dead" not in session._client_undo
+
+
+@pytest.mark.asyncio
+async def test_unbind_cancels_scheduled_flushes():
+    session, transport, a, b, t, v = await setup_scene_session()
+    with session.doc.transaction():
+        session.doc.get_node_by_id(t.id).name = "host"
+    assert session._flush_tasks
+    await session.unbind()
+    assert not session._flush_tasks
+    assert session._pending_broadcasts == []

@@ -345,3 +345,84 @@ def test_nested_handles_are_visible():
     assert set(handles) == {"voxels", "extra"}
     # A composite field is not itself a handle field, even if it holds one.
     assert "material" not in handles
+
+
+# --- fourth review: document core ---
+
+
+def test_child_index_cursor_is_invalidated_by_structural_changes():
+    doc = make_doc()
+    v = doc.root.items
+    assert v[2].count == 2
+    doc.root.items.prepend(doc.create_node(Item, count=99))
+    assert v[2].count == 1
+    doc.root.items[0].delete()
+    assert v[2].count == 2
+    v[1].move(v[0], position="before")
+    assert [n.count for n in v] == [1, 0, 2]
+    assert v[2].count == 2
+    v.insert(1, doc.create_node(Item, count=7))
+    assert [n.count for n in v] == [1, 7, 0, 2]
+    doc.undo_manager.undo()
+    assert [n.count for n in v] == [1, 0, 2]
+    assert v[1].count == 0
+
+
+def test_default_copies_do_not_share_nested_models():
+    class Frozen(BaseModel, frozen=True):
+        rgb: list[float] = [0.0, 0.0, 0.0]
+
+    @node
+    class Painted:
+        colors: list[Frozen] = [Frozen()]
+        by_name: dict[str, Frozen] = {"main": Frozen()}
+
+    @node
+    class PRoot:
+        painted: Array[Painted] = []
+
+    doc = Doc(PRoot)
+    a = doc.create_node(Painted)
+    b = doc.create_node(Painted)
+    doc.root.painted.append(a)
+    doc.root.painted.append(b)
+    a.colors[0].rgb.append(9.0)
+    a.by_name["main"].rgb.append(9.0)
+    assert b.colors[0].rgb == [0.0, 0.0, 0.0]
+    assert b.by_name["main"].rgb == [0.0, 0.0, 0.0]
+    assert Painted._field_defaults["colors"][0].rgb == [0.0, 0.0, 0.0]
+
+
+def test_journal_continues_past_a_listener_failure():
+    doc = make_doc()
+    ids = [n.id for n in doc.root.items]
+    calls = []
+
+    def listener(e):
+        calls.append(e)
+        if len(calls) == 1:
+            raise RuntimeError("first only")
+
+    doc.on_change(listener)
+    journal = [([], {ids[i]: {"count": 100 * (i + 1)}}) for i in range(3)]
+    with pytest.raises(ListenerError) as info:
+        doc.apply_operations(journal)
+    assert [n.count for n in doc.root.items] == [100, 200, 300]
+    assert len(calls) == 3
+    assert len(info.value.errors) == 1
+
+
+def test_base_exception_in_listener_does_not_wedge_the_document():
+    doc = make_doc()
+
+    def interrupt(e):
+        raise KeyboardInterrupt
+
+    unsubscribe = doc.on_change(interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        doc.root.items[0].count = 5
+    unsubscribe()
+    assert doc._lifecycle_stage == "idle"
+    assert doc.root.items[0].count == 5
+    doc.root.items[0].count = 6  # usable again
+    assert doc.root.items[0].count == 6

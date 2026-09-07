@@ -21,7 +21,7 @@ from ._protocol import (
     operations_to_wire,
 )
 from ._transport import ClientConnection, Transport
-from ._types import ChangeEvent, ListenerError
+from ._types import ChangeEvent, ListenerError, Operations
 from ._undo import UndoManager
 
 logger = logging.getLogger(__name__)
@@ -83,11 +83,14 @@ class Session:
       client does locally, so thin and thick clients agree.
     - ``"global"``: any client reverts the document's last commit,
       whoever made it — right for one user looking at the document
-      through several views, wrong for several users.
+      through several views, wrong for several users. When the document's
+      own undo manager is enabled it is the one used, so host and clients
+      share a single history; otherwise the session makes one.
     - ``"none"``: the requests are refused (error code ``unsupported``).
 
     Passing ``undo_manager`` selects the global policy with that manager.
-    The host's own ``doc.undo_manager`` is unaffected by any of this.
+    Under ``"per-client"`` and ``"none"`` the host's own
+    ``doc.undo_manager`` is untouched.
     """
 
     def __init__(
@@ -200,6 +203,10 @@ class Session:
         self._connecting.clear()
         for client_id in list(self._client_undo):
             self._drop_client_undo(client_id)
+        for task in list(self._flush_tasks):
+            task.cancel()
+        self._flush_tasks.clear()
+        self._pending_broadcasts.clear()
 
     # --- Doc change listener (synchronous) ---
 
@@ -270,11 +277,14 @@ class Session:
             self._connecting.pop(client.client_id, None)
             self._drop_client_undo(client.client_id)
             raise
-        if self._connecting.pop(client.client_id, None) is None:
-            return  # disconnected during the handshake
-        self._clients[client.client_id] = client
-        for message in buffer:
-            await self._safe_send(client, message)
+        # Promote and drain under the flush lock: a concurrent flush must
+        # not slip a newer patch between two buffered ones.
+        async with self._flush_lock:
+            if self._connecting.pop(client.client_id, None) is None:
+                return  # disconnected during the handshake
+            self._clients[client.client_id] = client
+            for message in buffer:
+                await self._safe_send(client, message)
 
     def _snapshot_message(
         self, client: ClientConnection, *, with_client_id: bool = False
@@ -308,7 +318,14 @@ class Session:
         msg_type = msg.get("type")
         ref = msg.get("ref")
 
-        self._request = _Request(client.client_id, ref)
+        # The request context lives only for the synchronous dispatch:
+        # every commit made while it is set is attributed to this request.
+        # It is cleared before any await, so a host-side commit landing
+        # while a reply is in flight is never mislabeled.
+        request = _Request(client.client_id, ref)
+        self._request = request
+        error: dict[str, Any] | None = None
+        rejected: _Rejected | None = None
         try:
             if msg_type == MSG_OP:
                 self._apply_op(client, msg)
@@ -319,14 +336,26 @@ class Session:
             elif msg_type == MSG_REDO:
                 self._handle_redo(client, msg)
             else:
-                await client.send({
-                    "type": MSG_ERROR,
-                    "ref": ref,
-                    "code": "unknown_type",
-                    "message": f"Unknown message type: {msg_type}",
-                })
-                return
-        except _Rejected as rejected:
+                error = {"code": "unknown_type", "message": f"Unknown message type: {msg_type}"}
+        except _Rejected as exc:
+            rejected = exc
+        except ListenerError:
+            # The request was applied and committed; a host-side change
+            # listener failed afterwards. That is the host's bug, not the
+            # client's: log it and deliver the patch like any other.
+            logger.exception(
+                "Change listener failed after applying %s from %s",
+                msg_type, client.client_id,
+            )
+        except _Unsupported as unsupported:
+            error = {"code": "unsupported", "message": str(unsupported)}
+        except Exception as exc:
+            logger.exception("Error handling message from %s", client.client_id)
+            error = {"code": "invalid_op", "message": str(exc)}
+        finally:
+            self._request = None
+
+        if rejected is not None:
             # A valid message that is invalid against the current document
             # (referential integrity, validation, a node that is gone). The
             # document rolled it back and nothing was broadcast. A thick
@@ -347,33 +376,9 @@ class Session:
             if rejected.resync:
                 await self._send_snapshot(client)
             return
-        except ListenerError:
-            # The request was applied and committed; a host-side change
-            # listener failed afterwards. That is the host's bug, not the
-            # client's: log it and deliver the patch like any other.
-            logger.exception(
-                "Change listener failed after applying %s from %s",
-                msg_type, client.client_id,
-            )
-        except _Unsupported as unsupported:
-            await client.send({
-                "type": MSG_ERROR,
-                "ref": ref,
-                "code": "unsupported",
-                "message": str(unsupported),
-            })
+        if error is not None:
+            await client.send({"type": MSG_ERROR, "ref": ref, **error})
             return
-        except Exception as exc:
-            logger.exception("Error handling message from %s", client.client_id)
-            await client.send({
-                "type": MSG_ERROR,
-                "ref": ref,
-                "code": "invalid_op",
-                "message": str(exc),
-            })
-            return
-        finally:
-            self._request = None
 
         # Broadcast the patch to ALL clients (including the source).
         # Thin clients need the echo to update their store.
@@ -398,8 +403,10 @@ class Session:
         ops = operations_from_wire(raw)
         # Compare against the canonical form so a minimal or reordered
         # frame still matches its own echo.
-        assert self._request is not None
-        self._request.ops = _normalize(operations_to_wire(ops))
+        request = self._request
+        assert request is not None
+        request.ops = _normalize(operations_to_wire(ops))
+        queued_before = len(self._pending_broadcasts)
         try:
             # Strict: a missing target is a failure, and any failure is
             # rolled back and raised here as a rejection. The server must
@@ -409,6 +416,76 @@ class Session:
             raise  # applied and committed; an observer failed afterwards
         except Exception as exc:
             raise _Rejected(exc) from exc
+        committed = len(self._pending_broadcasts) > queued_before
+        moved = any(op[0] == 2 for op in ops[0])
+        if not committed or moved:
+            # The requester applied this optimistically in its own frame,
+            # and that frame may not match the server's for the slots it
+            # touched: a remote move anchored at a node it had a pending
+            # move for was vacuous locally and real here, or the request
+            # changed nothing here (a move to where the node already is,
+            # a write of the value already held) and so produced no echo
+            # at all. Either way, answer it alone with a patch at the
+            # current version giving the server's order of every slot it
+            # moved into and the values it holds. Queued like any
+            # broadcast, it is delivered in order: after this request's
+            # own echo, before any later commit.
+            self._pending_broadcasts.append((
+                {
+                    "type": MSG_PATCH,
+                    "version": self._version,
+                    "operations": self._positions_of(ops, moves_only=committed),
+                    "source_client": None,
+                    "ref": request.ref,
+                },
+                [client.client_id],
+            ))
+
+    def _positions_of(self, ops: Operations, *, moves_only: bool = False) -> dict[str, Any]:
+        """The server's current state for what ``ops`` touch.
+
+        For every slot a move (or, unless ``moves_only``, an insert) of
+        ``ops`` landed in, the full order of that slot as a chain of
+        moves: append the first node, then each node after its
+        predecessor. Applying the chain is a no-op for every node already
+        in place and a correction for the rest; a replica that matches
+        the server is left untouched. With ``moves_only`` the state part
+        is empty (the echo already carried it); otherwise state entries
+        carry the values as stored.
+        """
+        doc = self._doc
+        ordered: list[Any] = []
+        slots_done: set[tuple[str, str]] = set()
+        for op in ops[0]:
+            if op[0] == 0 and not moves_only:
+                start_id = op[1][0][0]
+            elif op[0] == 2:
+                start_id = op[1]
+            else:
+                continue
+            start = doc.get_node_by_id(str(start_id))
+            if start is None or start._parent is None or start._slot_name is None:
+                continue
+            parent, slot = start._parent, start._slot_name
+            if (parent.id, slot) in slots_done:
+                continue
+            slots_done.add((parent.id, slot))
+            parent_ref: str | int = 0 if parent is doc.root else parent.id
+            prev_id: str | int = 0
+            for node in getattr(parent, slot):
+                ordered.append([2, node.id, 0, parent_ref, slot, prev_id, 0])
+                prev_id = node.id
+        state: dict[str, dict[str, Any]] = {}
+        for node_id, patch in ([] if moves_only else ops[1].items()):
+            node = doc.get_node_by_id(node_id)
+            if node is None:
+                continue
+            state[node_id] = {
+                key: node._state_key_to_json(key)
+                for key in patch
+                if key in node._field_adapters
+            }
+        return {"ordered": ordered, "state": state}
 
     def _handle_create(self, client: ClientConnection, msg: dict[str, Any]) -> None:
         node_type = msg["node_type"]
@@ -465,18 +542,23 @@ class Session:
         if not isinstance(steps, int) or steps < 1:
             raise ValueError("'steps' must be a positive integer")
         step = manager.undo if direction == "undo" else manager.redo
+        listener_errors: list[BaseException] = []
         for _ in range(steps):
             if not (manager.can_undo if direction == "undo" else manager.can_redo):
                 break
             try:
                 step()
-            except ListenerError:
-                raise
+            except ListenerError as exc:
+                # The step applied; only a host listener failed. Keep
+                # stepping and report afterwards.
+                listener_errors.extend(exc.errors)
             except Exception as exc:
                 # The step no longer applies (someone else edited what it
                 # would revert). It is kept for a retry; nothing was
                 # applied optimistically, so no resync.
                 raise _Rejected(exc, resync=False) from exc
+        if listener_errors:
+            raise ListenerError(listener_errors)
 
     # --- Broadcasting ---
 
@@ -488,8 +570,11 @@ class Session:
         """
         async with self._flush_lock:
             while self._pending_broadcasts:
-                broadcast, recipients = self._pending_broadcasts.pop(0)
+                broadcast, recipients = self._pending_broadcasts[0]
                 await self._broadcast(broadcast, exclude=exclude, only=recipients)
+                # Popped only once sent: a cancellation mid-send leaves it
+                # queued rather than opening a version gap.
+                self._pending_broadcasts.pop(0)
 
     async def _broadcast(
         self,
@@ -522,3 +607,4 @@ class Session:
                 "Removing dead client %s", client.client_id
             )
             self._clients.pop(client.client_id, None)
+            self._drop_client_undo(client.client_id)
