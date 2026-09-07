@@ -43,9 +43,19 @@ QUADRATIC_BOUND = 10.0
 
 
 def ratio(fn: Callable[[int], float]) -> float:
-    fn(N)  # warm up
-    small = min(fn(N) for _ in range(3))
-    large = min(fn(4 * N) for _ in range(3))
+    """Time ratio between 4n and n, best of five.
+
+    If the small run is under a millisecond the timer and fixed per-call
+    overhead (an event loop start, say) dominate, so n is raised once; a
+    quadratic path stays far above the bound either way.
+    """
+    n = N
+    fn(n)  # warm up
+    small = min(fn(n) for _ in range(3))
+    if small < 1e-3:
+        n *= 4
+        small = min(fn(n) for _ in range(3))
+    large = min(fn(4 * n) for _ in range(3))
     return large / max(small, 1e-6)
 
 
