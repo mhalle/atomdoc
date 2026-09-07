@@ -1338,7 +1338,7 @@ class Doc:
             # Discover frozen value types from the field annotations
             # (including members of unions and Optional).
             for fname, ann in node_cls._field_annotations.items():
-                for vtype in frozen_models_in(ann):
+                for vtype in frozen_models_in(ann, deep=True):
                     seen_type = value_type_classes.get(vtype.__name__)
                     if seen_type is vtype:
                         continue

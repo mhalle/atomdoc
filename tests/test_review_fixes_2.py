@@ -311,4 +311,7 @@ def test_nested_handles_are_visible():
     assert uris == ["file://direct", "file://listed", "file://nested"]
     schema = doc.atomdoc_schema()
     assert set(schema["value_types"]) >= {"Material", "Voxels", "Thumb"}
-    assert "voxels" in schema["node_types"]["Vol"]["handles"]
+    handles = schema["node_types"]["Vol"]["handles"]
+    assert set(handles) == {"voxels", "extra"}
+    # A composite field is not itself a handle field, even if it holds one.
+    assert "material" not in handles

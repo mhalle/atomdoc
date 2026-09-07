@@ -58,9 +58,13 @@ def classify_field(annotation: Any) -> Tier:
     return "mergeable"
 
 
-def frozen_models_in(annotation: Any) -> list[type[BaseModel]]:
+def frozen_models_in(annotation: Any, *, deep: bool = False) -> list[type[BaseModel]]:
     """Frozen model classes mentioned by an annotation (unions, Optional,
-    Annotated, list/dict item types), in declaration order."""
+    Annotated, list/dict item types), in declaration order.
+
+    With ``deep`` the fields of each frozen model are walked too, so a
+    value type nested in a composite (a handle inside a material) is
+    included."""
     found: list[type[BaseModel]] = []
 
     def walk(ann: Any) -> None:
@@ -68,10 +72,9 @@ def frozen_models_in(annotation: Any) -> list[type[BaseModel]]:
             if ann in found:
                 return
             found.append(ann)
-            # A composite value may hold further value types (a handle
-            # inside a material, say); they are part of the contract too.
-            for info in ann.model_fields.values():
-                walk(info.annotation)
+            if deep:
+                for info in ann.model_fields.values():
+                    walk(info.annotation)
             return
         origin = get_origin(ann)
         if origin is Annotated:
