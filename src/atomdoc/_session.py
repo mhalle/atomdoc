@@ -26,6 +26,14 @@ from ._undo import UndoManager
 logger = logging.getLogger(__name__)
 
 
+class _Rejected(Exception):
+    """A well-formed request the document refused to apply."""
+
+    def __init__(self, cause: BaseException) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+
+
 class Session:
     """Manages a Doc and its connected clients.
 
@@ -113,13 +121,20 @@ class Session:
         await client.send({"type": MSG_SCHEMA, "schema": self._cached_schema})
 
         # Send snapshot (includes client_id so the client can identify self-echoes)
-        await client.send({
+        await self._send_snapshot(client, with_client_id=True)
+
+    async def _send_snapshot(
+        self, client: ClientConnection, *, with_client_id: bool = False
+    ) -> None:
+        message: dict[str, Any] = {
             "type": MSG_SNAPSHOT,
             "doc_id": self._doc.id,
             "version": self._version,
             "data": self._doc.dump(),
-            "client_id": client.client_id,
-        })
+        }
+        if with_client_id:
+            message["client_id"] = client.client_id
+        await client.send(message)
 
     async def _handle_message(
         self, client: ClientConnection, msg: dict[str, Any]
@@ -144,6 +159,23 @@ class Session:
                     "message": f"Unknown message type: {msg_type}",
                 })
                 return
+        except _Rejected as rejected:
+            # A valid message that is invalid against the current document
+            # (referential integrity, validation, a node that is gone). The
+            # document rolled it back and nothing was broadcast. A thick
+            # client applied it optimistically, so send it the truth: a
+            # fresh snapshot replaces its local document.
+            logger.info(
+                "Rejected %s from %s: %s", msg_type, client.client_id, rejected
+            )
+            await client.send({
+                "type": MSG_ERROR,
+                "ref": ref,
+                "code": "rejected",
+                "message": str(rejected),
+            })
+            await self._send_snapshot(client)
+            return
         except Exception as exc:
             logger.exception("Error handling message from %s", client.client_id)
             await client.send({
@@ -168,7 +200,13 @@ class Session:
         ops = operations_from_wire(msg["operations"])
         self._current_client_id = client.client_id
         try:
-            self._doc.apply_operations(ops)
+            # apply_operations swallows failures inside the transaction and
+            # rolls back; run it in an explicit transaction so the failure
+            # surfaces here as a rejection.
+            with self._doc.transaction():
+                self._doc.apply_operations(ops)
+        except Exception as exc:
+            raise _Rejected(exc) from exc
         finally:
             self._current_client_id = None
 
@@ -203,6 +241,8 @@ class Session:
                 self._doc._insert_into_slot(
                     parent, slot, position, [new_node], target=target
                 )
+        except Exception as exc:
+            raise _Rejected(exc) from exc
         finally:
             self._current_client_id = None
 

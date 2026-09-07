@@ -57,6 +57,24 @@ nodes. The operations wire format is unchanged; the schema export gains a
   restore in strict mode and warns otherwise.
 - **Schema export:** field tier `"ref"` and a per-node-type `refs` block
   (`target_type`, `many`, `policy`).
+- **Handles.** `Handle` (frozen: `uri`, `media_type`, `digest`) with a
+  class-level `strength` of `"weak"` (default) or `"strong"`.
+  `doc.handles(strength=...)` lists what the document depends on without
+  resolving anything. Exported per field (`handles`) and per value type.
+- **Tagged unions of values.** A union of frozen models is now tier
+  `atomic` (it was `mergeable`), its members are discovered as value
+  types, and it exports as an inlined `anyOf`/`oneOf` with any Pydantic
+  discriminator. `JsonValue` is re-exported for open-ended values.
+- **Composition.** `dump(node)` serializes a subtree; `doc.adopt(fragment,
+  parent, slot, position, target)` inserts it keeping its IDs and internal
+  references, re-minting only IDs that collide with the receiving document.
+- **Rejected requests resync the sender.** When a well-formed `op` or
+  `create` fails against the current document, the session replies with
+  `error` code `rejected` and then a fresh `snapshot` for that client only,
+  instead of `invalid_op` and silence. Malformed requests still get
+  `invalid_op`.
+- Exported JSON schemas are self-contained: local `$defs` are inlined
+  (a recursive definition becomes `{}`).
 - `mint_session_id(created_at_ms, existing)`, `session_prefix(node_id)`,
   and `node_id_factory(..., existing_sessions=...)` in `atomdoc._id`.
 - **Doc-owned undo manager.** Every `Doc` has `doc.undo_manager`, configured

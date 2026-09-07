@@ -197,9 +197,101 @@ rebuilds it. A dump whose references do not resolve fails to restore in
 strict mode and warns otherwise, leaving the field reading as `None`.
 
 References never cross documents. To point at something outside the
-document — another document's node, a file, an ontology term — store a
-plain frozen value (a URI, a digest) and resolve it yourself. Choosing
-`Ref` over such a handle asserts that the two nodes ship together.
+document — another document's node, a file, an ontology term — use a
+[handle](#handles). Choosing `Ref` over a handle asserts that the two
+nodes ship together.
+
+### Handles
+
+A `Handle` is a frozen value naming something outside the document. It
+is an ordinary atomic field, so undo and sync move only the handle, never
+the data behind it. Each handle type declares its **strength**: whether
+the document is usable without resolving it.
+
+```python
+from atomdoc import Handle
+
+class VoxelData(Handle):          # the document is useless without it
+    strength = "strong"
+
+class Terminology(Handle):        # nice to have; weak is the default
+    pass
+
+@node
+class Volume:
+    data: VoxelData | None = None
+    term: Terminology | None = None
+
+with doc.transaction():
+    vol.data = VoxelData(uri="s3://bucket/vol.nii.gz", digest="sha256:...")
+
+doc.handles(strength="strong")    # [(vol, "data", VoxelData(...))]: the hard
+                                  # dependency list, without resolving anything
+```
+
+`Handle` has `uri`, and optional `media_type` and `digest`; subclasses may
+add fields. Strength is exported per field (`handles` in the schema), so a
+service can answer "can I open this?" from the schema and a dump alone.
+
+### Heterogeneous values
+
+Two tools cover values whose type varies:
+
+- **A closed set:** a union of frozen models. It is one atomic value on
+  the wire, and with a Pydantic discriminator it exports as a tagged
+  `oneOf`.
+
+  ```python
+  class Scalar(BaseModel, frozen=True):
+      kind: Literal["scalar"] = "scalar"
+      v: float = 0.0
+
+  class Vec3(BaseModel, frozen=True):
+      kind: Literal["vec3"] = "vec3"
+      v: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+  @node
+  class Override:
+      target: Ref[Volume] | None = None
+      field: str = ""
+      value: Annotated[Scalar | Vec3, Field(discriminator="kind")] = Scalar()
+  ```
+
+- **An open set:** `JsonValue` (re-exported from Pydantic). Any JSON value,
+  stored natively, mergeable, exported as an unconstrained property. The
+  schema cannot say more, so validate it yourself where the rule lives —
+  for a `(target, field, value)` override, a normalizer that looks up the
+  target's field adapter and validates `value` against it.
+
+### Composition
+
+A document is the smallest unit whose references all resolve, and so the
+smallest unit that ships. Documents compose by **adoption**: a subtree
+dumped from one document is inserted into another, keeping its IDs.
+
+```python
+fragment = scene_doc.dump(scene_doc.root)           # or any node
+with library.transaction():
+    [scene] = library.adopt(fragment, library.root, "scenes")
+```
+
+Nothing inside the fragment is rewritten — references between its nodes
+stay intact and outside citations of its node IDs remain valid. The only
+exception is an ID that already exists in the receiving document, which
+is re-minted (and references to it inside the fragment follow). A
+reference from the fragment to a node it does not contain must resolve
+in the receiving document; the commit-time check enforces that. Adoption
+emits ordinary insert operations, so connected clients reproduce it.
+
+Decomposition is not symmetric: pulling a member back out means deciding,
+per reference that crosses the boundary, whether it becomes a handle.
+Reparenting alone keeps members extractable; promoting handles to
+references afterwards is what welds them together.
+
+When two adopted fragments each carry a node for the same external thing
+(the same terminology code, the same coordinate frame), both nodes stay.
+Sameness is then a handle comparison, not a reference comparison — which
+is why such nodes should hold a handle in the first place.
 
 ### Multiple child arrays
 
@@ -409,7 +501,7 @@ Messages from server to client:
 | `schema` | JSON Schema with `x-atomdoc` extensions (sent on connect) |
 | `snapshot` | Full document state (sent on connect) |
 | `patch` | Incremental operations (broadcast after each change) |
-| `error` | Error response |
+| `error` | Error response. `code` is `unknown_type` or `invalid_op` for a malformed request, or `rejected` when a well-formed request is invalid against the current document (a dangling reference, a validation failure, a node that is gone). A rejected request is rolled back and not broadcast; the sender then receives a fresh `snapshot` to replace its local copy. |
 
 Messages from client to server:
 
@@ -568,6 +660,7 @@ The tier is inferred automatically from the type annotation:
 | **Mergeable** | `str`, `int`, `float`, `bool` | One operation per field. Concurrent edits to different fields merge. |
 | **Atomic** | `frozen=True` Pydantic model | Replaced as a unit. Last-write-wins on conflict. |
 | **Opaque** | `bytes` | Stored as base64, not diffed or merged. |
+| **Atomic** | union of `frozen=True` models | A tagged union of values. Still one value, replaced as a unit. |
 | **Ref** | `Ref[T]`, `list[Ref[T]]` | A node ID. Replaced as a unit; referential integrity checked at commit. |
 
 `Array[T]` is not a field tier: it is a child slot, taken out of the state
@@ -576,8 +669,8 @@ move operations.
 
 Bulk data (a large image, a mesh, an external store) should not go in a
 `bytes` field: the opaque tier is copied into every snapshot and patch
-that touches it. Store a frozen handle (`uri`, `digest`, `media_type`)
-instead, so undo and sync move only the handle.
+that touches it. Store a [`Handle`](#handles) instead, so undo and sync
+move only the handle.
 
 ## Extensions
 

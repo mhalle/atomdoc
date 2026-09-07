@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 
 from pydantic import BaseModel
-from atomdoc import Array, Doc, node
+from atomdoc import Array, Doc, Ref, node
 from atomdoc._protocol import MSG_CREATE, MSG_ERROR, MSG_OP, MSG_PATCH, MSG_SCHEMA, MSG_SNAPSHOT, MSG_UNDO, MSG_REDO, operations_to_wire
 from atomdoc._session import Session
 from atomdoc._transport import ClientConnection, Transport
@@ -331,3 +331,108 @@ async def test_broadcast_includes_source(session, transport):
     # Source client's patch has source_client set
     patch = next(m for m in client1.messages if m["type"] == MSG_PATCH)
     assert patch["source_client"] == client1.client_id
+
+
+# --- Rejection and resync ---
+
+
+@node
+class Transform:
+    name: str = ""
+
+
+@node
+class Volume:
+    transform: Ref[Transform] | None = None
+
+
+@node
+class Scene:
+    transforms: Array[Transform] = []
+    volumes: Array[Volume] = []
+
+
+async def setup_scene_session():
+    doc = Doc(root_type=Scene)
+    with doc.transaction():
+        t = doc.create_node(Transform, name="t")
+        doc.root.transforms.append(t)
+        v = doc.create_node(Volume, transform=t)
+        doc.root.volumes.append(v)
+    session = Session(doc)
+    transport = MockTransport()
+    await session.bind(transport)
+    a = MockClient("a")
+    b = MockClient("b")
+    await transport.connect_client(a)
+    await transport.connect_client(b)
+    a.messages.clear()
+    b.messages.clear()
+    return session, transport, a, b, t, v
+
+
+@pytest.mark.asyncio
+async def test_rejected_op_gets_error_then_snapshot():
+    session, transport, a, b, t, v = await setup_scene_session()
+    version_before = session.version
+
+    # Delete a transform that a volume still references.
+    await transport.send_message(a, {
+        "type": MSG_OP,
+        "ref": "op-1",
+        "operations": {"ordered": [[1, t.id, 0]], "state": {}},
+    })
+
+    assert [m["type"] for m in a.messages] == [MSG_ERROR, MSG_SNAPSHOT]
+    err, snap = a.messages
+    assert err["code"] == "rejected"
+    assert err["ref"] == "op-1"
+    assert "still referenced" in err["message"]
+    assert snap["version"] == version_before
+    assert snap["data"] == session.doc.dump()
+    assert "client_id" not in snap
+    # Nothing was applied or broadcast.
+    assert session.doc.get_node_by_id(t.id) is not None
+    assert session.version == version_before
+    assert b.messages == []
+
+
+@pytest.mark.asyncio
+async def test_rejected_create_with_dangling_reference():
+    session, transport, a, b, t, v = await setup_scene_session()
+    await transport.send_message(a, {
+        "type": MSG_CREATE,
+        "ref": "c-1",
+        "node_type": "Volume",
+        "state": {"transform": "ghost"},
+        "slot": "volumes",
+    })
+    assert [m["type"] for m in a.messages] == [MSG_ERROR, MSG_SNAPSHOT]
+    assert a.messages[0]["code"] == "rejected"
+    assert len(session.doc.root.volumes) == 1
+    assert b.messages == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_request_is_invalid_op_without_snapshot():
+    session, transport, a, b, t, v = await setup_scene_session()
+    await transport.send_message(a, {"type": MSG_OP, "ref": "x"})  # no operations
+    assert [m["type"] for m in a.messages] == [MSG_ERROR]
+    assert a.messages[0]["code"] == "invalid_op"
+
+
+@pytest.mark.asyncio
+async def test_valid_op_after_rejection_still_broadcasts():
+    session, transport, a, b, t, v = await setup_scene_session()
+    await transport.send_message(a, {
+        "type": MSG_OP, "ref": "bad",
+        "operations": {"ordered": [[1, t.id, 0]], "state": {}},
+    })
+    a.messages.clear()
+    await transport.send_message(a, {
+        "type": MSG_OP, "ref": "good",
+        "operations": {"ordered": [], "state": {v.id: {"transform": None}}},
+    })
+    assert [m["type"] for m in a.messages] == [MSG_PATCH]
+    assert [m["type"] for m in b.messages] == [MSG_PATCH]
+    assert session.doc.get_node_by_id(v.id).transform is None

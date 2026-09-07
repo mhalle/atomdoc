@@ -17,8 +17,10 @@ from ._id import (
     node_id_factory,
     session_prefix,
 )
+from ._handle import Handle, is_handle_type
 from ._node import AtomNode, _MISSING
 from ._ref import RefIntegrityError, ref_ids
+from ._tier import frozen_models_in
 from ._types import (
     ChangeEvent,
     Diff,
@@ -679,6 +681,25 @@ class Doc:
                 result.append(referrer)
         return result
 
+    # --- Handles ---
+
+    def handles(
+        self, *, strength: str | None = None
+    ) -> list[tuple[AtomNode, str, Handle]]:
+        """Every handle held by the document as ``(node, field, handle)``.
+
+        With ``strength="strong"`` this is the document's hard dependency
+        list: what must resolve for the document to be usable. Nothing is
+        resolved or fetched; the handles are read off the tree.
+        """
+        result: list[tuple[AtomNode, str, Handle]] = []
+        for node in self._node_map.values():
+            for name, value in node._state.items():
+                if isinstance(value, Handle):
+                    if strength is None or value.strength == strength:
+                        result.append((node, name, value))
+        return result
+
     def _refs_add(self, node: AtomNode) -> None:
         for name in type(node)._ref_defs:
             for target_id in ref_ids(node, name):
@@ -894,15 +915,99 @@ class Doc:
 
     # --- Wire format (dump/restore, has IDs) ---
 
-    def dump(self, *, include_defaults: bool = False) -> JsonDoc:
+    def dump(
+        self, node: AtomNode | None = None, *, include_defaults: bool = False
+    ) -> JsonDoc:
         """Serialize to wire format (with IDs) for persistence and sync.
 
-        If ``include_defaults`` is True, fields with default values are
-        included in the output.
+        With ``node``, serialize that subtree only — a fragment another
+        document can take in with ``adopt()``. If ``include_defaults`` is
+        True, fields with default values are included in the output.
         """
         if self._lifecycle_stage not in ("idle", "change"):
             raise RuntimeError("Cannot serialize during an active transaction")
-        return _node_to_wire(self._root, include_defaults=include_defaults)
+        target = node if node is not None else self._root
+        return _node_to_wire(target, include_defaults=include_defaults)
+
+    # --- Composition ---
+
+    def adopt(
+        self,
+        fragment: JsonDoc | list[JsonDoc],
+        parent: AtomNode,
+        slot_name: str,
+        position: str = "append",
+        target: AtomNode | None = None,
+    ) -> list[AtomNode]:
+        """Take in a subtree dumped from another document.
+
+        ``fragment`` is one node entry from ``dump(node)`` or a list of
+        them. The nodes keep their IDs, so references *within* the fragment
+        stay intact and citations of the fragment's nodes made elsewhere
+        remain valid. Only an ID that already exists in this document is
+        re-minted, and references inside the fragment to it are rewritten.
+        That is the whole cost of composition: no other state changes.
+
+        References from the fragment to nodes outside it must resolve in
+        this document once inserted; the commit-time integrity check
+        enforces that. Returns the top-level adopted nodes, in order.
+        """
+        entries: list[JsonDoc]
+        if fragment and isinstance(fragment[0], list):
+            entries = list(fragment)  # type: ignore[arg-type]
+        else:
+            entries = [fragment]  # type: ignore[list-item]
+
+        incoming: list[str] = []
+
+        def collect(entry: JsonDoc) -> None:
+            incoming.append(entry[0])
+            if len(entry) > 3 and entry[3]:
+                for children in entry[3].values():
+                    for child in children:
+                        collect(child)
+
+        for entry in entries:
+            collect(entry)
+
+        remap: dict[str, str] = {}
+        for node_id in incoming:
+            if node_id in self._node_map and node_id not in remap:
+                remap[node_id] = self._id_gen()
+
+        nodes = [self._build_fragment_node(entry, remap) for entry in entries]
+        self._insert_into_slot(parent, slot_name, position, nodes, target=target)
+        return nodes
+
+    def _build_fragment_node(self, entry: JsonDoc, remap: dict[str, str]) -> AtomNode:
+        """Detached node tree from a wire entry, applying an ID remap."""
+        node_id = remap.get(entry[0], entry[0])
+        state = entry[2] if len(entry) > 2 else {}
+        node = self._create_node_from_json([node_id, entry[1], state])
+        if remap:
+            for name in type(node)._ref_defs:
+                value = node._state.get(name)
+                if isinstance(value, str):
+                    node._state[name] = remap.get(value, value)
+                elif isinstance(value, list):
+                    node._state[name] = [remap.get(v, v) for v in value]
+        if len(entry) > 3 and entry[3]:
+            for slot_name, children in entry[3].items():
+                if slot_name not in node._slot_first:
+                    continue
+                prev: AtomNode | None = None
+                for child_entry in children:
+                    child = self._build_fragment_node(child_entry, remap)
+                    child._parent = node
+                    child._slot_name = slot_name
+                    child._prev_sibling = prev
+                    if prev is not None:
+                        prev._next_sibling = child
+                    else:
+                        node._slot_first[slot_name] = child
+                    prev = child
+                node._slot_last[slot_name] = prev
+        return node
 
     @classmethod
     def restore(
@@ -1004,8 +1109,6 @@ class Doc:
         Returns a schema document describing all node types and frozen
         value types, suitable for bootstrapping language-agnostic clients.
         """
-        from ._tier import _is_frozen_model
-
         node_types: dict[str, Any] = {}
         value_types: dict[str, Any] = {}
 
@@ -1025,6 +1128,7 @@ class Doc:
                         prop = adapter.json_schema()
                 except Exception:
                     prop = {}
+                prop = _inline_defs(prop)
                 fdefault = node_cls._field_defaults.get(fname, _MISSING)
                 if fdefault is not _MISSING and "default" not in prop:
                     try:
@@ -1046,6 +1150,18 @@ class Doc:
                 }
                 for fname, rdef in node_cls._ref_defs.items()
             }
+
+            # Handles: fields whose value type names something outside the
+            # document, with the declared strength.
+            handles: dict[str, Any] = {}
+            for fname, ann in node_cls._field_annotations.items():
+                handle_types = [m for m in frozen_models_in(ann) if is_handle_type(m)]
+                if handle_types:
+                    handles[fname] = {
+                        "value_type": handle_types[0].__name__,
+                        "strength": handle_types[0].strength,  # type: ignore[attr-defined]
+                    }
+            entry["handles"] = handles
 
             # Slots
             slots: dict[str, Any] = {}
@@ -1070,22 +1186,19 @@ class Doc:
 
             node_types[type_name] = entry
 
-            # Discover frozen value types from field tiers and adapters
-            for fname, tier in node_cls._field_tiers.items():
-                if tier == "atomic":
-                    # Get the actual type from the adapter's core schema
-                    adapter = node_cls._field_adapters.get(fname)
-                    if adapter is None:
+            # Discover frozen value types from the field annotations
+            # (including members of unions and Optional).
+            for fname, ann in node_cls._field_annotations.items():
+                for vtype in frozen_models_in(ann):
+                    if vtype.__name__ in value_types:
                         continue
-                    # Walk defaults to find the type
-                    default_val = node_cls._field_defaults.get(fname, _MISSING)
-                    if default_val is not _MISSING and isinstance(default_val, BaseModel):
-                        vtype = type(default_val)
-                        if _is_frozen_model(vtype) and vtype.__name__ not in value_types:
-                            value_types[vtype.__name__] = {
-                                "json_schema": vtype.model_json_schema(),
-                                "frozen": True,
-                            }
+                    ventry: dict[str, Any] = {
+                        "json_schema": _inline_defs(vtype.model_json_schema()),
+                        "frozen": True,
+                    }
+                    if is_handle_type(vtype):
+                        ventry["handle"] = {"strength": vtype.strength}  # type: ignore[attr-defined]
+                    value_types[vtype.__name__] = ventry
 
         return {
             "version": 1,
@@ -1098,6 +1211,35 @@ class Doc:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _inline_defs(schema: dict[str, Any]) -> dict[str, Any]:
+    """Resolve local ``$ref``s into the schema so it is self-contained.
+
+    Pydantic emits ``$defs`` for unions and nested models. Clients that
+    read the export field by field should not have to chase references;
+    a recursive definition (``JsonValue``) becomes ``{}`` (any value).
+    """
+    defs = schema.get("$defs")
+    if not defs:
+        return schema
+
+    def resolve(obj: Any, stack: tuple[str, ...]) -> Any:
+        if isinstance(obj, dict):
+            ref = obj.get("$ref")
+            if isinstance(ref, str) and ref.startswith("#/$defs/"):
+                name = ref[len("#/$defs/"):]
+                if name in stack or name not in defs:
+                    return {}
+                resolved = resolve(defs[name], stack + (name,))
+                extra = {k: v for k, v in obj.items() if k != "$ref"}
+                return {**resolved, **extra} if isinstance(resolved, dict) else resolved
+            return {k: resolve(v, stack) for k, v in obj.items() if k != "$defs"}
+        if isinstance(obj, list):
+            return [resolve(v, stack) for v in obj]
+        return obj
+
+    return resolve(schema, ())
 
 
 def _json_safe(value: Any) -> Any:

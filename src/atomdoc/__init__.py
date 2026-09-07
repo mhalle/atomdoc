@@ -1,7 +1,10 @@
 """AtomDoc — Local-first document models with semantic atomicity."""
 
 from ._array import Array
+from pydantic import JsonValue
+
 from ._doc import Doc, Extension, node
+from ._handle import Handle
 from ._id import NodeIdGenerator, default_node_id_generator
 from ._node import AtomNode
 from ._operations import merge_operations
@@ -17,6 +20,8 @@ __all__ = [
     "Doc",
     "AtomNode",
     "Extension",
+    "Handle",
+    "JsonValue",
     "UndoManager",
     "UndoManagerConfig",
     "UndoHistory",
