@@ -322,10 +322,15 @@ def test_restore_dangling_lenient_warns_and_reads_none():
 # --- Serialization / schema ---
 
 
-def test_to_json_emits_reference_ids():
+def test_to_json_emits_reference_paths():
+    """The ID-free export names a target by its document path, not its ID."""
     doc, t1, t2, v1, v2 = make_scene()
-    assert doc.to_json(v1) == {"transform": t2.id}
-    assert doc.to_json(v2) == {"sources": [v1.id]}
+    root = doc.to_json()
+    t_paths = [f"/transforms/{i}" for i in range(len(doc.root.transforms))]
+    v_paths = [f"/volumes/{i}" for i in range(len(doc.root.volumes))]
+    assert doc.to_json(v1) == {"transform": t_paths[list(doc.root.transforms).index(t2)]}
+    assert doc.to_json(v2) == {"sources": [v_paths[list(doc.root.volumes).index(v1)]]}
+    assert root["volumes"][list(doc.root.volumes).index(v1)]["transform"].startswith("/transforms/")
 
 
 def test_schema_export_describes_refs():
