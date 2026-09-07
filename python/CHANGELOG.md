@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **`to_json()` emits references as document paths** (`"/transforms/2"`,
+  `null` when unresolved) instead of raw node IDs, so the ID-free export
+  is usable on its own. `dump()` is unchanged.
+
+### Added
+
+- `ChildrenView.remove(*nodes)`: delete children by node. Its docstring,
+  and the error raised when appending a node already in the document,
+  point at `node.move(...)` for reparenting and reordering.
+
 ## [0.4.2] - 2026-09-07
 
 Fixes from a fourth adversarial review and an end-to-end integration

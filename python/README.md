@@ -128,11 +128,15 @@ with doc.transaction():
     doc.root.annotations.prepend(another)           # add to start
     doc.root.annotations.insert(2, mid)             # insert at index
     doc.root.annotations[0].delete()                # remove node
+    doc.root.annotations.remove(ann)                # same, by node
     doc.root.annotations.clear()                    # remove all
 ```
 
-Nodes can be moved within or across child arrays. Append or prepend to a
-slot on a new parent, or position next to a sibling:
+Removal is deletion: a node cannot be detached and kept. To put a node
+somewhere else, move it, which is one operation and does not trip
+reference integrity. Appending a node that is already in the document
+raises; nodes are moved within or across child arrays with `move`. Append
+or prepend to a slot on a new parent, or position next to a sibling:
 
 ```python
 with doc.transaction():
@@ -168,7 +172,9 @@ class Scene:
 ```
 
 Reading a reference resolves it to the node; assigning accepts a node or
-its ID. On the wire and in `dump()` the value is the target's node ID.
+its ID. On the wire and in `dump()` the value is the target's node ID; in
+`to_json()`, which carries no IDs, it is the target's document path
+(`"/transforms/2"`), or `null` if it does not resolve.
 
 ```python
 with doc.transaction():

@@ -110,6 +110,20 @@ class ChildrenView(Sequence["AtomNode"]):
         except IndexError:
             self.append(node)
 
+    def remove(self, *nodes: AtomNode) -> None:
+        """Delete the given children of this slot from the document.
+
+        Removal is deletion: a node cannot be detached and kept. To put a
+        node somewhere else, use ``node.move(...)``, which is one
+        operation and does not trip reference integrity.
+        """
+        for node in nodes:
+            if node._parent is not self._node or node._slot_name != self._slot_name:
+                raise ValueError(
+                    f"Node '{node.id}' is not in slot '{self._slot_name}'"
+                )
+            node.delete()
+
     def clear(self) -> None:
         """Delete all children in this slot."""
         first = self._node._slot_first.get(self._slot_name)

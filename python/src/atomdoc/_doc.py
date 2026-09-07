@@ -566,7 +566,8 @@ class Doc:
                         raise RuntimeError("Node is from a different document")
                     if desc.id in self._node_map or desc.id in seen:
                         raise RuntimeError(
-                            f"Node '{desc.id}' already exists in the document"
+                            f"Node '{desc.id}' already exists in the document; "
+                            "to reparent or reorder it use node.move(...)"
                         )
                     seen.add(desc.id)
 
@@ -1024,9 +1025,13 @@ class Doc:
     ) -> dict[str, Any]:
         """Return clean JSON for a node (default: root).
 
-        Node IDs are omitted; the tree is nested data. The one exception is
-        a ``Ref[T]`` field, whose value *is* a node ID and is emitted as
-        such. For a format that round-trips, use ``dump()``.
+        Node IDs are omitted; the tree is nested data. A ``Ref[T]`` field
+        is emitted as the target's *document path*, ``"/slot/index/..."``
+        from the root (``"/transforms/2"``), which names the node without
+        an identifier; a reference that does not resolve is ``null``.
+        Paths are always absolute, even when exporting a subtree, so a
+        reference out of the subtree still points somewhere. For a format
+        that round-trips, use ``dump()``.
 
         If ``include_defaults`` is True, fields with default values are
         included in the output.
@@ -1467,11 +1472,42 @@ def _node_to_wire(node: AtomNode, include_defaults: bool = False) -> JsonDoc:
     return root_entry
 
 
+def _document_paths(doc: Doc) -> dict[str, str]:
+    """Node ID -> ``"/slot/index/..."`` path from the root, for every node."""
+    paths: dict[str, str] = {doc.root.id: "/"}
+    stack: list[tuple[AtomNode, str]] = [(doc.root, "")]
+    while stack:
+        node, prefix = stack.pop()
+        for slot_name in node._slot_order:
+            child: AtomNode | None = node._slot_first.get(slot_name)
+            index = 0
+            while child is not None:
+                path = f"{prefix}/{slot_name}/{index}"
+                paths[child.id] = path
+                stack.append((child, path))
+                child = child._next_sibling
+                index += 1
+    return paths
+
+
 def _node_to_data(node: AtomNode, include_defaults: bool = False) -> dict[str, Any]:
-    """Serialize a node to clean JSON (no IDs, just data). Iterative."""
+    """Serialize a node to clean JSON (no IDs, just data). Iterative.
+
+    Reference fields are emitted as document paths (see ``Doc.to_json``).
+    """
+    doc = node._doc_ref
+    paths = _document_paths(doc) if doc is not None else {}
 
     def entry_for(n: AtomNode) -> dict[str, Any]:
         result: dict[str, Any] = n._state_to_json_plain(include_defaults=include_defaults)
+        for name in type(n)._ref_defs:
+            if name not in result:
+                continue
+            value = result[name]
+            if isinstance(value, list):
+                result[name] = [paths.get(v) for v in value]
+            else:
+                result[name] = paths.get(value) if value is not None else None
         for slot_name in n._slot_order:
             result[slot_name] = []
         return result
