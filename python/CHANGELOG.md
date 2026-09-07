@@ -2,7 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.4.5] - 2026-09-07
+
+Validators on derived node classes, union and bare `Array` slots. The
+schema export gains `allowed_types` per slot (additive; older clients
+ignore it).
 
 ### Fixed
 

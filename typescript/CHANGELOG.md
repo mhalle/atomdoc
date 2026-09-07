@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.4.5
+
+Released in step with atomdoc 0.4.5.
 
 ### Added
 

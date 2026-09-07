@@ -1,6 +1,6 @@
 {
   "name": "atomdoc-ts",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "AtomDoc document model for TypeScript",
   "type": "module",
   "main": "dist/index.js",
