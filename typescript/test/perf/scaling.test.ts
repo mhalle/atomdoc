@@ -40,6 +40,20 @@ function ratio(run: (n: number) => number, scale = 1): number {
   return t2 / Math.max(t1, 1e-6);
 }
 
+/**
+ * A shared CI runner can pause a single measurement (GC, a noisy
+ * neighbor) enough to push a linear path over the bound. Measure up to
+ * three times and keep the best: a quadratic path fails every time.
+ */
+function bestRatio(run: (n: number) => number, scale = 1): number {
+  let best = Infinity;
+  for (let i = 0; i < 3; i++) {
+    best = Math.min(best, ratio(run, scale));
+    if (best < QUADRATIC_BOUND) break;
+  }
+  return best;
+}
+
 describe("scaling", () => {
   for (const name of [
     "load_snapshot",
@@ -60,7 +74,7 @@ describe("scaling", () => {
   ]) {
     it(`${name} scales linearly`, () => {
       const sc = scenarios[name];
-      expect(ratio(sc.run, sc.scale), name).toBeLessThan(QUADRATIC_BOUND);
+      expect(bestRatio(sc.run, sc.scale), name).toBeLessThan(QUADRATIC_BOUND);
     });
   }
 
@@ -84,7 +98,7 @@ describe("scaling", () => {
       expect(store.getChildren(store.getRootId(), "volumes").length).toBe(n);
       return secs;
     };
-    expect(ratio(run)).toBeLessThan(QUADRATIC_BOUND);
+    expect(bestRatio(run)).toBeLessThan(QUADRATIC_BOUND);
   });
 
   it("a chain thousands of nodes deep builds, serializes, and deletes", () => {

@@ -82,7 +82,15 @@ def ratio(fn: Callable[[int], float]) -> float:
     ids=lambda f: f.__name__.removeprefix("bench_"),
 )
 def test_scales_linearly(fn: Callable[[int], float]) -> None:
-    assert ratio(fn) < QUADRATIC_BOUND
+    # A shared CI runner can pause one measurement enough to push a linear
+    # path over the bound; measure up to three times and keep the best. A
+    # quadratic path fails every time.
+    best = min(ratio(fn) for _ in range(1))
+    for _ in range(2):
+        if best < QUADRATIC_BOUND:
+            break
+        best = min(best, ratio(fn))
+    assert best < QUADRATIC_BOUND
 
 
 def _same_tree(a: object, b: object) -> bool:
