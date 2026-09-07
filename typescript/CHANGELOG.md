@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.6
+
+No changes; released in step with atomdoc 0.4.6.
+
 ## 0.4.5
 
 Released in step with atomdoc 0.4.5.

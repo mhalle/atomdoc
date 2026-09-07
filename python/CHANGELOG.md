@@ -2,7 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.4.6] - 2026-09-07
+
+`@node` keeps the source class's behavior. No wire or schema changes;
+atomdoc-ts 0.4.6 is the same code as 0.4.5, re-tagged to keep the
+versions in step.
 
 ### Fixed
 
