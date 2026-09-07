@@ -3,7 +3,7 @@
 import pytest
 from ulid import ULID
 
-from atomdoc import Doc, Array, node, Extension, UndoManager
+from atomdoc import ListenerError, Doc, Array, node, Extension, UndoManager
 
 
 @node
@@ -202,7 +202,7 @@ class TestTransactions:
 
         doc.on_change(bad_handler)
 
-        with pytest.raises(RuntimeError, match="change"):
+        with pytest.raises(ListenerError, match="change"):
             with doc.transaction():
                 doc.root.children.append(*text(doc, "trigger"))
 

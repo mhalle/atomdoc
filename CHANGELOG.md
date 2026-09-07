@@ -10,7 +10,6 @@ nodes. The operations wire format is unchanged; the schema export gains a
 `refs` block, the `"ref"` tier, and `Field(...)` constraints (see Added).
 
 ### Fixed
-
 - **`Field(...)` on a plain `@node` class was ignored.** The `FieldInfo`
   object leaked through as the field's default value, and its constraints
   (`ge`, `le`, ...) were never enforced. The default is now unwrapped and
@@ -58,104 +57,20 @@ nodes. The operations wire format is unchanged; the schema export gains a
 - **Unknown state keys, unknown operation codes, and nodes of the wrong
   type for a slot were accepted** from operations and from the local
   API. All three now raise; `Array[T]` is enforced on insert and move.
-- **Change events exposed live internal buffers**, which a rollback after
-  a failing listener rewrote under earlier listeners; the undo manager
-  also kept an entry for the rolled-back change. Events now own copies
-  and the undo manager takes the entry back.
-- **Handles nested in a composite frozen value (a handle inside a
-  material) were invisible** to `doc.handles()` and the schema export.
-- **Two node classes sharing a `node_type` were silently merged** when
-  discovered through slots; this now raises like the explicit `nodes=`
-  path does.
-- **Session: `create`, `undo` and `redo` patches were labelled as the
-  requester's echo** although the requester never applied those
-  operations locally, so a thick client dropped them. Only an `op` whose
-  operations the commit carries verbatim is an echo; every patch
-  produced by a request now carries the request's `ref`.
-- **Session: a client connecting during a commit could receive the same
-  change in its snapshot and as a patch**, or miss it. The handshake
-  now takes the snapshot atomically and holds newer patches until the
-  snapshot is sent; a failed handshake leaves nothing registered.
-- **Session: commits made outside a request (the host editing
-  `session.doc`) were not broadcast** until the next client message, and
-  a resync snapshot ignored them. They are now flushed as they happen;
-  pending broadcasts go out before a resync snapshot.
-- **Session: a malformed frame could leave the request context set**,
-  labelling later host-side commits as that client's echo.
-- **The same node twice in one insert linked it to itself**, hanging every
-  later traversal. Rejected now, as is a duplicate ID within an adopted
-  fragment or a dump. Adopting the same fragment twice in one call yields
-  two distinct copies, and `adopt()` reseeds the ID session.
-- **Moving a node into a detached parent** orphaned it while it stayed in
-  the node map and the reference index. Rejected now.
-- **`Doc(snapshot)` never checked references**, so dangling ones could be
-  born at construction. Checked now, like restore.
-- **`UndoManager.undo()` dropped a step it could not apply** (for example
-  one that would delete a node a peer has since referenced). The step is
-  kept and the error propagates.
-- **`doc.handles()` missed handles inside lists and dicts**, and a union
-  of handle types exported the first one's strength rather than the
-  strongest.
-- **Same-named value types from different modules** silently overwrote
-  each other in the export. Now an error.
-- **Exported schemas leaked `$defs` for recursive value types** and a
-  stranded `discriminator.mapping`.
-- **Session: a well-formed `op` that failed was dropped in silence.**
-  `apply_operations` swallowed the failure inside the transaction the
-  session wrapped around it, so no `rejected` error, no snapshot, and no
-  patch went out. The session now applies strictly: a missing target is a
-  failure, and any failure is a rejection with a resync snapshot.
-- **Session: a multi-step undo broadcast only the last patch**, and a
-  change committed outside any request was either dropped or sent to a
-  client that had connected after it (and already had it in its snapshot).
-  Every commit is broadcast, to the clients connected when it happened.
-- **Session: a normalizer's additions were invisible to the sender.** A
-  patch that carries more than the client sent is no longer labelled as
-  that client's echo.
-- **Session: a non-object frame dropped the connection** instead of
-  returning `invalid_op`.
-- **Rollback applied inverse operations in the wrong order.** A
-  transaction body that raised after inserting a node and moving an
-  existing node into it deleted the existing node for good. `abort()` now
-  rolls back in reverse and always returns the document to idle, even if
-  an inverse operation fails.
-- **Rolling back a write to a required `Ref[T]` wedged the document.** An
-  unset required field serializes as `null`, which the reference adapter
-  refused on the way back. `null` now round-trips as "unset" for every
-  field type, and an unset required field reads as `None` rather than an
-  internal sentinel.
-- **`Field(default_factory=...)` ran once per class**, so every node shared
-  one mutable default and mutating it corrupted the class default and the
-  schema export. Factories now run per node, mutable literal defaults are
-  copied per node, and `default_factory` / `default=None` on a `BaseModel`
-  source are no longer dropped.
-- **`Field(alias=...)` with a constraint disabled commit validation.**
-- **Non-JSON defaults (`datetime`, `Decimal`, `Enum`, `set`) broke the
-  schema export**, which broke the WebSocket handshake.
-- **A handle to a node that was deleted and then restored (undo,
-  rollback) went stale.** The restore created a new object under the same
-  ID; the old handle still passed the "is attached" check, so writes
-  through it were broadcast but never applied, and a delete through it
-  corrupted the tree. A restore now revives the original object, so
-  handles survive undo and rollback; attachment is checked by identity,
-  and a stale object is refused.
-- **A failing nested transaction aborted the enclosing one and left the
-  document idle**, so the rest of the outer block auto-committed
-  statement by statement. A nested failure now propagates and only the
-  outermost transaction rolls back, as a whole. `apply_operations`
-  inside an open transaction therefore raises instead of skipping.
-- **The root node never got per-node defaults**, so a mutable class
-  default (`tags: list[str] = []`) was shared by every document in the
-  process and mutations to it were not saved.
-- **`null` in a state patch skipped type validation** for a field whose
-  default is not `None`, even in strict mode.
-- **Unknown state keys, unknown operation codes, and nodes of the wrong
-  type for a slot were accepted** from operations and from the local
-  API. All three now raise; `Array[T]` is enforced on insert and move.
-- **Change events exposed live internal buffers**, which a rollback after
-  a failing listener rewrote under earlier listeners; the undo manager
-  also kept an entry for the rolled-back change. Events now own copies
-  and the undo manager takes the entry back.
+- **A failing change listener rolled back a commit that other listeners
+  had already acted on.** A session had already queued the broadcast, so
+  other clients received a change the server then reverted; the undo
+  manager kept an entry for it; and events exposed live internal buffers
+  that the rollback rewrote. Change listeners are now post-commit
+  observers: every listener runs, the commit stands, events are copies,
+  and the failures are raised afterwards as `ListenerError` (with
+  `errors` and `__cause__`). Validation that should veto a commit belongs
+  in model validators or normalizers, which run before.
+- **A broadcast patch carried the client's raw values, not the validated
+  ones.** Sending `"7"` to an `int` field stored `7` and broadcast
+  `"7"`. Forward patches now serialize the value as stored. Such a commit
+  is not the sender's verbatim echo, so it goes out with `source_client:
+  null` and the sender applies it too.
 - **Handles nested in a composite frozen value (a handle inside a
   material) were invisible** to `doc.handles()` and the schema export.
 - **Two node classes sharing a `node_type` were silently merged** when
@@ -230,6 +145,7 @@ nodes. The operations wire format is unchanged; the schema export gains a
 - **Normalizer changes bypassed validation.** Pydantic validation ran before
   normalizers, so nodes a normalizer inserted or edited were never checked.
   Validation now runs after normalization, before the change event.
+
 
 ### Added
 

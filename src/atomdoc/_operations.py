@@ -420,7 +420,7 @@ def on_apply_operations(doc: Doc, operations: Operations, *, strict: bool = Fals
         if node is None:
             missing("Node to update", node_id)
             continue
-        current_patch[node_id] = {**current_patch.get(node_id, {}), **patches}
+        node_patch = current_patch.setdefault(node_id, {})
         if node_id not in doc._diff.inserted:
             doc._diff.updated.add(node_id)
         inserted_same_tx = node_id in doc._diff.inserted
@@ -443,6 +443,10 @@ def on_apply_operations(doc: Doc, operations: Operations, *, strict: bool = Fals
             else:
                 new_value = node._parse_state_key(key, json_val)
                 node._state[key] = new_value
+            # The forward patch carries the value as stored, after
+            # coercion ("7" sent to an int field is broadcast as 7), so
+            # every replica ends up with what the server holds.
+            node_patch[key] = node._state_key_to_json(key)
             if key in node._ref_defs:
                 doc._refs_update(node, key, old_value, new_value)
 
@@ -486,12 +490,11 @@ def maybe_trigger_listeners(doc: Doc, ignore_empty_diff: bool = False) -> None:
     doc._validate_changed_nodes()
     doc._check_ref_integrity()
 
-    from ._types import ChangeEvent, Diff
+    from ._types import ChangeEvent, Diff, ListenerError
 
     doc._lifecycle_stage = "change"
     # The event owns copies: listeners may keep it (the undo manager
-    # does), and a rollback after a failed listener must not rewrite
-    # what earlier listeners already received.
+    # does) and the document reuses nothing they received.
     # Inverse ops are recorded in forward order; the event (and the undo
     # manager) get them in application order.
     inverse: Operations = (
@@ -513,9 +516,17 @@ def maybe_trigger_listeners(doc: Doc, ignore_empty_diff: bool = False) -> None:
         diff=diff,
         flags=doc._transaction_flags,
     )
-    doc._change_notified = True
+    # Listeners are observers of a commit that is already final: every
+    # one of them runs, whatever the others do, and failures are reported
+    # together afterwards (see ListenerError).
+    errors: list[BaseException] = []
     for change_listener in list(doc._change_listeners):
-        change_listener(event)
+        try:
+            change_listener(event)
+        except Exception as exc:
+            errors.append(exc)
+    if errors:
+        raise ListenerError(errors)
 
 
 # --- Merging ---

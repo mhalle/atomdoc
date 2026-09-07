@@ -36,6 +36,28 @@ StatePatch = dict[str, dict[str, Any]]
 Operations = tuple[list[OrderedOperation], StatePatch]
 
 
+class ListenerError(Exception):
+    """One or more change listeners raised after a transaction committed.
+
+    Change listeners are observers: they run after validation, once the
+    commit is final, so a failing listener cannot undo what other
+    listeners (a session broadcast, a UI store) have already seen. The
+    document keeps the change; this error reports the failures to the
+    caller afterwards. ``errors`` holds every exception raised, in
+    listener order; the first is also the ``__cause__``.
+    """
+
+    def __init__(self, errors: list[BaseException]) -> None:
+        self.errors = errors
+        first = errors[0]
+        more = f" (+{len(errors) - 1} more)" if len(errors) > 1 else ""
+        super().__init__(
+            f"{len(errors)} change listener(s) failed after commit: "
+            f"{type(first).__name__}: {first}{more}"
+        )
+        self.__cause__ = first
+
+
 @dataclass(frozen=True)
 class TransactionFlags:
     """Per-transaction flags, delivered to change listeners.

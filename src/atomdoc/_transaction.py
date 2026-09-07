@@ -6,7 +6,7 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
-from ._types import TransactionFlags
+from ._types import ListenerError, TransactionFlags
 
 if TYPE_CHECKING:
     from ._doc import Doc
@@ -84,6 +84,11 @@ def with_transaction(
     if is_new_tx:
         try:
             doc.force_commit()
+        except ListenerError:
+            # The commit is final; only an observer failed. Never swallow
+            # that, whatever mode we are in: the caller must know a
+            # listener is broken.
+            raise
         except Exception:
             try:
                 doc.abort()

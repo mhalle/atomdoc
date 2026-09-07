@@ -2,7 +2,7 @@
 
 import pytest
 
-from atomdoc import Doc, Array, ChangeEvent, node
+from atomdoc import ListenerError, Doc, Array, ChangeEvent, node
 
 
 @node
@@ -74,9 +74,12 @@ def test_cannot_mutate_in_change_handler(doc):
 
     doc.on_change(bad_handler)
 
-    with pytest.raises(RuntimeError):
+    # The commit stands; the listener's failure is reported afterwards.
+    with pytest.raises(ListenerError) as info:
         with doc.transaction():
             doc.root.value = "trigger"
+    assert isinstance(info.value.__cause__, RuntimeError)
+    assert doc.root.value == "trigger"
 
 
 def test_disposed_doc_rejects_transaction(doc):

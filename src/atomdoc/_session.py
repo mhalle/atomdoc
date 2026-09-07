@@ -21,7 +21,7 @@ from ._protocol import (
     operations_to_wire,
 )
 from ._transport import ClientConnection, Transport
-from ._types import ChangeEvent
+from ._types import ChangeEvent, ListenerError
 from ._undo import UndoManager
 
 logger = logging.getLogger(__name__)
@@ -347,6 +347,14 @@ class Session:
             if rejected.resync:
                 await self._send_snapshot(client)
             return
+        except ListenerError:
+            # The request was applied and committed; a host-side change
+            # listener failed afterwards. That is the host's bug, not the
+            # client's: log it and deliver the patch like any other.
+            logger.exception(
+                "Change listener failed after applying %s from %s",
+                msg_type, client.client_id,
+            )
         except _Unsupported as unsupported:
             await client.send({
                 "type": MSG_ERROR,
@@ -397,6 +405,8 @@ class Session:
             # rolled back and raised here as a rejection. The server must
             # never silently drop what a client applied optimistically.
             self._doc.apply_operations(ops, strict=True)
+        except ListenerError:
+            raise  # applied and committed; an observer failed afterwards
         except Exception as exc:
             raise _Rejected(exc) from exc
 
@@ -434,6 +444,8 @@ class Session:
                 self._doc._insert_into_slot(
                     parent, slot, position, [new_node], target=target
                 )
+        except ListenerError:
+            raise
         except Exception as exc:
             raise _Rejected(exc) from exc
 
@@ -458,6 +470,8 @@ class Session:
                 break
             try:
                 step()
+            except ListenerError:
+                raise
             except Exception as exc:
                 # The step no longer applies (someone else edited what it
                 # would revert). It is kept for a retry; nothing was

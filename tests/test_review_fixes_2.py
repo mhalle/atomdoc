@@ -3,7 +3,7 @@
 import pytest
 from pydantic import BaseModel
 
-from atomdoc import Array, Doc, Handle, UndoManagerConfig, node
+from atomdoc import Array, Doc, Handle, ListenerError, UndoManagerConfig, node
 
 
 @node
@@ -234,24 +234,30 @@ def test_duplicate_node_type_in_discovery_raises():
 # --- change event isolation and undo bookkeeping ---
 
 
-def test_failed_listener_leaves_no_phantom_undo_entry_and_event_intact():
+def test_change_listeners_are_post_commit_observers():
+    """A failing listener cannot retract a commit other listeners saw."""
     doc = make_doc()
-    recorded = []
-    doc.on_change(recorded.append)
-    doc.on_change(lambda e: 1 / 0)
-    before = doc.dump()
+    first, last = [], []
+    doc.on_change(first.append)
+    unsubscribe = doc.on_change(lambda e: 1 / 0)
+    doc.on_change(last.append)
     steps = len(doc.undo_manager._undo_stack)
-    with pytest.raises(ZeroDivisionError):
+    with pytest.raises(ListenerError) as info:
         with doc.transaction():
             doc.root.items.append(doc.create_node(Item, count=5))
-    assert doc.dump() == before
-    assert len(doc.undo_manager._undo_stack) == steps
-    event = recorded[-1]
-    assert len(event.operations[0]) == 1 and event.operations[0][0][0] == 0
-    assert len(event.diff.inserted) == 1
+    assert isinstance(info.value.__cause__, ZeroDivisionError)
+    assert [type(e) for e in info.value.errors] == [ZeroDivisionError]
+    # The commit stands, every listener ran, and undo knows about it.
+    assert len(doc.root.items) == 4
+    assert len(first) == 1 and len(last) == 1
+    assert len(doc.undo_manager._undo_stack) == steps + 1
+    assert doc._lifecycle_stage == "idle"
+    unsubscribe()
+    doc.undo_manager.undo()
+    assert len(doc.root.items) == 3
 
 
-def test_failed_listener_during_undo_keeps_redo_stack_clean():
+def test_failed_listener_during_undo_does_not_restore_the_step():
     doc = make_doc()
     a = doc.root.items[0]
     a.count = 1
@@ -263,11 +269,35 @@ def test_failed_listener_during_undo_keeps_redo_stack_clean():
 
     doc.on_change(listener)
     fail["on"] = True
-    with pytest.raises(RuntimeError):
+    steps = len(doc.undo_manager._undo_stack)
+    with pytest.raises(ListenerError):
         doc.undo_manager.undo()
+    # The undo applied; only the observer failed.
+    assert a.count == 0
+    assert len(doc.undo_manager._undo_stack) == steps - 1
+    assert doc.undo_manager.can_redo
+    fail["on"] = False
+    doc.undo_manager.redo()
     assert a.count == 1
-    assert doc.undo_manager.can_undo
-    assert not doc.undo_manager.can_redo
+
+
+def test_listener_failure_is_never_swallowed_by_lenient_apply():
+    doc = make_doc()
+    a = doc.root.items[0]
+    doc.on_change(lambda e: 1 / 0)
+    with pytest.raises(ListenerError):
+        doc.apply_operations(([], {a.id: {"count": 9}}))
+    assert a.count == 9
+
+
+def test_forward_patch_carries_validated_values():
+    doc = make_doc()
+    a = doc.root.items[0]
+    events = []
+    doc.on_change(events.append)
+    doc.apply_operations(([], {a.id: {"count": "7"}}), strict=True)
+    assert a.count == 7
+    assert events[-1].operations[1] == {a.id: {"count": 7}}
 
 
 # --- nested handles ---

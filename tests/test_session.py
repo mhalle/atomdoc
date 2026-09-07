@@ -774,3 +774,52 @@ async def test_failed_handshake_leaves_no_client_behind():
         session.doc.get_node_by_id(t.id).name = "host"
     await settle(session)
     assert _patch_versions(a) == [1]
+
+
+# --- outside review: broadcasts and coercion ---
+
+
+@pytest.mark.asyncio
+async def test_listener_failure_after_session_does_not_retract_broadcast():
+    session, transport, a, b, t, v = await setup_scene_session()
+    session.doc.on_change(lambda e: 1 / 0)  # registered after the Session
+    await transport.send_message(a, _set_name("a1", t.id, "changed"))
+    # The commit stands, so both clients get it and the sender is not
+    # told it failed.
+    assert session.doc.get_node_by_id(t.id).name == "changed"
+    for client in (a, b):
+        assert [m["type"] for m in client.messages] == [MSG_PATCH]
+        assert client.messages[0]["operations"]["state"][t.id]["name"] == "changed"
+
+
+@pytest.mark.asyncio
+async def test_broadcast_carries_coerced_values():
+    @node
+    class Counter:
+        n: int = 0
+
+    @node
+    class CRoot:
+        counters: Array[Counter] = []
+
+    doc = Doc(root_type=CRoot)
+    with doc.transaction():
+        c = doc.create_node(Counter)
+        doc.root.counters.append(c)
+    session = Session(doc)
+    transport = MockTransport()
+    await session.bind(transport)
+    a, b = MockClient("a"), MockClient("b")
+    await transport.connect_client(a)
+    await transport.connect_client(b)
+    await transport.send_message(a, {
+        "type": MSG_OP, "ref": "r",
+        "operations": {"ordered": [], "state": {c.id: {"n": "7"}}},
+    })
+    assert doc.get_node_by_id(c.id).n == 7
+    patch = next(m for m in b.messages if m["type"] == MSG_PATCH)
+    assert patch["operations"]["state"][c.id]["n"] == 7
+    # The sender's copy is not a verbatim echo of what it sent.
+    own = next(m for m in a.messages if m["type"] == MSG_PATCH)
+    assert own["source_client"] is None
+    assert own["operations"]["state"][c.id]["n"] == 7

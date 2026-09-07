@@ -12,7 +12,7 @@ from ._protocol import operations_from_wire, operations_to_wire
 from ._ref import Ref, RefIntegrityError
 from ._session import Session
 from ._transport import ClientConnection, Transport
-from ._types import ChangeEvent, Diff, Operations, TransactionFlags
+from ._types import ChangeEvent, Diff, ListenerError, Operations, TransactionFlags
 from ._undo import UndoHistory, UndoManager, UndoManagerConfig
 
 __all__ = [
@@ -32,6 +32,7 @@ __all__ = [
     "Operations",
     "Ref",
     "RefIntegrityError",
+    "ListenerError",
     "Session",
     "TransactionFlags",
     "Transport",

@@ -438,10 +438,19 @@ doc.on_change(lambda event: print(
 ))
 ```
 
-Change events fire once per transaction, after all mutations and
-normalization are complete. Each event carries forward and inverse
-operations for sync and undo, plus `event.flags` (`TransactionFlags`),
-whose `skip_undo` tells listeners the transaction was excluded from undo.
+Change events fire once per transaction, after all mutations,
+normalization and validation are complete. Each event carries forward and
+inverse operations for sync and undo, plus `event.flags`
+(`TransactionFlags`), whose `skip_undo` tells listeners the transaction
+was excluded from undo.
+
+Listeners are observers of a commit that is already final. Every listener
+runs whatever the others do, and a listener that raises cannot roll the
+commit back: other listeners (a session broadcasting the change, a UI
+store) have already acted on it. Their failures are collected and raised
+to the caller afterwards as a `ListenerError`, whose `errors` holds each
+exception and whose `__cause__` is the first. Validation that should veto
+a commit belongs in model validators or normalizers, which run before.
 
 ### Transactions
 

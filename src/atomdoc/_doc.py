@@ -25,6 +25,7 @@ from ._tier import frozen_models_in
 from ._types import (
     ChangeEvent,
     Diff,
+    ListenerError,
     JsonDoc,
     LifeCycleStage,
     Operations,
@@ -316,9 +317,6 @@ class Doc:
         self._transaction_flags = TransactionFlags()
         self._diff = Diff()
         self._change_listeners: list[Callable[[ChangeEvent], None]] = []
-        # Set while change listeners run, so an abort after a listener
-        # failed can tell the undo manager to forget the entry it took.
-        self._change_notified = False
         self._normalize_listeners: list[Callable[[Diff], None]] = []
         self._undo_config = undo_manager or UndoManagerConfig()
         self._undo_manager: UndoManager | None = None
@@ -679,13 +677,21 @@ class Doc:
         self._lifecycle_stage = "idle"
         try:
             ops.maybe_trigger_listeners(self, ignore_empty_diff)
+        except ListenerError:
+            # The commit is final; a listener failed afterwards. Close the
+            # transaction, then report.
+            self._close_transaction()
+            raise
         except Exception:
-            # Validation or a listener failed. Reopen the transaction and
-            # leave the recorded operations in place so the caller
-            # (with_transaction / transaction_context) can roll back.
+            # Validation or normalization failed before the commit.
+            # Reopen the transaction and leave the recorded operations in
+            # place so the caller (with_transaction / transaction_context)
+            # can roll back.
             self._lifecycle_stage = "update"
             raise
-        self._change_notified = False
+        self._close_transaction()
+
+    def _close_transaction(self) -> None:
         self._operations = ([], {})
         self._inverse_operations = ([], {})
         self._transaction_flags = TransactionFlags()
@@ -894,6 +900,8 @@ class Doc:
     def abort(self) -> None:
         from . import _operations as ops
 
+        if self._lifecycle_stage == "idle":
+            return  # nothing open (a commit already closed it)
         # Inverse ops are recorded in forward order; roll back in reverse.
         inverse: Operations = (
             list(reversed(self._inverse_operations[0])),
@@ -904,17 +912,7 @@ class Doc:
         finally:
             # Whatever happens, the document must not stay in the update
             # stage: a wedged document can never commit or dump again.
-            if self._change_notified and self._undo_manager is not None:
-                # Change listeners already ran for this transaction (one
-                # of them failed). The undo manager took an entry for a
-                # change that is now rolled back; give it back.
-                self._undo_manager._discard_last_change()
-            self._change_notified = False
-            self._operations = ([], {})
-            self._inverse_operations = ([], {})
-            self._transaction_flags = TransactionFlags()
-            self._diff = Diff()
-            self._lifecycle_stage = "idle"
+            self._close_transaction()
             self._rebuild_ref_index()
 
     # --- Listeners ---
