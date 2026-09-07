@@ -765,6 +765,30 @@ inside operations, and a validating generator rejects operations that
 carry IDs it does not recognize: `Doc.restore` raises, and
 `apply_operations` drops the offending operation set.
 
+## Performance
+
+`benchmarks/bench.py` times Slicer-like scenes (transforms with
+matrices and parent references, volumes with references and handles) at
+several sizes and prints per-item cost and the scaling ratio between
+sizes; `tests/test_scaling.py` asserts that the core operations stay
+linear. On a laptop a node costs on the order of 10 microseconds to
+create, a field write a few microseconds, a dump or restore a few
+microseconds per node.
+
+Things to know when a document gets large:
+
+- Children are a linked list. Iterate them (`for v in root.volumes`) or
+  take `list(root.volumes)` once; `len()` walks the list, and `[i]` is
+  cheap only for a sequential scan.
+- A mergeable field is written as a unit: assigning a 10,000-point list
+  serializes the whole list twice (inverse and forward patch). Keep bulk
+  data behind a handle.
+- Every commit runs model validation for the nodes it touched and copies
+  its operations for the change event; batch related writes in one
+  transaction.
+- A session serializes a broadcast once per client. Snapshots on connect
+  are the whole document.
+
 ## Development
 
 ```bash

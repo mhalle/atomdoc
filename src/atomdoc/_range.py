@@ -189,24 +189,36 @@ def _iter_range(start: AtomNode, end: AtomNode) -> Iterator[AtomNode]:
     )
 
 
-def _descendants_inclusive(node: AtomNode) -> Iterator[AtomNode]:
-    """Depth-first traversal of node and all its descendants."""
-    yield node
-    for slot_name in node._slot_order:
-        child = node._slot_first.get(slot_name)
+def _push_children(stack: list[AtomNode], node: AtomNode) -> None:
+    """Push a node's children so they pop in document order."""
+    for slot_name in reversed(node._slot_order):
+        child = node._slot_last.get(slot_name)
         while child is not None:
-            yield from _descendants_inclusive(child)
-            child = child._next_sibling
+            stack.append(child)
+            child = child._prev_sibling
+
+
+def _descendants_inclusive(node: AtomNode) -> Iterator[AtomNode]:
+    """Depth-first (pre-order) traversal of node and all its descendants.
+
+    Iterative: a chain thousands of nodes deep must not hit the
+    interpreter's recursion limit.
+    """
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        yield current
+        _push_children(stack, current)
 
 
 def _descendants(node: AtomNode) -> Iterator[AtomNode]:
-    """Depth-first traversal of descendants (excludes node itself)."""
-    for slot_name in node._slot_order:
-        child = node._slot_first.get(slot_name)
-        while child is not None:
-            yield child
-            yield from _descendants(child)
-            child = child._next_sibling
+    """Depth-first (pre-order) traversal of descendants (excludes node itself)."""
+    stack: list[AtomNode] = []
+    _push_children(stack, node)
+    while stack:
+        current = stack.pop()
+        yield current
+        _push_children(stack, current)
 
 
 def _detach_range(start: AtomNode, end: AtomNode) -> None:

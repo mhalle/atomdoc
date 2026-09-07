@@ -20,6 +20,7 @@ from ._id import (
 )
 from ._handle import Handle, is_handle_type
 from ._node import AtomNode, _MISSING
+from ._range import _descendants, _descendants_inclusive
 from ._ref import RefIntegrityError, ref_ids
 from ._tier import frozen_models_in
 from ._types import (
@@ -378,42 +379,37 @@ class Doc:
         return self._node_id_generator
 
     def _apply_snapshot(self, live_node: AtomNode, snapshot: AtomNode) -> None:
-        """Populate a live node tree from a snapshot (user-constructed node)."""
-        # Copy state
-        for key, value in snapshot._state.items():
-            live_node._state[key] = value
+        """Populate a live node tree from a snapshot (user-constructed node).
 
-        # Process slot children from snapshot
-        snapshot_slots = getattr(snapshot, "_snapshot", None)
-        if not snapshot_slots:
-            return
-
-        for slot_name, children in snapshot_slots.items():
-            if slot_name not in live_node._slot_first:
+        Iterative over an explicit work list, so nesting depth is not
+        bounded by the interpreter's recursion limit.
+        """
+        work = [(live_node, snapshot)]
+        while work:
+            live, snap = work.pop()
+            for key, value in snap._state.items():
+                live._state[key] = value
+            snapshot_slots = getattr(snap, "_snapshot", None)
+            if not snapshot_slots:
                 continue
-            for child_snapshot in children:
-                child_cls = type(child_snapshot)
-                child_id = self._id_gen()
-                child = child_cls(_id=child_id, _doc=self)
-                # Copy state
-                for key, value in child_snapshot._state.items():
-                    child._state[key] = value
-                # Apply defaults not in state
-                child_cls._apply_defaults(child._state)
-                # Link into tree
-                prev = live_node._slot_last.get(slot_name)
-                child._parent = live_node
-                child._slot_name = slot_name
-                child._prev_sibling = prev
-                if prev is not None:
-                    prev._next_sibling = child
-                else:
-                    live_node._slot_first[slot_name] = child
-                live_node._slot_last[slot_name] = child
-                self._node_map[child.id] = child
-
-                # Recurse into child's slots
-                self._apply_snapshot(child, child_snapshot)
+            for slot_name, children in snapshot_slots.items():
+                if slot_name not in live._slot_first:
+                    continue
+                for child_snapshot in children:
+                    child_cls = type(child_snapshot)
+                    child = child_cls(_id=self._id_gen(), _doc=self)
+                    child_cls._apply_defaults(child._state)
+                    prev = live._slot_last.get(slot_name)
+                    child._parent = live
+                    child._slot_name = slot_name
+                    child._prev_sibling = prev
+                    if prev is not None:
+                        prev._next_sibling = child
+                    else:
+                        live._slot_first[slot_name] = child
+                    live._slot_last[slot_name] = child
+                    self._node_map[child.id] = child
+                    work.append((child, child_snapshot))
 
     @property
     def root(self) -> AtomNode:
@@ -449,12 +445,7 @@ class Doc:
 
     def descendants(self, node: AtomNode) -> Iterator[AtomNode]:
         """Depth-first traversal of all descendants across all slots (excludes node)."""
-        for slot_name in node._slot_order:
-            child = node._slot_first.get(slot_name)
-            while child is not None:
-                yield child
-                yield from self.descendants(child)
-                child = child._next_sibling
+        return _descendants(node)
 
     def next_siblings(self, node: AtomNode) -> Iterator[AtomNode]:
         """Forward siblings after node (within same slot)."""
@@ -1076,11 +1067,13 @@ class Doc:
             entries = [fragment]  # type: ignore[list-item]
 
         def collect(entry: JsonDoc, into: list[str]) -> None:
-            into.append(entry[0])
-            if len(entry) > 3 and entry[3]:
-                for children in entry[3].values():
-                    for child in children:
-                        collect(child, into)
+            stack = [entry]
+            while stack:
+                e = stack.pop()
+                into.append(e[0])
+                if len(e) > 3 and e[3]:
+                    for children in e[3].values():
+                        stack.extend(children)
 
         # IDs already present in the document, plus those taken by earlier
         # entries of this call: the same fragment adopted twice yields two
@@ -1105,23 +1098,32 @@ class Doc:
 
     def _build_fragment_node(self, entry: JsonDoc, remap: dict[str, str]) -> AtomNode:
         """Detached node tree from a wire entry, applying an ID remap."""
-        node_id = remap.get(entry[0], entry[0])
-        state = entry[2] if len(entry) > 2 else {}
-        node = self._create_node_from_json([node_id, entry[1], state])
-        if remap:
-            for name in type(node)._ref_defs:
-                value = node._state.get(name)
-                if isinstance(value, str):
-                    node._state[name] = remap.get(value, value)
-                elif isinstance(value, list):
-                    node._state[name] = [remap.get(v, v) for v in value]
-        if len(entry) > 3 and entry[3]:
-            for slot_name, children in entry[3].items():
+
+        def make(e: JsonDoc) -> AtomNode:
+            node_id = remap.get(e[0], e[0])
+            state = e[2] if len(e) > 2 else {}
+            n = self._create_node_from_json([node_id, e[1], state])
+            if remap:
+                for name in type(n)._ref_defs:
+                    value = n._state.get(name)
+                    if isinstance(value, str):
+                        n._state[name] = remap.get(value, value)
+                    elif isinstance(value, list):
+                        n._state[name] = [remap.get(v, v) for v in value]
+            return n
+
+        root = make(entry)
+        work: list[tuple[AtomNode, JsonDoc]] = [(root, entry)]
+        while work:
+            node, e = work.pop()
+            if len(e) <= 3 or not e[3]:
+                continue
+            for slot_name, children in e[3].items():
                 if slot_name not in node._slot_first:
                     continue
                 prev: AtomNode | None = None
                 for child_entry in children:
-                    child = self._build_fragment_node(child_entry, remap)
+                    child = make(child_entry)
                     child._parent = node
                     child._slot_name = slot_name
                     child._prev_sibling = prev
@@ -1130,8 +1132,9 @@ class Doc:
                     else:
                         node._slot_first[slot_name] = child
                     prev = child
+                    work.append((child, child_entry))
                 node._slot_last[slot_name] = prev
-        return node
+        return root
 
     @classmethod
     def restore(
@@ -1416,95 +1419,99 @@ def _json_safe(value: Any) -> Any:
 
 
 def _node_to_wire(node: AtomNode, include_defaults: bool = False) -> JsonDoc:
-    """Serialize a node to wire format (with IDs)."""
-    state = node._state_to_json_plain(include_defaults=include_defaults)
-    result: JsonDoc = [node.id, node._node_type, state]
+    """Serialize a node to wire format (with IDs).
 
-    if node._slot_order:
-        slots_dict: dict[str, list[JsonDoc]] = {}
-        for slot_name in node._slot_order:
-            children: list[JsonDoc] = []
-            child: AtomNode | None = node._slot_first.get(slot_name)
+    Iterative: each node's entry is created when it is visited and its
+    children are appended to it in document order as they are visited.
+    """
+
+    def entry_for(n: AtomNode) -> JsonDoc:
+        state = n._state_to_json_plain(include_defaults=include_defaults)
+        result: JsonDoc = [n.id, n._node_type, state]
+        if n._slot_order:
+            result.append({slot_name: [] for slot_name in n._slot_order})
+        return result
+
+    root_entry = entry_for(node)
+    # (node, the list its entry goes into) — None for the root.
+    stack: list[tuple[AtomNode, list[JsonDoc] | None, JsonDoc]] = [(node, None, root_entry)]
+    while stack:
+        current, into, entry = stack.pop()
+        if into is not None:
+            into.append(entry)
+        if not current._slot_order:
+            continue
+        slots = entry[3]
+        pending: list[tuple[AtomNode, list[JsonDoc] | None, JsonDoc]] = []
+        for slot_name in current._slot_order:
+            child: AtomNode | None = current._slot_first.get(slot_name)
             while child is not None:
-                children.append(_node_to_wire(child, include_defaults=include_defaults))
+                pending.append((child, slots[slot_name], entry_for(child)))
                 child = child._next_sibling
-            slots_dict[slot_name] = children
-        result.append(slots_dict)
-
-    return result
+        stack.extend(reversed(pending))
+    return root_entry
 
 
 def _node_to_data(node: AtomNode, include_defaults: bool = False) -> dict[str, Any]:
-    """Serialize a node to clean JSON (no IDs, just data)."""
-    result: dict[str, Any] = {}
+    """Serialize a node to clean JSON (no IDs, just data). Iterative."""
 
-    # State fields
-    for key, value in node._state.items():
-        if not include_defaults:
-            default = node._field_defaults.get(key, _MISSING)
-            if default is not _MISSING and value == default:
-                continue
-        from pydantic import BaseModel as _BM
-        if isinstance(value, _BM):
-            result[key] = value.model_dump(mode="json")
-        elif isinstance(value, bytes):
-            import base64
-            result[key] = base64.b64encode(value).decode()
-        else:
-            result[key] = value
+    def entry_for(n: AtomNode) -> dict[str, Any]:
+        result: dict[str, Any] = n._state_to_json_plain(include_defaults=include_defaults)
+        for slot_name in n._slot_order:
+            result[slot_name] = []
+        return result
 
-    # Slots
-    for slot_name in node._slot_order:
-        children: list[dict[str, Any]] = []
-        child: AtomNode | None = node._slot_first.get(slot_name)
-        while child is not None:
-            children.append(_node_to_data(child, include_defaults=include_defaults))
-            child = child._next_sibling
-        result[slot_name] = children
-
-    return result
+    root_entry = entry_for(node)
+    stack: list[tuple[AtomNode, list[dict[str, Any]] | None, dict[str, Any]]] = [
+        (node, None, root_entry)
+    ]
+    while stack:
+        current, into, entry = stack.pop()
+        if into is not None:
+            into.append(entry)
+        pending: list[tuple[AtomNode, list[dict[str, Any]] | None, dict[str, Any]]] = []
+        for slot_name in current._slot_order:
+            child: AtomNode | None = current._slot_first.get(slot_name)
+            while child is not None:
+                pending.append((child, entry[slot_name], entry_for(child)))
+                child = child._next_sibling
+        stack.extend(reversed(pending))
+    return root_entry
 
 
 def _deserialize_slots(doc: Doc, parent: AtomNode, slots_data: dict[str, list[JsonDoc]]) -> None:
-    """Recursively deserialize slot children."""
-    for slot_name, children_data in slots_data.items():
-        if slot_name not in parent._slot_first:
-            continue  # skip unknown slots
+    """Deserialize slot children, iteratively over an explicit work list."""
+    work: list[tuple[AtomNode, dict[str, list[JsonDoc]]]] = [(parent, slots_data)]
+    while work:
+        node, slots = work.pop()
+        for slot_name, children_data in slots.items():
+            if slot_name not in node._slot_first:
+                continue  # skip unknown slots
 
-        prev: AtomNode | None = None
-        for child_json in children_data:
-            if child_json[0] in doc._node_map:
-                raise ValueError(f"Duplicate node id in document: {child_json[0]!r}")
-            child = doc._create_node_from_json(child_json)
-            child._parent = parent
-            child._slot_name = slot_name
-            child._prev_sibling = prev
+            prev: AtomNode | None = None
+            for child_json in children_data:
+                if child_json[0] in doc._node_map:
+                    raise ValueError(f"Duplicate node id in document: {child_json[0]!r}")
+                child = doc._create_node_from_json(child_json)
+                child._parent = node
+                child._slot_name = slot_name
+                child._prev_sibling = prev
+                if prev is not None:
+                    prev._next_sibling = child
+                else:
+                    node._slot_first[slot_name] = child
+                doc._node_map[child.id] = child
+                prev = child
+                if len(child_json) > 3 and child_json[3]:
+                    work.append((child, child_json[3]))
+
             if prev is not None:
-                prev._next_sibling = child
-            else:
-                parent._slot_first[slot_name] = child
-            doc._node_map[child.id] = child
-            prev = child
-
-        if prev is not None:
-            parent._slot_last[slot_name] = prev
-
-        # Recurse into children's slots
-        for i, child_json in enumerate(children_data):
-            if len(child_json) > 3 and child_json[3]:
-                child_node = doc.get_node_by_id(child_json[0])
-                if child_node is not None:
-                    _deserialize_slots(doc, child_node, child_json[3])
+                node._slot_last[slot_name] = prev
 
 
-def _descendants_inclusive_iter(node: AtomNode):  # type: ignore[no-untyped-def]
-    """Yield node and all its descendants."""
-    yield node
-    for slot_name in node._slot_order:
-        child = node._slot_first.get(slot_name)
-        while child is not None:
-            yield from _descendants_inclusive_iter(child)
-            child = child._next_sibling
+def _descendants_inclusive_iter(node: AtomNode) -> Iterator[AtomNode]:
+    """Yield node and all its descendants (pre-order, iterative)."""
+    return _descendants_inclusive(node)
 
 
 def _make_root_class(root_type: str) -> type[AtomNode]:

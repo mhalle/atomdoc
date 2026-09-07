@@ -16,11 +16,16 @@ class ChildrenView(Sequence["AtomNode"]):
     and mutation (append, prepend, insert).
     """
 
-    __slots__ = ("_node", "_slot_name")
+    __slots__ = ("_node", "_slot_name", "_cursor")
 
     def __init__(self, node: AtomNode, slot_name: str) -> None:
         self._node = node
         self._slot_name = slot_name
+        # (index, node) of the last positional lookup. The children are a
+        # linked list, so ``view[i]`` walks from the start; a sequential
+        # scan (``for i in range(n): view[i]``) would be quadratic. The
+        # cursor makes each step from the previous index cost O(1).
+        self._cursor: tuple[int, AtomNode] | None = None
 
     def __len__(self) -> int:
         count = 0
@@ -43,8 +48,17 @@ class ChildrenView(Sequence["AtomNode"]):
             return items[index]
         current = self._node._slot_first.get(self._slot_name)
         i = 0
+        cursor = self._cursor
+        if (
+            cursor is not None
+            and cursor[0] <= index
+            and cursor[1]._parent is self._node
+            and cursor[1]._slot_name == self._slot_name
+        ):
+            i, current = cursor
         while current is not None:
             if i == index:
+                self._cursor = (i, current)
                 return current
             current = current._next_sibling
             i += 1

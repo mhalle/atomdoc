@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 import sys
-import copy
 from collections.abc import Callable
 from typing import Any, ClassVar, get_type_hints
 
@@ -99,8 +98,31 @@ class SlotDef:
         self.allowed_type = allowed_type
 
 
+def _copy_container(value: Any) -> Any:
+    """Copy of a default value that shares nothing mutable with it.
+
+    Cheaper than ``copy.deepcopy`` for the JSON-like defaults fields hold
+    (a 4x4 matrix as a list of floats, say): immutable leaves are shared,
+    only containers are rebuilt.
+    """
+    if isinstance(value, list):
+        return [_copy_container(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _copy_container(v) for k, v in value.items()}
+    if isinstance(value, set):
+        return set(value)
+    if isinstance(value, tuple):
+        return tuple(_copy_container(v) for v in value)
+    return value
+
+
 class SlotDescriptor:
-    """Property descriptor that returns a ChildrenView for a named slot."""
+    """Property descriptor that returns a ChildrenView for a named slot.
+
+    The view is created once per node and slot and cached on the node, so
+    the view's index cursor (see ``ChildrenView.__getitem__``) survives
+    repeated ``node.slot[i]`` accesses.
+    """
 
     __slots__ = ("name",)
 
@@ -113,7 +135,14 @@ class SlotDescriptor:
     def __get__(self, obj: Any, objtype: type | None = None) -> Any:
         if obj is None:
             return self
-        return ChildrenView(obj, self.name)
+        views = obj.__dict__.get("_slot_views")
+        if views is None:
+            views = {}
+            object.__setattr__(obj, "_slot_views", views)
+        view = views.get(self.name)
+        if view is None:
+            view = views[self.name] = ChildrenView(obj, self.name)
+        return view
 
     def __set__(self, obj: Any, value: Any) -> None:
         raise AttributeError(f"Cannot assign to slot '{self.name}' directly; use .append(), .insert(), etc.")
@@ -304,8 +333,8 @@ class AtomNode:
         if factory is not None:
             return factory()
         default = cls._field_defaults.get(name, _MISSING)
-        if isinstance(default, (list, dict, set)):
-            return copy.deepcopy(default)
+        if isinstance(default, (list, dict, set, tuple)):
+            return _copy_container(default)
         return default
 
     @classmethod

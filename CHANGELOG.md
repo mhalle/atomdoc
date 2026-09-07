@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **A tree about a thousand levels deep crashed with `RecursionError`**
+  on `dump()`, `restore()`, `descendants()`, `adopt()`, and deleting the
+  chain. Every tree walk is now iterative. (Serializing such a dump with
+  the standard `json` module still hits the interpreter's recursion
+  limit; that is json's limit, not the document's.)
+- **`children[i]` in a loop was quadratic.** Children are a linked list,
+  so each index walked from the start. The slot view is now cached per
+  node and keeps a cursor, so a sequential scan costs O(1) per step.
+  `len()` still walks the list; iterate instead of indexing.
+- **Per-node default copies used `copy.deepcopy`**, a quarter of the cost
+  of creating a node with a 4x4 matrix default. Defaults are now copied
+  structurally.
+
+### Added
+
+- **Performance suite.** `benchmarks/bench.py` sweeps Slicer-like scenes
+  across sizes and reports per-item cost and the scaling ratio;
+  `--profile <scenario>` prints a cProfile. `tests/test_scaling.py` runs
+  in the normal suite and fails if any of sixteen operations turns
+  quadratic, plus a 5000-deep chain round trip.
+
 ## [0.4.1] - 2026-09-07
 
 Fixes from an outside review of the synchronization layer. No wire
