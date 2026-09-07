@@ -26,7 +26,7 @@ guarantee.
   for was vacuous in the client's frame while real on the server, and a
   move the server found already satisfied got no reply at all. The
   server now follows every move echo, and answers every no-op request,
-  with the touched slot's full order for the requester (see PROTOCOL.md,
+  with the touched slot's full order for the requester (see ../PROTOCOL.md,
   "Slot-order corrections"). A two-thick-client convergence harness
   (`test/integration/two-clients.test.ts`) covers concurrent moves,
   creates, deletes and writes with and without a host-side device.
@@ -97,7 +97,7 @@ with atomdoc >= 0.3.0.
   reverts only its own commits — the same rule the thick client's local
   undo already follows. A step that no longer applies comes back as
   `error` code `rejected` with no snapshot; a session with undo disabled
-  answers `unsupported`. See PROTOCOL.md.
+  answers `unsupported`. See ../PROTOCOL.md.
 
 ### Fixed
 

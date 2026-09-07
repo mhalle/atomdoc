@@ -22,7 +22,7 @@ function startServer(env: Record<string, string>): Promise<void> {
   return new Promise((resolve, reject) => {
     const serverPath = new URL("./device_server.py", import.meta.url).pathname;
     server = spawn("uv", ["run", "python", serverPath], {
-      cwd: new URL("../../../atomdoc", import.meta.url).pathname,
+      cwd: new URL("../../../python", import.meta.url).pathname,
       env: { ...process.env, ...env },
       stdio: ["ignore", "pipe", "pipe"],
     });

@@ -5,7 +5,7 @@ import sys
 import os
 
 # Add atomdoc to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "atomdoc", "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "python", "src"))
 
 from pydantic import BaseModel
 from atomdoc import Array, Doc, node

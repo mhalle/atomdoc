@@ -24,7 +24,7 @@ import os
 import random
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "atomdoc", "src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "python", "src"))
 
 from atomdoc import Array, Doc, node  # noqa: E402
 from atomdoc._session import Session  # noqa: E402

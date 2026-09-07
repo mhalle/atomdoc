@@ -658,7 +658,7 @@ asyncio.run(main())
 
 ## Wire Protocol Reference
 
-See [PROTOCOL.md](PROTOCOL.md) for the full wire protocol specification.
+See [PROTOCOL.md](../PROTOCOL.md) for the full wire protocol specification.
 
 ### Server -> Client
 
