@@ -42,10 +42,17 @@ class NodeRange:
                 raise RuntimeError("Root node cannot be deleted")
             from . import _operations as ops
 
+            # Validate before recording anything, so a bad range inside an
+            # enclosing transaction leaves it untouched.
+            doc._check_live(self._start)
+            doc._check_live(self._end)
+            nodes = list(_iter_range(self._start, self._end))
+
             ops.on_delete_range(doc, self._start, self._end)
-            for node in _iter_range(self._start, self._end):
+            for node in nodes:
                 for desc in _descendants_inclusive(node):
                     doc._node_map.pop(desc.id, None)
+                    doc._graveyard[desc.id] = desc
                     doc._refs_remove(desc)
             _detach_range(self._start, self._end)
 
@@ -97,8 +104,18 @@ class NodeRange:
                 raise ValueError(
                     f"Cannot move into {new_parent!r}: it is not in the document"
                 )
+            doc._check_live(self._start)
+            doc._check_live(self._end)
+            doc._check_live(new_parent)
+            if position in ("before", "after"):
+                doc._check_live(target)
 
             nodes_in_range = set(_iter_range(self._start, self._end))
+            from ._doc import _check_allowed
+
+            allowed = new_parent._slot_defs[slot].allowed_type
+            for node in nodes_in_range:
+                _check_allowed(allowed, node, slot, new_parent)
             if new_parent in nodes_in_range:
                 raise ValueError("Target is in the range")
             anc = new_parent._parent

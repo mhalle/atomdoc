@@ -8,7 +8,7 @@ import pytest
 
 from pydantic import BaseModel
 from atomdoc import Array, Doc, Ref, node
-from atomdoc._protocol import MSG_CREATE, MSG_ERROR, MSG_OP, MSG_PATCH, MSG_SCHEMA, MSG_SNAPSHOT, MSG_UNDO, MSG_REDO, operations_to_wire
+from atomdoc._protocol import MSG_CREATE, MSG_ERROR, MSG_OP, MSG_PATCH, MSG_SCHEMA, MSG_SNAPSHOT, MSG_UNDO, MSG_REDO
 from atomdoc._session import Session
 from atomdoc._transport import ClientConnection, Transport
 
@@ -328,9 +328,12 @@ async def test_broadcast_includes_source(session, transport):
     assert any(m["type"] == MSG_PATCH for m in client1.messages)
     assert any(m["type"] == MSG_PATCH for m in client2.messages)
 
-    # Source client's patch has source_client set
+    # A ``create`` is not the requester's echo: the server minted the
+    # node, the client never applied it locally. The request ref is
+    # carried so the client can match the reply.
     patch = next(m for m in client1.messages if m["type"] == MSG_PATCH)
-    assert patch["source_client"] == client1.client_id
+    assert patch["source_client"] is None
+    assert patch["ref"] == "c1"
 
 
 # --- Rejection and resync ---
@@ -436,3 +439,183 @@ async def test_valid_op_after_rejection_still_broadcasts():
     assert [m["type"] for m in a.messages] == [MSG_PATCH]
     assert [m["type"] for m in b.messages] == [MSG_PATCH]
     assert session.doc.get_node_by_id(v.id).transform is None
+
+
+# --- Second adversarial review: session ---
+
+
+class YieldingClient(MockClient):
+    """A client whose send yields to the loop, like a real transport."""
+
+    async def send(self, message: dict[str, Any]) -> None:
+        await asyncio.sleep(0)
+        self.messages.append(message)
+
+
+class DeadClient(MockClient):
+    async def send(self, message: dict[str, Any]) -> None:
+        raise ConnectionResetError("gone")
+
+
+def _patch_versions(client: MockClient) -> list[int]:
+    return [m["version"] for m in client.messages if m["type"] == MSG_PATCH]
+
+
+async def settle(session: Session) -> None:
+    """Wait for the flushes a host-side commit scheduled."""
+    while session._flush_tasks:
+        await asyncio.gather(*session._flush_tasks)
+
+
+@pytest.mark.asyncio
+async def test_undo_and_redo_patches_are_not_labelled_as_echo():
+    session, transport, a, b, t, v = await setup_scene_session()
+    await transport.send_message(a, {
+        "type": MSG_OP, "ref": "r1",
+        "operations": {"ordered": [], "state": {t.id: {"name": "x"}}},
+    })
+    a.messages.clear()
+    b.messages.clear()
+    await transport.send_message(b, {"type": MSG_UNDO, "ref": "u1"})
+    patch = next(m for m in b.messages if m["type"] == MSG_PATCH)
+    assert patch["source_client"] is None
+    assert patch["ref"] == "u1"
+    a.messages.clear()
+    await transport.send_message(a, {"type": MSG_REDO, "ref": "d1"})
+    patch = next(m for m in a.messages if m["type"] == MSG_PATCH)
+    assert patch["source_client"] is None
+    assert patch["ref"] == "d1"
+
+
+@pytest.mark.asyncio
+async def test_minimal_op_frame_is_still_its_own_echo():
+    session, transport, a, b, t, v = await setup_scene_session()
+    await transport.send_message(a, {
+        "type": MSG_OP, "ref": "r1",
+        "operations": {"state": {t.id: {"name": "x"}}},
+    })
+    patch = next(m for m in a.messages if m["type"] == MSG_PATCH)
+    assert patch["source_client"] == "a"
+    assert patch["ref"] == "r1"
+
+
+@pytest.mark.asyncio
+async def test_connecting_client_never_gets_a_patch_older_than_its_snapshot():
+    session, transport, a, b, t, v = await setup_scene_session()
+    newbie = YieldingClient("n")
+    connect = asyncio.ensure_future(transport.connect_client(newbie))
+    await asyncio.sleep(0)  # handshake is in flight, snapshot taken
+    await transport.send_message(a, {
+        "type": MSG_OP, "ref": "r1",
+        "operations": {"ordered": [], "state": {t.id: {"name": "during"}}},
+    })
+    await connect
+    snapshot = next(m for m in newbie.messages if m["type"] == MSG_SNAPSHOT)
+    versions = _patch_versions(newbie)
+    assert all(ver > snapshot["version"] for ver in versions)
+    # The change is delivered exactly once, either in the snapshot or as a
+    # patch after it.
+    in_snapshot = any(
+        entry[2].get("name") == "during" for entry in snapshot["data"][3]["transforms"]
+    )
+    assert in_snapshot != bool(versions)
+    types = [m["type"] for m in newbie.messages]
+    assert types.index(MSG_SNAPSHOT) < len(types) - len(versions)
+
+
+@pytest.mark.asyncio
+async def test_resync_snapshot_is_newer_than_everything_queued():
+    session, transport, a, b, t, v = await setup_scene_session()
+    # A host-side edit outside any request (no loop flush yet in this
+    # synchronous block).
+    with session.doc.transaction():
+        session.doc.get_node_by_id(t.id).name = "server-side"
+    await settle(session)
+    assert _patch_versions(a) == [1]
+    await transport.send_message(a, {
+        "type": MSG_OP, "ref": "bad",
+        "operations": {"ordered": [[1, "nope", 0]], "state": {}},
+    })
+    snapshot = next(m for m in a.messages if m["type"] == MSG_SNAPSHOT)
+    assert snapshot["version"] == 1
+    await transport.send_message(b, {
+        "type": MSG_OP, "ref": "ok",
+        "operations": {"ordered": [], "state": {t.id: {"name": "after"}}},
+    })
+    later = [ver for ver in _patch_versions(a) if ver > 1]
+    assert later == [2]
+
+
+@pytest.mark.asyncio
+async def test_host_side_commit_is_broadcast_without_a_client_message():
+    session, transport, a, b, t, v = await setup_scene_session()
+    with session.doc.transaction():
+        session.doc.get_node_by_id(t.id).name = "host"
+    await settle(session)
+    for client in (a, b):
+        patch = next(m for m in client.messages if m["type"] == MSG_PATCH)
+        assert patch["source_client"] is None
+        assert patch["ref"] is None
+
+
+@pytest.mark.asyncio
+async def test_hostile_frame_does_not_poison_later_broadcasts():
+    session, transport, a, b, t, v = await setup_scene_session()
+    deep: Any = []
+    for _ in range(20000):
+        deep = [deep]
+    await transport.send_message(a, {
+        "type": MSG_OP, "ref": "deep",
+        "operations": {"ordered": [], "state": {"nope": {"k": deep}}},
+    })
+    assert any(m["type"] == MSG_ERROR for m in a.messages)
+    assert session._request is None
+    a.messages.clear()
+    with session.doc.transaction():
+        session.doc.get_node_by_id(t.id).name = "host"
+    await settle(session)
+    patch = next(m for m in a.messages if m["type"] == MSG_PATCH)
+    assert patch["source_client"] is None
+
+
+@pytest.mark.asyncio
+async def test_malformed_operations_are_rejected_not_dropped():
+    session, transport, a, b, t, v = await setup_scene_session()
+    for bad in (
+        {"ordered": [[99, "whatever", 0]], "state": {}},
+        {"ordered": "abc", "state": {}},
+        "not a dict",
+        {"ordered": [], "state": {t.id: {"__evil__": {"any": "json"}}}},
+    ):
+        a.messages.clear()
+        await transport.send_message(a, {"type": MSG_OP, "ref": "x", "operations": bad})
+        assert a.messages, bad
+        assert a.messages[0]["type"] == MSG_ERROR
+        assert a.messages[0]["ref"] == "x"
+    assert "__evil__" not in session.doc.get_node_by_id(t.id)._state
+    assert b.messages == []
+
+
+@pytest.mark.asyncio
+async def test_create_respects_slot_allowed_type():
+    session, transport, a, b, t, v = await setup_scene_session()
+    await transport.send_message(a, {
+        "type": MSG_CREATE, "ref": "c", "node_type": "Transform", "slot": "volumes",
+    })
+    assert a.messages[0]["type"] == MSG_ERROR
+    assert a.messages[0]["code"] == "rejected"
+    assert [type(n).__name__ for n in session.doc.root.volumes] == ["Volume"]
+
+
+@pytest.mark.asyncio
+async def test_failed_handshake_leaves_no_client_behind():
+    session, transport, a, b, t, v = await setup_scene_session()
+    dead = DeadClient("dead")
+    with pytest.raises(ConnectionResetError):
+        await transport.connect_client(dead)
+    assert "dead" not in session.clients
+    assert "dead" not in session._connecting
+    with session.doc.transaction():
+        session.doc.get_node_by_id(t.id).name = "host"
+    await settle(session)
+    assert _patch_versions(a) == [1]

@@ -75,6 +75,9 @@ class UndoManager:
         self._redo_stack: list[UndoStackItem] = []
         self._tx_type: str = "update"  # "undo" | "redo" | "update"
         self._last_update: float | None = None
+        # How the last change event altered the stacks, so a commit that
+        # fails after this manager saw it can be taken back exactly.
+        self._last_change: tuple[str, Any] | None = None
         self._unsubscribe: Callable[[], None] | None = None
 
         if self.is_enabled:
@@ -93,12 +96,19 @@ class UndoManager:
         return self._merge_interval
 
     def _on_change(self, event: ChangeEvent) -> None:
+        self._last_change = None
         if event.flags.skip_undo:
             return
         item = UndoStackItem(operations=event.inverse_operations)
         if self._tx_type == "update":
             now = self._clock()
             last = self._undo_stack[-1] if self._undo_stack else None
+            saved = (
+                list(self._undo_stack),
+                [(it, it.operations) for it in self._undo_stack],
+                list(self._redo_stack),
+                self._last_update,
+            )
             if (
                 last is not None
                 and self._last_update is not None
@@ -112,12 +122,41 @@ class UndoManager:
                 self._undo_stack.append(item)
             self._redo_stack.clear()
             self._last_update = now
+            self._last_change = ("update", saved)
         elif self._tx_type == "undo":
             self._redo_stack.append(item)
             self._tx_type = "update"
+            self._last_change = ("redo_push", item)
         elif self._tx_type == "redo":
             self._undo_stack.append(item)
             self._tx_type = "update"
+            self._last_change = ("undo_push", item)
+
+    def _discard_last_change(self) -> None:
+        """Take back what the last change event did to the stacks.
+
+        Called by the document when a commit is rolled back *after* its
+        change listeners ran (a later listener failed). Without this the
+        stack would hold an entry for a change that never happened.
+        """
+        change = self._last_change
+        self._last_change = None
+        if change is None:
+            return
+        kind, payload = change
+        if kind == "update":
+            undo_items, undo_ops, redo_items, last_update = payload
+            self._undo_stack = undo_items
+            for it, ops in undo_ops:
+                it.operations = ops
+            self._redo_stack = redo_items
+            self._last_update = last_update
+        elif kind == "redo_push":
+            if self._redo_stack and self._redo_stack[-1] is payload:
+                self._redo_stack.pop()
+        elif kind == "undo_push":
+            if self._undo_stack and self._undo_stack[-1] is payload:
+                self._undo_stack.pop()
 
     def undo(self) -> None:
         """Undo the last transaction."""

@@ -368,7 +368,7 @@ class AtomNode:
             elif name in self._field_adapters:
                 state[name] = self._field_adapters[name].validate_python(value)
             else:
-                state[name] = value
+                raise TypeError(f"{type(self).__name__} has no field {name!r}")
 
         object.__setattr__(self, "_state", state)
         object.__setattr__(self, "_snapshot", slots)
@@ -509,9 +509,12 @@ class AtomNode:
 
     def _parse_json_value(self, key: str, json_val: Any) -> Any:
         """Parse a plain JSON value back to its Python type (for deserialization)."""
-        if json_val is None:
-            # ``null`` is "unset or None" for any field type; a required
-            # field's inverse op carries it and must round-trip.
+        if json_val is None and self._field_defaults.get(key) is None:
+            # ``null`` is "unset" for a field without a default, or whose
+            # default is None (that is how an unset field serializes; a
+            # required field's inverse op carries it and must round-trip).
+            # For any other field ``null`` is a value and is validated
+            # like one below.
             return None
         tier = self._field_tiers.get(key)
         if tier == "opaque" and isinstance(json_val, str):

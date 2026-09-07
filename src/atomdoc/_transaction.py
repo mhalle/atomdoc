@@ -56,6 +56,14 @@ def with_transaction(
     ``with_transaction`` call returns. During the ``init`` stage (extension
     registration) mutations accumulate and are committed by the document
     constructor.
+
+    A failure inside a *joined* transaction propagates to the caller
+    without touching the document: only the outermost boundary rolls
+    back, and it rolls back everything. (There are no savepoints, so a
+    nested failure cannot be undone on its own.) ``is_apply_operations``
+    therefore only swallows a failure when this call opened the
+    transaction; inside an open transaction the failure always
+    propagates so the enclosing transaction aborts as a whole.
     """
     _check_stage(doc)
     is_new_tx = _begin(doc, flags)
@@ -63,6 +71,8 @@ def with_transaction(
     try:
         fn()
     except Exception:
+        if not is_new_tx:
+            raise
         try:
             doc.abort()
         except Exception:
@@ -89,7 +99,9 @@ def transaction_context(
 ) -> Generator[None, None, None]:
     """Context manager: ``with doc.transaction(): ...``
 
-    Commits on clean exit, aborts on exception.
+    Commits on clean exit, aborts on exception. A nested block that fails
+    re-raises without rolling anything back; the outermost block aborts
+    the whole transaction (see :func:`with_transaction`).
     """
     _check_stage(doc)
     is_new_tx = _begin(doc, flags)
@@ -97,10 +109,11 @@ def transaction_context(
     try:
         yield
     except Exception:
-        try:
-            doc.abort()
-        except Exception:
-            pass
+        if is_new_tx:
+            try:
+                doc.abort()
+            except Exception:
+                pass
         raise
     else:
         if is_new_tx:

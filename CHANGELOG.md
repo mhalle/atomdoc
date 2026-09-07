@@ -38,6 +38,50 @@ nodes. The operations wire format is unchanged; the schema export gains a
 - **`Field(alias=...)` with a constraint disabled commit validation.**
 - **Non-JSON defaults (`datetime`, `Decimal`, `Enum`, `set`) broke the
   schema export**, which broke the WebSocket handshake.
+- **A handle to a node that was deleted and then restored (undo,
+  rollback) went stale.** The restore created a new object under the same
+  ID; the old handle still passed the "is attached" check, so writes
+  through it were broadcast but never applied, and a delete through it
+  corrupted the tree. A restore now revives the original object, so
+  handles survive undo and rollback; attachment is checked by identity,
+  and a stale object is refused.
+- **A failing nested transaction aborted the enclosing one and left the
+  document idle**, so the rest of the outer block auto-committed
+  statement by statement. A nested failure now propagates and only the
+  outermost transaction rolls back, as a whole. `apply_operations`
+  inside an open transaction therefore raises instead of skipping.
+- **The root node never got per-node defaults**, so a mutable class
+  default (`tags: list[str] = []`) was shared by every document in the
+  process and mutations to it were not saved.
+- **`null` in a state patch skipped type validation** for a field whose
+  default is not `None`, even in strict mode.
+- **Unknown state keys, unknown operation codes, and nodes of the wrong
+  type for a slot were accepted** from operations and from the local
+  API. All three now raise; `Array[T]` is enforced on insert and move.
+- **Change events exposed live internal buffers**, which a rollback after
+  a failing listener rewrote under earlier listeners; the undo manager
+  also kept an entry for the rolled-back change. Events now own copies
+  and the undo manager takes the entry back.
+- **Handles nested in a composite frozen value (a handle inside a
+  material) were invisible** to `doc.handles()` and the schema export.
+- **Two node classes sharing a `node_type` were silently merged** when
+  discovered through slots; this now raises like the explicit `nodes=`
+  path does.
+- **Session: `create`, `undo` and `redo` patches were labelled as the
+  requester's echo** although the requester never applied those
+  operations locally, so a thick client dropped them. Only an `op` whose
+  operations the commit carries verbatim is an echo; every patch
+  produced by a request now carries the request's `ref`.
+- **Session: a client connecting during a commit could receive the same
+  change in its snapshot and as a patch**, or miss it. The handshake
+  now takes the snapshot atomically and holds newer patches until the
+  snapshot is sent; a failed handshake leaves nothing registered.
+- **Session: commits made outside a request (the host editing
+  `session.doc`) were not broadcast** until the next client message, and
+  a resync snapshot ignored them. They are now flushed as they happen;
+  pending broadcasts go out before a resync snapshot.
+- **Session: a malformed frame could leave the request context set**,
+  labelling later host-side commits as that client's echo.
 - **The same node twice in one insert linked it to itself**, hanging every
   later traversal. Rejected now, as is a duplicate ID within an adopted
   fragment or a dump. Adopting the same fragment twice in one call yields
@@ -88,6 +132,50 @@ nodes. The operations wire format is unchanged; the schema export gains a
 - **`Field(alias=...)` with a constraint disabled commit validation.**
 - **Non-JSON defaults (`datetime`, `Decimal`, `Enum`, `set`) broke the
   schema export**, which broke the WebSocket handshake.
+- **A handle to a node that was deleted and then restored (undo,
+  rollback) went stale.** The restore created a new object under the same
+  ID; the old handle still passed the "is attached" check, so writes
+  through it were broadcast but never applied, and a delete through it
+  corrupted the tree. A restore now revives the original object, so
+  handles survive undo and rollback; attachment is checked by identity,
+  and a stale object is refused.
+- **A failing nested transaction aborted the enclosing one and left the
+  document idle**, so the rest of the outer block auto-committed
+  statement by statement. A nested failure now propagates and only the
+  outermost transaction rolls back, as a whole. `apply_operations`
+  inside an open transaction therefore raises instead of skipping.
+- **The root node never got per-node defaults**, so a mutable class
+  default (`tags: list[str] = []`) was shared by every document in the
+  process and mutations to it were not saved.
+- **`null` in a state patch skipped type validation** for a field whose
+  default is not `None`, even in strict mode.
+- **Unknown state keys, unknown operation codes, and nodes of the wrong
+  type for a slot were accepted** from operations and from the local
+  API. All three now raise; `Array[T]` is enforced on insert and move.
+- **Change events exposed live internal buffers**, which a rollback after
+  a failing listener rewrote under earlier listeners; the undo manager
+  also kept an entry for the rolled-back change. Events now own copies
+  and the undo manager takes the entry back.
+- **Handles nested in a composite frozen value (a handle inside a
+  material) were invisible** to `doc.handles()` and the schema export.
+- **Two node classes sharing a `node_type` were silently merged** when
+  discovered through slots; this now raises like the explicit `nodes=`
+  path does.
+- **Session: `create`, `undo` and `redo` patches were labelled as the
+  requester's echo** although the requester never applied those
+  operations locally, so a thick client dropped them. Only an `op` whose
+  operations the commit carries verbatim is an echo; every patch
+  produced by a request now carries the request's `ref`.
+- **Session: a client connecting during a commit could receive the same
+  change in its snapshot and as a patch**, or miss it. The handshake
+  now takes the snapshot atomically and holds newer patches until the
+  snapshot is sent; a failed handshake leaves nothing registered.
+- **Session: commits made outside a request (the host editing
+  `session.doc`) were not broadcast** until the next client message, and
+  a resync snapshot ignored them. They are now flushed as they happen;
+  pending broadcasts go out before a resync snapshot.
+- **Session: a malformed frame could leave the request context set**,
+  labelling later host-side commits as that client's echo.
 - **The same node twice in one insert linked it to itself**, hanging every
   later traversal. Rejected now, as is a duplicate ID within an adopted
   fragment or a dump. Adopting the same fragment twice in one call yields

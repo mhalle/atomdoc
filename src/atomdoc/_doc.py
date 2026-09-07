@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from typing import Annotated, Any, ForwardRef
@@ -180,6 +181,23 @@ class Extension:
 # Doc
 # ---------------------------------------------------------------------------
 
+def _check_allowed(
+    allowed: Any, node: AtomNode, slot_name: str, parent: AtomNode
+) -> None:
+    """Raise unless ``node`` may live in a slot that accepts ``allowed``."""
+    if allowed is None or not isinstance(allowed, type):
+        return
+    if isinstance(node, allowed):
+        return
+    allowed_type = getattr(allowed, "_node_type", None)
+    if allowed_type is not None and node._node_type == allowed_type:
+        return
+    raise TypeError(
+        f"Slot '{slot_name}' of {type(parent).__name__} accepts "
+        f"{getattr(allowed, '__name__', allowed)}, not {type(node).__name__}"
+    )
+
+
 def _discover_node_types(root_cls: type[AtomNode]) -> dict[str, type[AtomNode]]:
     """Walk slot declarations to discover all reachable node types from root."""
     result: dict[str, type[AtomNode]] = {}
@@ -188,8 +206,14 @@ def _discover_node_types(root_cls: type[AtomNode]) -> dict[str, type[AtomNode]]:
         cls = pending.pop()
         if not hasattr(cls, "_node_type"):
             continue
-        if cls._node_type in result:
+        existing = result.get(cls._node_type)
+        if existing is cls:
             continue
+        if existing is not None:
+            raise ValueError(
+                f"Duplicate node type '{cls._node_type}': "
+                f"{existing.__qualname__} and {cls.__qualname__}"
+            )
         result[cls._node_type] = cls
         for slot_def in getattr(cls, "_slot_defs", {}).values():
             if slot_def.allowed_type is not None and slot_def.allowed_type not in result.values():
@@ -276,6 +300,12 @@ class Doc:
             self._id = self._node_id_generator.generate()
 
         self._node_map: dict[str, AtomNode] = {}
+        # Node objects removed from the document, by ID, for as long as
+        # someone still holds them. A rollback or undo that re-inserts the
+        # same ID revives the object, so a handle survives the round trip.
+        self._graveyard: weakref.WeakValueDictionary[str, AtomNode] = (
+            weakref.WeakValueDictionary()
+        )
         # Reverse reference index: target id -> {(referrer id, field): None}.
         # Derived state — never serialized, rebuilt on restore.
         self._ref_index: dict[str, dict[tuple[str, str], None]] = {}
@@ -286,6 +316,9 @@ class Doc:
         self._transaction_flags = TransactionFlags()
         self._diff = Diff()
         self._change_listeners: list[Callable[[ChangeEvent], None]] = []
+        # Set while change listeners run, so an abort after a listener
+        # failed can tell the undo manager to forget the entry it took.
+        self._change_notified = False
         self._normalize_listeners: list[Callable[[Diff], None]] = []
         self._undo_config = undo_manager or UndoManagerConfig()
         self._undo_manager: UndoManager | None = None
@@ -293,6 +326,7 @@ class Doc:
         # Create root node
         root_node_cls = self._node_types[root_type_str]
         self._root = root_node_cls(_id=self._id, _doc=self)
+        root_node_cls._apply_defaults(self._root._state)
         self._node_map[self._id] = self._root
 
         extract_time = self._node_id_generator.extract_time
@@ -447,6 +481,11 @@ class Doc:
             raise ValueError(
                 f"Node type '{node_cls._node_type}' is not registered"
             )
+        unknown = [name for name in state if name not in node_cls._field_adapters]
+        if unknown:
+            raise TypeError(
+                f"{node_cls.__name__} has no field {unknown[0]!r}"
+            )
         node_id = self._id_gen()
         node = node_cls(_id=node_id, _doc=self)
         for name in node_cls._field_defaults:
@@ -474,7 +513,9 @@ class Doc:
             current = node._state.get(key, node._field_defaults.get(key, _MISSING))
             if current is value or current == value:
                 return
-            is_attached = node.id in self._node_map
+            # Identity, not ID: a handle to a node that was deleted and
+            # re-created under the same ID must not write into the doc.
+            is_attached = self._node_map.get(node.id) is node
             if is_attached:
                 ops.on_set_state_inverse(self, node, key)
             node._state[key] = value
@@ -507,6 +548,20 @@ class Doc:
                 raise ValueError(
                     f"Slot '{slot_name}' does not exist on {type(parent).__name__}"
                 )
+            # The parent (and the sibling target) must be the live objects
+            # for their IDs: a stale handle to a deleted-and-restored node
+            # would link the new nodes into a tree nobody can see.
+            self._check_live(parent)
+            if target is not None:
+                self._check_live(target)
+                if target._parent is not parent or target._slot_name != slot_name:
+                    raise ValueError(
+                        f"Node '{target.id}' is not in slot '{slot_name}' "
+                        f"of '{parent.id}'"
+                    )
+            allowed = parent._slot_defs[slot_name].allowed_type
+            for top_node in nodes:
+                _check_allowed(allowed, top_node, slot_name, parent)
 
             # Validate nodes (also against each other: the same node or ID
             # twice in one batch would link a node to itself)
@@ -630,6 +685,7 @@ class Doc:
             # (with_transaction / transaction_context) can roll back.
             self._lifecycle_stage = "update"
             raise
+        self._change_notified = False
         self._operations = ([], {})
         self._inverse_operations = ([], {})
         self._transaction_flags = TransactionFlags()
@@ -708,6 +764,10 @@ class Doc:
             elif isinstance(value, dict):
                 for item in value.values():
                     walk(node, name, item)
+            elif isinstance(value, BaseModel):
+                # A handle nested in a composite value counts too.
+                for fname in type(value).model_fields:
+                    walk(node, name, getattr(value, fname))
 
         for node in self._node_map.values():
             for name, value in node._state.items():
@@ -844,6 +904,12 @@ class Doc:
         finally:
             # Whatever happens, the document must not stay in the update
             # stage: a wedged document can never commit or dump again.
+            if self._change_notified and self._undo_manager is not None:
+                # Change listeners already ran for this transaction (one
+                # of them failed). The undo manager took an entry for a
+                # change that is now rolled back; give it back.
+                self._undo_manager._discard_last_change()
+            self._change_notified = False
             self._operations = ([], {})
             self._inverse_operations = ([], {})
             self._transaction_flags = TransactionFlags()
@@ -895,6 +961,10 @@ class Doc:
         flagged so the undo manager ignores them — use it for operations
         received from a remote peer. Any open transaction is committed first.
 
+        Called inside an open transaction, the operations join it and a
+        failure propagates: the enclosing transaction is aborted as a
+        whole (there are no savepoints), whatever ``raise_on_error`` says.
+
         By default a failing entry is rolled back and silently skipped
         (best effort, for undo and journals). With ``raise_on_error`` the
         failure propagates after the rollback. With ``strict`` an operation
@@ -930,9 +1000,6 @@ class Doc:
             with_transaction(
                 self, _do, is_apply_operations=not raise_on_error, flags=flags
             )
-
-        if skip_undo and self._lifecycle_stage == "update":
-            self.force_commit()
 
         return remaining
 
@@ -1114,6 +1181,37 @@ class Doc:
         # Unresolved references raise (strict) or warn in _finish_init.
         doc._finish_init()
         return doc
+
+    def _check_live(self, node: AtomNode) -> None:
+        """Raise unless ``node`` is the object the document holds for its ID."""
+        live = self._node_map.get(node.id)
+        if live is None:
+            raise RuntimeError(f"Node '{node.id}' is not in the document")
+        if live is not node:
+            raise RuntimeError(
+                f"Node '{node.id}' is a stale handle: the document holds a "
+                "different object for this ID"
+            )
+
+    def _node_for_insert(self, node_id: str, node_type: str) -> AtomNode:
+        """A bare node for an insert operation.
+
+        If the ID belongs to a node this document removed earlier (an
+        undone delete, a rolled-back transaction, a cut that is pasted
+        back) and someone still holds that object, it is revived: reset to
+        a fresh node and handed back, so the holder's handle is live
+        again. Otherwise a new object is created.
+        """
+        old = self._graveyard.pop(node_id, None)
+        if (
+            old is not None
+            and old._doc_ref is self
+            and old._node_type == node_type
+        ):
+            old._init_internal(node_id, self)
+            type(old)._apply_defaults(old._state)
+            return old
+        return self._create_node_from_json([node_id, node_type, {}])
 
     def _create_node_from_json(self, json_node: JsonDoc) -> AtomNode:
         node_id = json_node[0]

@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel
 
-from atomdoc import Array, AtomNode, Doc, node
+from atomdoc import Array, Doc, node
 
 
 class Color(BaseModel, frozen=True):

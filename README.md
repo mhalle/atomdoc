@@ -470,6 +470,16 @@ with doc.transaction():
 # doc.root.title is unchanged
 ```
 
+Transactions nest by joining: an inner `with doc.transaction()` (or any
+mutation, or `apply_operations`) inside an open one becomes part of it.
+There are no savepoints, so a failure inside the inner block propagates
+and the outermost transaction rolls back as a whole. Every mutation
+validates before it records anything, so an exception you catch inside
+a transaction leaves it consistent.
+
+Node handles stay valid across undo and rollback: a node deleted and then
+restored is the same Python object.
+
 ## Server protocol
 
 AtomDoc includes a server protocol layer for connecting clients to a
@@ -502,7 +512,7 @@ Messages from server to client:
 |---------|-------------|
 | `schema` | JSON Schema with `x-atomdoc` extensions (sent on connect) |
 | `snapshot` | Full document state (sent on connect) |
-| `patch` | Incremental operations (broadcast after each change) |
+| `patch` | Incremental operations (broadcast after each change). `ref` is the `ref` of the client request that produced it (`null` for a host-side change). `source_client` is set only when the patch is the verbatim echo of that client's `op`; a `create`, `undo` or `redo` result, or an `op` a normalizer changed, has `source_client: null` because the requester never applied those operations locally. |
 | `error` | Error response. `code` is `unknown_type` or `invalid_op` for a malformed request, or `rejected` when a well-formed request is invalid against the current document (a dangling reference, a validation failure, a node that is gone). A rejected request is rolled back and not broadcast; the sender then receives a fresh `snapshot` to replace its local copy. |
 
 Messages from client to server:

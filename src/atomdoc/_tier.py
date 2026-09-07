@@ -65,8 +65,13 @@ def frozen_models_in(annotation: Any) -> list[type[BaseModel]]:
 
     def walk(ann: Any) -> None:
         if _is_frozen_model(ann):
-            if ann not in found:
-                found.append(ann)
+            if ann in found:
+                return
+            found.append(ann)
+            # A composite value may hold further value types (a handle
+            # inside a material, say); they are part of the contract too.
+            for info in ann.model_fields.values():
+                walk(info.annotation)
             return
         origin = get_origin(ann)
         if origin is Annotated:

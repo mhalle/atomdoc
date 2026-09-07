@@ -32,7 +32,7 @@ def _normalize(value: Any) -> Any:
     lists, ints vs floats)."""
     try:
         return json.loads(json.dumps(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return value
 
 
@@ -42,6 +42,19 @@ class _Rejected(Exception):
     def __init__(self, cause: BaseException) -> None:
         super().__init__(str(cause))
         self.cause = cause
+
+
+class _Request:
+    """The client request being handled, for labelling its commits."""
+
+    __slots__ = ("client_id", "ref", "ops")
+
+    def __init__(self, client_id: str, ref: Any, ops: Any = None) -> None:
+        self.client_id = client_id
+        self.ref = ref
+        # JSON-normalized operations of an ``op`` request, so a commit
+        # that equals them can be labelled as the sender's echo.
+        self.ops = ops
 
 
 class Session:
@@ -65,20 +78,22 @@ class Session:
         else:
             self._undo = UndoManager(doc)
         self._clients: dict[str, ClientConnection] = {}
+        # Clients whose handshake (schema + snapshot) is in flight. A
+        # commit that lands meanwhile is newer than their snapshot, so it
+        # is held here and delivered right after the snapshot.
+        self._connecting: dict[str, tuple[ClientConnection, list[dict[str, Any]]]] = {}
         self._version: int = 0
         self._transport: Transport | None = None
 
         # Pending broadcasts set synchronously by the on_change callback
-        # and consumed by the async message handler. One request can
-        # commit more than once (a multi-step undo), hence a list. Each
-        # entry records the clients connected at commit time: a client
-        # that connects later gets the change in its snapshot instead.
+        # and consumed asynchronously. One request can commit more than
+        # once (a multi-step undo), hence a list. Each entry records the
+        # clients connected (or connecting) at commit time: a client that
+        # connects later gets the change in its snapshot instead.
         self._pending_broadcasts: list[tuple[dict[str, Any], list[str]]] = []
-        self._current_client_id: str | None = None
-        # The operations the current request sent, JSON-normalized, so a
-        # commit that differs from them (a normalizer added or changed
-        # something) is not tagged as the sender's own echo.
-        self._current_request_ops: Any = None
+        self._flush_lock = asyncio.Lock()
+        self._flush_tasks: set[asyncio.Task[None]] = set()
+        self._request: _Request | None = None
 
         # Cache the schema so we don't rebuild it on every connect.
         self._cached_schema: dict[str, Any] | None = None
@@ -114,6 +129,7 @@ class Session:
             await self._transport.stop()
             self._transport = None
         self._clients.clear()
+        self._connecting.clear()
 
     # --- Doc change listener (synchronous) ---
 
@@ -121,39 +137,76 @@ class Session:
         """Called synchronously by Doc after a transaction commits."""
         self._version += 1
         wire = operations_to_wire(event.operations)
-        source = self._current_client_id
-        if source is not None and self._current_request_ops is not None:
-            if _normalize(wire) != self._current_request_ops:
-                # The commit carries more than the client sent (a
-                # normalizer ran). A thick client skips its own echoes, so
-                # do not label this one as an echo.
-                source = None
+        request = self._request
+        source: str | None = None
+        ref: Any = None
+        if request is not None:
+            ref = request.ref
+            # Only an ``op`` request whose operations the commit carries
+            # verbatim is the sender's own echo. A commit that differs (a
+            # normalizer ran), or one produced by create/undo/redo (ops
+            # the client never applied itself), is not: a thick client
+            # skipping its echoes must apply it.
+            if request.ops is not None and _normalize(wire) == request.ops:
+                source = request.client_id
         self._pending_broadcasts.append((
             {
                 "type": MSG_PATCH,
                 "version": self._version,
                 "operations": wire,
                 "source_client": source,
+                "ref": ref,
             },
-            list(self._clients),
+            [*self._clients, *self._connecting],
         ))
+        if request is None:
+            # Not inside a request handler (the host edited the document
+            # directly): nothing will flush this later, so do it now.
+            self._schedule_flush()
+
+    def _schedule_flush(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop: the broadcast waits for the next request or
+            # connect, which flush before they send anything else.
+            return
+        task = loop.create_task(self._flush_broadcast())
+        self._flush_tasks.add(task)
+        task.add_done_callback(self._flush_tasks.discard)
 
     # --- Transport callbacks ---
 
     async def _handle_connect(self, client: ClientConnection) -> None:
-        self._clients[client.client_id] = client
+        # Anything committed but not yet sent predates this client's
+        # snapshot; deliver it to the others first so the order of
+        # versions each client sees stays monotonic.
+        await self._flush_broadcast()
 
-        # Send schema (cached after first build)
         if self._cached_schema is None:
             self._cached_schema = self._doc.atomdoc_schema()
-        await client.send({"type": MSG_SCHEMA, "schema": self._cached_schema})
 
-        # Send snapshot (includes client_id so the client can identify self-echoes)
-        await self._send_snapshot(client, with_client_id=True)
+        # Register as connecting and take the snapshot in the same
+        # synchronous step: every commit from here on is newer than the
+        # snapshot and is buffered for delivery after it.
+        buffer: list[dict[str, Any]] = []
+        self._connecting[client.client_id] = (client, buffer)
+        snapshot = self._snapshot_message(client, with_client_id=True)
+        try:
+            await client.send({"type": MSG_SCHEMA, "schema": self._cached_schema})
+            await client.send(snapshot)
+        except BaseException:
+            self._connecting.pop(client.client_id, None)
+            raise
+        if self._connecting.pop(client.client_id, None) is None:
+            return  # disconnected during the handshake
+        self._clients[client.client_id] = client
+        for message in buffer:
+            await self._safe_send(client, message)
 
-    async def _send_snapshot(
+    def _snapshot_message(
         self, client: ClientConnection, *, with_client_id: bool = False
-    ) -> None:
+    ) -> dict[str, Any]:
         message: dict[str, Any] = {
             "type": MSG_SNAPSHOT,
             "doc_id": self._doc.id,
@@ -162,7 +215,12 @@ class Session:
         }
         if with_client_id:
             message["client_id"] = client.client_id
-        await client.send(message)
+        return message
+
+    async def _send_snapshot(
+        self, client: ClientConnection, *, with_client_id: bool = False
+    ) -> None:
+        await client.send(self._snapshot_message(client, with_client_id=with_client_id))
 
     async def _handle_message(
         self, client: ClientConnection, msg: dict[str, Any]
@@ -178,6 +236,7 @@ class Session:
         msg_type = msg.get("type")
         ref = msg.get("ref")
 
+        self._request = _Request(client.client_id, ref)
         try:
             if msg_type == MSG_OP:
                 self._apply_op(client, msg)
@@ -200,10 +259,13 @@ class Session:
             # (referential integrity, validation, a node that is gone). The
             # document rolled it back and nothing was broadcast. A thick
             # client applied it optimistically, so send it the truth: a
-            # fresh snapshot replaces its local document.
+            # fresh snapshot replaces its local document. Whatever was
+            # committed before this request goes out first, so the
+            # snapshot is the newest thing the client receives.
             logger.info(
                 "Rejected %s from %s: %s", msg_type, client.client_id, rejected
             )
+            await self._flush_broadcast()
             await client.send({
                 "type": MSG_ERROR,
                 "ref": ref,
@@ -221,6 +283,8 @@ class Session:
                 "message": str(exc),
             })
             return
+        finally:
+            self._request = None
 
         # Broadcast the patch to ALL clients (including the source).
         # Thin clients need the echo to update their store.
@@ -229,13 +293,23 @@ class Session:
 
     async def _handle_disconnect(self, client: ClientConnection) -> None:
         self._clients.pop(client.client_id, None)
+        self._connecting.pop(client.client_id, None)
 
     # --- Message handlers ---
 
     def _apply_op(self, client: ClientConnection, msg: dict[str, Any]) -> None:
-        ops = operations_from_wire(msg["operations"])
-        self._current_client_id = client.client_id
-        self._current_request_ops = _normalize(msg["operations"])
+        raw = msg.get("operations")
+        if (
+            not isinstance(raw, dict)
+            or not isinstance(raw.get("ordered", []), list)
+            or not isinstance(raw.get("state", {}), dict)
+        ):
+            raise ValueError("'operations' must be {'ordered': [...], 'state': {...}}")
+        ops = operations_from_wire(raw)
+        # Compare against the canonical form so a minimal or reordered
+        # frame still matches its own echo.
+        assert self._request is not None
+        self._request.ops = _normalize(operations_to_wire(ops))
         try:
             # Strict: a missing target is a failure, and any failure is
             # rolled back and raised here as a rejection. The server must
@@ -243,9 +317,6 @@ class Session:
             self._doc.apply_operations(ops, strict=True)
         except Exception as exc:
             raise _Rejected(exc) from exc
-        finally:
-            self._current_client_id = None
-            self._current_request_ops = None
 
     def _handle_create(self, client: ClientConnection, msg: dict[str, Any]) -> None:
         node_type = msg["node_type"]
@@ -258,8 +329,9 @@ class Session:
         node_cls = self._doc._node_types.get(node_type)
         if node_cls is None:
             raise ValueError(f"Unknown node type: {node_type!r}")
+        if not isinstance(state, dict):
+            raise ValueError("'state' must be an object")
 
-        self._current_client_id = client.client_id
         try:
             with self._doc.transaction():
                 new_node = self._doc.create_node(node_cls, **state)
@@ -274,47 +346,41 @@ class Session:
                 target = None
                 if target_id:
                     target = self._doc.get_node_by_id(target_id)
+                    if target is None:
+                        raise ValueError(f"Target node not found: {target_id!r}")
 
                 self._doc._insert_into_slot(
                     parent, slot, position, [new_node], target=target
                 )
         except Exception as exc:
             raise _Rejected(exc) from exc
-        finally:
-            self._current_client_id = None
 
     def _handle_undo(self, client: ClientConnection, msg: dict[str, Any]) -> None:
         steps = msg.get("steps", 1)
-        self._current_client_id = client.client_id
-        try:
-            for _ in range(steps):
-                if not self._undo.can_undo:
-                    break
-                self._undo.undo()
-        finally:
-            self._current_client_id = None
+        for _ in range(steps):
+            if not self._undo.can_undo:
+                break
+            self._undo.undo()
 
     def _handle_redo(self, client: ClientConnection, msg: dict[str, Any]) -> None:
         steps = msg.get("steps", 1)
-        self._current_client_id = client.client_id
-        try:
-            for _ in range(steps):
-                if not self._undo.can_redo:
-                    break
-                self._undo.redo()
-        finally:
-            self._current_client_id = None
+        for _ in range(steps):
+            if not self._undo.can_redo:
+                break
+            self._undo.redo()
 
     # --- Broadcasting ---
 
     async def _flush_broadcast(self, exclude: str | None = None) -> None:
-        """Send every pending broadcast produced by the Doc changes, in order."""
-        broadcasts = self._pending_broadcasts
-        if not broadcasts:
-            return
-        self._pending_broadcasts = []
-        for broadcast, recipients in broadcasts:
-            await self._broadcast(broadcast, exclude=exclude, only=recipients)
+        """Send every pending broadcast produced by the Doc changes, in order.
+
+        Serialized: two flushes never interleave, so every client sees
+        versions in order.
+        """
+        async with self._flush_lock:
+            while self._pending_broadcasts:
+                broadcast, recipients = self._pending_broadcasts.pop(0)
+                await self._broadcast(broadcast, exclude=exclude, only=recipients)
 
     async def _broadcast(
         self,
@@ -323,12 +389,17 @@ class Session:
         only: list[str] | None = None,
     ) -> None:
         """Send a message to connected clients (``only`` those, if given),
-        optionally excluding one."""
+        optionally excluding one. A client still in its handshake gets
+        the message queued behind its snapshot."""
         tasks = []
         for cid, client in self._clients.items():
             if cid == exclude or (only is not None and cid not in only):
                 continue
             tasks.append(self._safe_send(client, message))
+        for cid, (_, buffer) in self._connecting.items():
+            if cid == exclude or (only is not None and cid not in only):
+                continue
+            buffer.append(message)
         if tasks:
             await asyncio.gather(*tasks)
 

@@ -340,10 +340,7 @@ def on_apply_operations(doc: Doc, operations: Operations, *, strict: bool = Fals
         op = ordered_op
         if op[0] == 0:
             # Insert: (0, nodes, parent_id, slot_name, prev_id, next_id)
-            nodes = [
-                doc._create_node_from_json([nid, ntype, {}])
-                for nid, ntype in op[1]
-            ]
+            nodes = [doc._node_for_insert(nid, ntype) for nid, ntype in op[1]]
             parent_id = op[2]
             slot_name = op[3]
             prev_id = op[4]
@@ -410,6 +407,9 @@ def on_apply_operations(doc: Doc, operations: Operations, *, strict: bool = Fals
                 if strict:
                     raise
 
+        else:
+            raise ValueError(f"Unknown operation code: {op[0]!r}")
+
     # Apply state patches
     to_apply = operations[1]
     current_patch = doc._operations[1]
@@ -425,6 +425,10 @@ def on_apply_operations(doc: Doc, operations: Operations, *, strict: bool = Fals
             doc._diff.updated.add(node_id)
         inserted_same_tx = node_id in doc._diff.inserted
         for key, json_val in patches.items():
+            if key not in node._field_adapters:
+                raise ValueError(
+                    f"{type(node).__name__} has no field {key!r}"
+                )
             if not inserted_same_tx:
                 if not current_inv_patch.get(node_id, {}).get(key):
                     original = node._state_key_to_json(key)
@@ -482,21 +486,34 @@ def maybe_trigger_listeners(doc: Doc, ignore_empty_diff: bool = False) -> None:
     doc._validate_changed_nodes()
     doc._check_ref_integrity()
 
-    from ._types import ChangeEvent
+    from ._types import ChangeEvent, Diff
 
     doc._lifecycle_stage = "change"
+    # The event owns copies: listeners may keep it (the undo manager
+    # does), and a rollback after a failed listener must not rewrite
+    # what earlier listeners already received.
     # Inverse ops are recorded in forward order; the event (and the undo
     # manager) get them in application order.
     inverse: Operations = (
         list(reversed(doc._inverse_operations[0])),
-        doc._inverse_operations[1],
+        {nid: dict(patch) for nid, patch in doc._inverse_operations[1].items()},
     )
+    forward: Operations = (
+        list(doc._operations[0]),
+        {nid: dict(patch) for nid, patch in doc._operations[1].items()},
+    )
+    diff = Diff()
+    diff.inserted = set(doc._diff.inserted)
+    diff.deleted = dict(doc._diff.deleted)
+    diff.moved = set(doc._diff.moved)
+    diff.updated = set(doc._diff.updated)
     event = ChangeEvent(
-        operations=doc._operations,
+        operations=forward,
         inverse_operations=inverse,
-        diff=doc._diff,
+        diff=diff,
         flags=doc._transaction_flags,
     )
+    doc._change_notified = True
     for change_listener in list(doc._change_listeners):
         change_listener(event)
 
