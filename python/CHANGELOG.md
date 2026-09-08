@@ -2,7 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.4.7] - 2026-09-07
+
+Validator ergonomics. No wire or schema changes; atomdoc-ts 0.4.7 is
+the same code as 0.4.6, re-tagged to keep the versions in step.
 
 ### Fixed
 
