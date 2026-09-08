@@ -161,3 +161,17 @@ describe("AtomDocClient", () => {
     expect(cb).not.toHaveBeenCalled();
   });
 });
+
+describe("AtomDocClient.moveNode", () => {
+  it("sends a move op with the root spelled as 0", () => {
+    const client = new AtomDocClient("ws://unused");
+    const sent: unknown[] = [];
+    (client as unknown as { ws: unknown }).ws = { send: (t: string) => sent.push(JSON.parse(t)) };
+    client.moveNode("n1", "", "items", "n0");
+    client.moveNode("n1", "p2", "children", undefined, "n3");
+    expect(sent).toEqual([
+      { type: "op", operations: { ordered: [[2, "n1", 0, 0, "items", "n0", 0]], state: {} } },
+      { type: "op", operations: { ordered: [[2, "n1", 0, "p2", "children", 0, "n3"]], state: {} } },
+    ]);
+  });
+});

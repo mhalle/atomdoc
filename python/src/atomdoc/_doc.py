@@ -1368,7 +1368,24 @@ class Doc:
         doc_id = data[0]
         root_type_str = data[1]
 
-        effective_root: type[AtomNode] | str = root_type if root_type is not None else root_type_str
+        if root_type is None:
+            # The dump names the root type; the class must come from
+            # ``nodes``. Building a bare stand-in would restore a document
+            # whose fields are unreachable and fail far from here.
+            registered = list(nodes or []) + [
+                cls_ for ext in extensions or [] for cls_ in ext.nodes
+            ]
+            for cls_ in registered:
+                if getattr(cls_, "_node_type", None) == root_type_str:
+                    root_type = cls_
+                    break
+            else:
+                raise TypeError(
+                    f"Doc.restore() needs root_type=: the dump's root is a "
+                    f"{root_type_str!r} node and no class in nodes= or an "
+                    "extension has that type"
+                )
+        effective_root: type[AtomNode] | str = root_type
 
         doc = cls(
             root_type=effective_root,
@@ -1526,16 +1543,22 @@ class Doc:
                     }
             entry["handles"] = handles
 
-            # Slots. ``allowed_type`` is the one accepted type or null
-            # (any node, or several); ``allowed_types`` lists them all.
+            # Slots. ``allowed_type`` is the one declared type or null
+            # (any node, or several); ``allowed_types`` lists every type
+            # the slot accepts: the declared ones and, since acceptance
+            # is by isinstance, every registered subclass of them.
             slots: dict[str, Any] = {}
             for slot_name, slot_def in node_cls._slot_defs.items():
-                names = [
-                    m if isinstance(m, str) else m._node_type
-                    for m in slot_member_types(slot_def.allowed_type)
-                ]
+                members = list(slot_member_types(slot_def.allowed_type))
+                names = [m if isinstance(m, str) else m._node_type for m in members]
+                classes = [m for m in members if not isinstance(m, str)]
+                for other_name, other_cls in self._node_types.items():
+                    if other_name not in names and any(
+                        issubclass(other_cls, m) for m in classes
+                    ):
+                        names.append(other_name)
                 slots[slot_name] = {
-                    "allowed_type": names[0] if len(names) == 1 else None,
+                    "allowed_type": names[0] if len(members) == 1 else None,
                     "allowed_types": names,
                 }
             entry["slots"] = slots

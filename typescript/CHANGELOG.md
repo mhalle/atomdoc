@@ -27,6 +27,28 @@ Released in step with atomdoc 0.5.1. Fixes from a review of 0.5.0.
 - `ErrorMsg.ref` is typed `string | null` (the server sends `null` when
   the request had no ref); `ListenerError` is exported from the package
   root.
+- **`deleteNode` on the thick client now runs the local referential
+  integrity check** the README promised (`RefIntegrityError` before
+  anything is sent) instead of letting the server reject it with a
+  resync that dropped undo history.
+- **`defineNode` slots accept a list of type names** (`Array[A | B]`)
+  and `null` (any type), exporting `allowed_type`/`allowed_types` as
+  Python does; a cast-in list used to emit a malformed schema.
+- **An `object` field with a value-type `schema` defaults to tier
+  `"atomic"`** (it was `"mergeable"`, unlike the Python export, and the
+  mistake was invisible); the inlined value type now carries its
+  `required` list as Python's does.
+- A mutator called before the document is loaded says so
+  ("Document not loaded yet") rather than "Not connected".
+
+### Added
+
+- `ThickAtomDocClient.ready()`: resolves once the schema and snapshot
+  are in (`connect()` resolves when the socket opens).
+- `AtomDocClient.moveNode(nodeId, parentId, slot, prevId?, nextId?)`
+  on the thin client.
+- `webSocket` option on both clients for runtimes without a global
+  `WebSocket`.
 
 ## 0.5.0
 

@@ -23,15 +23,22 @@ export class AtomDocClient {
   private errorCallbacks = new Set<(err: ErrorMsg) => void>();
   private patchCallbacks = new Set<(version: number) => void>();
 
-  constructor(url: string) {
+  private webSocket: new (url: string) => WebSocket;
+
+  /**
+   * @param options.webSocket The WebSocket constructor to use; defaults
+   *   to the global `WebSocket` (browsers, Node 22 and later).
+   */
+  constructor(url: string, options: { webSocket?: new (url: string) => WebSocket } = {}) {
     this.url = url;
+    this.webSocket = options.webSocket ?? WebSocket;
   }
 
   // --- Lifecycle ---
 
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const ws = new WebSocket(this.url);
+      const ws = new this.webSocket(this.url);
       this.ws = ws;
 
       ws.onopen = () => {
@@ -115,6 +122,21 @@ export class AtomDocClient {
       type: "op",
       operations: {
         ordered: [[1, nodeId, 0]],
+        state: {},
+      },
+    });
+  }
+
+  /**
+   * Move a node into `slot` of `parentId` (`"0"` or `""` for the root):
+   * after `prevId` if given, else before `nextId` if given, else at the
+   * end.
+   */
+  moveNode(nodeId: string, parentId: string, slot: string, prevId?: string, nextId?: string): void {
+    this.send({
+      type: "op",
+      operations: {
+        ordered: [[2, nodeId, 0, parentId === "" || parentId === "0" ? 0 : parentId, slot, prevId ?? 0, nextId ?? 0]],
         state: {},
       },
     });

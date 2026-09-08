@@ -521,10 +521,10 @@ async def test_per_client_undo_reverts_only_own_commits():
     assert [m["type"] for m in b.messages] == [MSG_PATCH]
     assert node.name == "from a"
 
-    # Nothing left for b: a no-op, no patch, no error.
+    # Nothing left for b: answered with an empty patch, nothing reverted.
     b.messages.clear()
     await transport.send_message(b, {"type": MSG_UNDO, "ref": "ub2"})
-    assert b.messages == []
+    assert [(m["type"], m["operations"]) for m in b.messages] == [(MSG_PATCH, {"ordered": [], "state": {}})]
 
 
 @pytest.mark.asyncio
@@ -585,7 +585,10 @@ async def test_per_client_history_is_dropped_on_disconnect():
     await transport.connect_client(a2)
     a2.messages.clear()
     await transport.send_message(a2, {"type": MSG_UNDO, "ref": "u"})
-    assert a2.messages == []
+    # Nothing to undo: answered with an empty patch, nothing reverted.
+    assert [(m["type"], m["ref"], m["operations"]) for m in a2.messages] == [
+        (MSG_PATCH, "u", {"ordered": [], "state": {}}),
+    ]
     assert session.doc.get_node_by_id(t.id).name == "from a"
 
 
@@ -1000,3 +1003,70 @@ async def test_create_with_a_bad_position_is_answered():
         (MSG_ERROR, "p3", "invalid_op"),
     ]
     assert b.messages == []
+
+
+@pytest.mark.asyncio
+async def test_every_request_with_a_ref_is_answered():
+    """An undo whose targets are gone, or with nothing left to revert, is
+    answered with an empty patch at the current version."""
+    session, transport, a, b, t, v = await setup_scene_session()
+    await transport.send_message(a, {
+        "type": MSG_OP, "ref": "ins",
+        "operations": {"ordered": [[0, [["gone.-", "Transform"]], 0, "transforms", 0, 0]], "state": {}},
+    })
+    await transport.send_message(b, {
+        "type": MSG_OP, "ref": "del",
+        "operations": {"ordered": [[1, "gone.-", 0]], "state": {}},
+    })
+    await settle(session)
+    a.messages.clear()
+    b.messages.clear()
+    version = session.version
+    await transport.send_message(a, {"type": MSG_UNDO, "ref": "u1"})
+    await settle(session)
+    assert [(m["type"], m["version"], m["ref"], m["operations"]) for m in a.messages] == [
+        (MSG_PATCH, version, "u1", {"ordered": [], "state": {}}),
+    ]
+    assert b.messages == []
+    # Nothing left to undo: answered the same way; without a ref, silence.
+    a.messages.clear()
+    await transport.send_message(a, {"type": MSG_UNDO, "ref": "u2"})
+    await transport.send_message(a, {"type": MSG_UNDO})
+    await settle(session)
+    assert [(m["ref"], m["operations"]) for m in a.messages] == [("u2", {"ordered": [], "state": {}})]
+
+
+@pytest.mark.asyncio
+async def test_malformed_ops_are_invalid_not_rejected():
+    session, transport, a, b, t, v = await setup_scene_session()
+    a.messages.clear()
+    await transport.send_message(a, {
+        "type": MSG_OP, "ref": "code",
+        "operations": {"ordered": [[9, "x", 0]], "state": {}},
+    })
+    await transport.send_message(a, {
+        "type": MSG_OP, "ref": "field",
+        "operations": {"ordered": [], "state": {t.id: {"nosuchfield": 1}}},
+    })
+    await settle(session)
+    assert [(m["type"], m["ref"], m["code"]) for m in a.messages] == [
+        (MSG_ERROR, "code", "invalid_op"),
+        (MSG_ERROR, "field", "invalid_op"),
+    ]
+    assert not any(m["type"] == MSG_SNAPSHOT for m in a.messages)
+    assert b.messages == []
+
+
+@pytest.mark.asyncio
+async def test_root_named_by_id_is_a_verbatim_echo():
+    session, transport, a, b, t, v = await setup_scene_session()
+    root_id = session.doc.root.id
+    a.messages.clear()
+    await transport.send_message(a, {
+        "type": MSG_OP, "ref": "byid",
+        "operations": {"ordered": [[0, [["byid.-", "Transform"]], root_id, "transforms", t.id, 0]], "state": {}},
+    })
+    await settle(session)
+    echo = next(m for m in a.messages if m["type"] == MSG_PATCH)
+    assert echo["source_client"] == a.client_id
+    assert echo["operations"]["ordered"][0][2] == 0

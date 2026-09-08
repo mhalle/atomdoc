@@ -329,6 +329,7 @@ class Session:
         self._request = request
         error: dict[str, Any] | None = None
         rejected: _Rejected | None = None
+        queued_before = len(self._pending_broadcasts)
         try:
             if msg_type == MSG_OP:
                 self._apply_op(client, msg)
@@ -382,6 +383,12 @@ class Session:
         if error is not None:
             await client.send({"type": MSG_ERROR, "ref": ref, **error})
             return
+        if ref is not None and len(self._pending_broadcasts) == queued_before:
+            # The request committed nothing and nothing answered it yet
+            # (an undo with nothing left to revert, say). A request that
+            # carries a ref is always answered, so the client can retire
+            # it: an empty patch at the current version.
+            self._pending_broadcasts.append((self._empty_answer(ref), [client.client_id]))
 
         # Broadcast the patch to ALL clients (including the source).
         # Thin clients need the echo to update their store.
@@ -404,11 +411,13 @@ class Session:
         ):
             raise ValueError("'operations' must be {'ordered': [...], 'state': {...}}")
         ops = operations_from_wire(raw)
+        self._check_well_formed(ops)
         # Compare against the canonical form so a minimal or reordered
-        # frame still matches its own echo.
+        # frame still matches its own echo. The root spelled by its ID is
+        # the root spelled as 0.
         request = self._request
         assert request is not None
-        request.ops = _normalize(operations_to_wire(ops))
+        request.ops = _normalize(operations_to_wire(self._root_as_zero(ops)))
         queued_before = len(self._pending_broadcasts)
         try:
             # Strict: a missing target is a failure, and any failure is
@@ -438,6 +447,43 @@ class Session:
                 },
                 [client.client_id],
             ))
+
+    def _empty_answer(self, ref: Any) -> dict[str, Any]:
+        return {
+            "type": MSG_PATCH,
+            "version": self._version,
+            "operations": {"ordered": [], "state": {}},
+            "source_client": None,
+            "ref": ref,
+        }
+
+    def _check_well_formed(self, ops: Operations) -> None:
+        """Refuse a malformed frame before touching the document: an
+        unknown operation code, or a field the node's type does not have.
+        These are ``invalid_op`` errors (no resync), not rejections."""
+        doc = self._doc
+        for op in ops[0]:
+            if op[0] not in (0, 1, 2):
+                raise ValueError(f"Unknown operation code: {op[0]!r}")
+        for node_id, patch in ops[1].items():
+            node = doc.get_node_by_id(node_id)
+            if node is None:
+                continue  # a node that is gone is a rejection, decided below
+            for key in patch:
+                if key not in node._field_adapters:
+                    raise ValueError(f"{type(node).__name__} has no field {key!r}")
+
+    def _root_as_zero(self, ops: Operations) -> Operations:
+        root_id = self._doc.root.id
+        ordered: list[Any] = []
+        for op in ops[0]:
+            op = list(op)
+            if op[0] == 0 and op[2] == root_id:
+                op[2] = 0
+            elif op[0] == 2 and op[3] == root_id:
+                op[3] = 0
+            ordered.append(op)
+        return (ordered, ops[1])  # type: ignore[return-value]
 
     def _stored_values(self, ops: Operations) -> dict[str, dict[str, Any]]:
         """The values the document holds for the fields ``ops`` write."""

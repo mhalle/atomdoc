@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { ThickAtomDocClient } from "../../src/thick/thick-client.js";
+import { RefIntegrityError } from "../../src/thick/local-doc.js";
 import { getSlotChildren } from "../../src/thick/doc-node.js";
 import type {
   AtomDocSchema,
@@ -16,9 +17,10 @@ const schema: AtomDocSchema = {
   node_types: {
     Page: {
       json_schema: {},
-      field_tiers: { title: "mergeable" },
+      field_tiers: { title: "mergeable", featured: "ref" },
       slots: { items: { allowed_type: "Item" } },
-      field_defaults: { title: "" },
+      field_defaults: { title: "", featured: null },
+      refs: { featured: { target_type: "Item", many: false, policy: "restrict" } },
     },
     Item: {
       json_schema: {},
@@ -530,6 +532,33 @@ describe("ThickAtomDocClient confirmed structure", () => {
     echo(sent[0]);
     expect(items(client)).toEqual(["i1"]);
     expect(client.getUndoManager()!.canUndo).toBe(true);
+  });
+});
+
+describe("ThickAtomDocClient readiness and integrity", () => {
+  it("ready() resolves once the snapshot is in; mutators explain the wait", async () => {
+    const client = new ThickAtomDocClient({ url: "ws://unused", coalesce: false });
+    expect(() => client.setField(ROOT, "title", "x")).toThrow(/not loaded yet/);
+    let resolved = false;
+    const p = client.ready().then(() => { resolved = true; });
+    client._injectMessage({ type: "schema", schema } as SchemaMsg);
+    expect(resolved).toBe(false);
+    client._injectMessage({ type: "snapshot", doc_id: ROOT, version: 0, data: snapshot, client_id: "me" } as SnapshotMsg);
+    await p;
+    expect(resolved).toBe(true);
+    await client.ready(); // already loaded: resolves at once
+  });
+
+  it("deleteNode refuses a node another node still references", () => {
+    const { client, sent, echo } = onlineClient();
+    client.setField(ROOT, "featured", "i1");
+    expect(() => client.deleteNode("i1")).toThrow(RefIntegrityError);
+    expect(sent.length).toBe(1); // only the field write
+    client.setField(ROOT, "featured", null);
+    client.deleteNode("i1");
+    expect(sent.length).toBe(3);
+    echo(sent[2]);
+    expect(items(client)).toEqual([]);
   });
 });
 

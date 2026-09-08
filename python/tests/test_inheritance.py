@@ -254,3 +254,22 @@ def test_union_and_bare_array_slots():
     restored = Doc.restore(doc.dump(), root_type=Mixed, nodes=[C])
     assert [type(n).__name__ for n in restored.root.either] == ["A", "B"]
     assert type(restored.root.anything[0]).__name__ == "C"
+
+
+def test_restore_needs_a_root_class():
+    doc = Doc(Canvas(), nodes=[Circle])
+    doc.root.shapes.append(doc.create_node(Circle, radius=2.0))
+    wire = doc.dump()
+    with pytest.raises(TypeError, match="root_type="):
+        Doc.restore(wire)
+    # Resolved from nodes= when the root class is registered there.
+    back = Doc.restore(wire, nodes=[Canvas, Circle])
+    assert isinstance(back.root, Canvas)
+    assert back.root.shapes[0].radius == 2.0
+
+
+def test_allowed_types_lists_accepted_subclasses():
+    doc = Doc(Canvas(), nodes=[Circle])
+    slot = doc.atomdoc_schema()["node_types"]["Canvas"]["slots"]["shapes"]
+    assert slot["allowed_type"] == "Shape"
+    assert slot["allowed_types"] == ["Shape", "Circle"]

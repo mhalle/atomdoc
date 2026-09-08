@@ -53,12 +53,9 @@ import { ThickAtomDocClient } from "atomdoc-ts";
 
 const client = new ThickAtomDocClient({ url: "ws://localhost:8765" });
 
-client.onConnected(() => {
-  const store = client.getStore();
-  console.log("Document loaded:", store.getRoot()!.state.title);
-});
-
-await client.connect();
+await client.connect(); // resolves when the socket opens...
+await client.ready();   // ...and this once the schema and snapshot are in
+// (or do the work inside client.onConnected(() => { ... }))
 
 // Field writes apply at once — no round-trip
 const rootId = client.getStore().getRootId();
@@ -148,6 +145,7 @@ schema.nodeTypeNames();                         // ["Page", "Annotation"]
 schema.valueTypeNames();                        // ["Color"]
 schema.getFieldTier("Annotation", "color");     // "atomic"
 schema.getSlots("Page");                        // { annotations: { allowed_type: "Annotation", allowed_types: ["Annotation"] } }
+                                                // (an unknown type name gives {} from getSlots and getDefaults)
 schema.getNodeType("Page"); schema.getValueType("Color"); schema.getRef("Volume", "transform"); schema.getHandles("Volume");
 schema.getRefs("Volume");                       // { transform: { target_type: "Transform", many: false, policy: "restrict" } }
 schema.getDefaults("Annotation");               // { label: "", color: { r: 0, g: 0, b: 0 } }
@@ -184,7 +182,7 @@ const Page = defineNode("Page", {
   // Several targets: an array of IDs
   related: { type: "ref", target: "Annotation", many: true, default: [] },
 }, {
-  slots: { annotations: "Annotation" },
+  slots: { annotations: "Annotation" }   // or ["A", "B"] (Python Array[A | B]), or null (any node type),
 });
 
 const schema = buildSchema("Page", [Page, Annotation], [Color]);
@@ -194,7 +192,9 @@ const schema = buildSchema("Page", [Page, Annotation], [Color]);
 Handles name things outside the document. `defineHandle(name, strength)`
 builds a frozen `uri` / `media_type` / `digest` value type; an `object`
 field whose `schema` is such a value type makes the node type export a
-`handles` block for it.
+`handles` block for it. An `object` field with a `schema` defaults to
+tier `"atomic"` (the value is replaced whole, as Python does for frozen
+models); every other field defaults to `"mergeable"`.
 `doc.handles("strong")` on a `LocalDoc` is the dependency list a consumer
 checks before opening a document: objects `{ node, field, handle, strength }`
 (the Python `doc.handles()` yields `(node, field, handle)` tuples).
@@ -242,12 +242,19 @@ client.setField(nodeId, "title", "New Title");
 // Set a frozen value (replaced atomically)
 client.setField(nodeId, "color", { r: 255, g: 0, b: 0 });
 
-// Create a new node (server assigns ID)
+// Create a new node (server assigns ID). Positions: "append", "prepend";
+// "before"/"after" need a target_id, so build a `create` message by hand for those.
 client.createNode("Annotation", { label: "New" }, parentId, "annotations");
 client.createNode("Annotation", { label: "First" }, parentId, "annotations", "prepend");
 
 // Delete a node
 client.deleteNode(nodeId);
+
+// Move a node: after prevId if given, else before nextId, else to the end
+client.moveNode(nodeId, parentId, "annotations", prevId);
+client.moveNode(nodeId, "", "annotations");          // "" or "0" is the root
+
+// Anything else: build the message (see Operation Constructors) and client.send(msg)
 
 // Undo / redo (server-side)
 client.undo();
@@ -267,11 +274,13 @@ client.onError((err) => {                   // server rejected an operation
 
 ### Transactions
 
-Buffer multiple operations and send as one atomic batch:
+Buffer multiple operations and send as one atomic batch (one `op`
+message, one undo step). A transaction carries `setField`, `deleteNode`,
+and `moveNode`; `createNode` is a separate message type on the wire and
+cannot join one (the thick client, which mints node IDs itself, has no
+such limit).
 
 ```ts
-import { Transaction } from "atomdoc-ts";
-
 const tx = client.begin();
 
 tx.setField(nodeId, "title", "New Title");
@@ -334,6 +343,10 @@ const client = new ThickAtomDocClient({
 });
 ```
 
+The client uses the global `WebSocket` (browsers, Node 22 and later);
+pass `webSocket: WS` (the `ws` package, say) on a runtime without one.
+Both clients take that option.
+
 The local document is always current. The store, which the UI
 subscribes to, is updated once per animation frame (a macrotask outside a
 browser), so a burst of patches from a device or a transaction touching
@@ -352,6 +365,7 @@ client.getVersion();     // server version
 #### Additional State
 
 ```ts
+await client.ready();     // resolves once the document is loaded (connect() resolves on socket open)
 client.getDoc();          // LocalDoc | null — the local document model (null until the snapshot)
 client.getUndoManager();  // UndoManager | null
 client.isOnline();        // connection status
@@ -385,9 +399,15 @@ client.pendingStructure();   // true while a structural edit awaits confirmation
 client.onPatch(() => { ... }); // fires after every applied patch, echoes included
 ```
 
-A structural edit the server rejects (its parent was deleted first, say)
-comes back as an `error` followed by a resync: the local document is
-rebuilt from the server's snapshot.
+Every mutator throws synchronously for what it can see is wrong: an
+unknown or already-deleted node (including one another client deleted a
+moment ago), a node pending deletion, an unknown field or slot, and, for
+`deleteNode`, a node that another node still references
+(`RefIntegrityError`, the same check the server runs). In an editor
+where other parties edit too, wrap mutations in `try`/`catch`. A
+structural edit the server nevertheless rejects (its parent was deleted
+on the server first, say) comes back as an `error` followed by a resync:
+the local document is rebuilt from the server's snapshot.
 
 #### Local Undo/Redo
 
@@ -423,9 +443,14 @@ const history = client.getUndoManager().exportHistory();
 undoManager.importHistory(history);
 ```
 
-The exported history is plain JSON. Its `lastUpdate` timestamp comes from
-the exporting manager's clock (`Date.now` by default), so a merge window can
+The exported history is plain JSON. `lastUpdate`, present when the last
+recorded step was an edit rather than an undo or redo, comes from the
+exporting manager's clock (`Date.now` by default), so a merge window can
 continue across the transfer only when both managers share a clock.
+`client.getUndoManager()` is a new object after every resync (rejection
+or reconnect): import into the one you get *after* the resync. A
+standalone manager is `new UndoManager(doc, maxSteps?, options?)` on a
+`LocalDoc`.
 
 On a `LocalDoc` directly, `applyOperations(ops, { skipUndo: true })` runs
 operations in a transaction the undo manager ignores, and every
@@ -451,10 +476,11 @@ client.onOnline(() => { ... });        // reconnected
 The thick client is not an offline editor. When the connection drops,
 field writes still apply locally and every edit is buffered — including
 any that were sent but not yet acknowledged when the socket dropped. On
-reconnect the server's snapshot replaces the local document (and drops
-the undo history), the buffered edits are sent in order, and each
-appears as the server confirms it; one the server rejects comes back as a
-resync. `onOnline` fires after the snapshot has landed.
+reconnect the server's snapshot replaces the local document and the
+undo history restarts from it: the buffered edits are sent in order and
+each appears, as a new undoable step, as the server confirms it; one the
+server rejects comes back as a resync. `onOnline` fires after the
+snapshot has landed.
 
 ```ts
 client.onOffline(() => { /* show a banner; edits queue until reconnect */ });
@@ -483,8 +509,18 @@ doc.nodeMap;               // Map<string, DocNode>
 doc.onChange((event) => {
   console.log("Forward ops:", event.operations);
   console.log("Inverse ops:", event.inverseOperations);
-  console.log("Diff:", event.diff);
+  console.log("Diff:", event.diff);   // Sets of ids (inserted, moved, updated) and a
+                                      // Map of deleted nodes: not JSON-serializable as is
 });
+
+// Mutate (each call is its own transaction; several ops in one go: applyOperations)
+doc.setNodeState(id, "title", "x");
+doc.insertIntoSlot(parent, "items", "append", [doc.createNode("Item", { label: "n" })]);
+doc.insertIntoSlot(parent, "items", "before", [node], target);   // or "after"
+doc.deleteRange(startId, endId?);
+doc.moveRange(startId, endId, parentId, slot);                   // to the end of the slot
+doc.moveRangeRelative(startId, endId, targetId, "before" | "after");
+doc.applyOperations({ ordered: [[1, id, 0]], state: { [rootId]: { featured: null } } });
 
 // Serialize
 const snapshot = doc.toSnapshot();  // wire format [id, type, state, slots]

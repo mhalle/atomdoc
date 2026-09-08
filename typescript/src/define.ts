@@ -49,8 +49,10 @@ export interface FieldDef {
   /** Default value for this field. */
   default?: unknown;
   /**
-   * Tier: "mergeable" (default), "atomic", or "opaque". A `"ref"` field is
-   * always tier "ref".
+   * Tier: "mergeable", "atomic", or "opaque". Defaults to "atomic" for an
+   * object field with a `schema` (a frozen value type is replaced whole,
+   * as in Python) and "mergeable" otherwise. A `"ref"` field is always
+   * tier "ref".
    */
   tier?: "mergeable" | "atomic" | "opaque" | "ref";
   /** For object fields: a ValueDef or NodeDef to reference. */
@@ -124,16 +126,22 @@ export function defineHandle(
 // Node type definition
 // ---------------------------------------------------------------------------
 
+/**
+ * What a slot accepts: one node type name, several (Python's
+ * `Array[A | B]`), or `null` for any node type (a bare `Array`).
+ */
+export type SlotDef = string | string[] | null;
+
 export interface NodeDef {
   name: string;
   fields: Record<string, FieldDef>;
-  slots: Record<string, string | null>;
+  slots: Record<string, SlotDef>;
 }
 
 export function defineNode(
   name: string,
   fields: Record<string, FieldDef>,
-  options: { slots?: Record<string, string | null> } = {},
+  options: { slots?: Record<string, SlotDef> } = {},
 ): NodeDef {
   return {
     name,
@@ -174,10 +182,14 @@ function fieldToJsonSchemaBase(field: FieldDef): Record<string, unknown> {
   }
 
   if (field.type === "object" && field.schema) {
+    // Inlined like the value type's own json_schema, `required` included.
     result.properties = {};
+    const required: string[] = [];
     for (const [k, f] of Object.entries(field.schema.fields)) {
       (result.properties as Record<string, unknown>)[k] = fieldToJsonSchema(f);
+      if (f.default === undefined) required.push(k);
     }
+    if (required.length > 0) result.required = required;
   }
 
   if (field.type === "array" && field.items) {
@@ -210,7 +222,7 @@ function nodeDefToTypeDef(node: NodeDef): NodeTypeDef {
         policy: "restrict",
       };
     } else {
-      fieldTiers[name] = field.tier ?? "mergeable";
+      fieldTiers[name] = field.tier ?? (field.type === "object" && field.schema ? "atomic" : "mergeable");
     }
     if (field.default !== undefined) {
       fieldDefaults[name] = field.default;
@@ -218,10 +230,11 @@ function nodeDefToTypeDef(node: NodeDef): NodeTypeDef {
   }
 
   const slots: Record<string, { allowed_type: string | null; allowed_types: string[] }> = {};
-  for (const [name, allowedType] of Object.entries(node.slots)) {
+  for (const [name, allowed] of Object.entries(node.slots)) {
+    const types = allowed === null ? [] : Array.isArray(allowed) ? allowed : [allowed];
     slots[name] = {
-      allowed_type: allowedType,
-      allowed_types: allowedType === null ? [] : [allowedType],
+      allowed_type: types.length === 1 ? types[0] : null,
+      allowed_types: types,
     };
   }
 

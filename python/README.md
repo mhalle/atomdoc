@@ -42,7 +42,7 @@ separately.
 - **Core document model**: `@node` decorator, `Array[T]` slots, frozen value types (Pydantic), transactions, built-in undo/redo with merge interval and history transfer
 - **Server protocol layer**: `Session`, `Transport` (abstract), `WebSocketTransport`
 - **Wire protocol**: schema/snapshot/patch messages (server to client), op/create/undo/redo (client to server)
-- **Schema export**: `atomdoc_schema()` with `x-atomdoc` extensions (field tiers, slots, references, value types)
+- **Schema export**: `atomdoc_schema()` — every node and value type with its JSON Schema, field tiers, defaults, slots, references, and handles
 - **References**: `Ref[T]` fields point at other nodes in the same document, with a reverse index and referential integrity checked at commit
 - **Validation**: full Pydantic validation at transaction commit time
 - **Extensions**: bundle node types and normalization hooks
@@ -124,14 +124,20 @@ After creation, mutations happen inside transactions:
 ```python
 with doc.transaction():
     doc.root.title = "Updated"
-    new_ann = doc.create_node(Annotation, label="New")
+    new_ann = doc.create_node(Annotation, label="New")   # a node with an ID, not yet in the tree
     doc.root.annotations.append(new_ann)            # add to end
     doc.root.annotations.prepend(another)           # add to start
-    doc.root.annotations.insert(2, mid)             # insert at index
+    doc.root.annotations.insert(2, mid)             # insert at index (clamped to the ends)
     doc.root.annotations[0].delete()                # remove node
     doc.root.annotations.remove(ann)                # same, by node
     doc.root.annotations.clear()                    # remove all
 ```
+
+`doc.create_node(Type, **fields)` makes a node of a registered type with
+the given field values (defaults fill the rest); it joins the document
+when appended, prepended, inserted, or adopted. A child array such as
+`doc.root.annotations` is a `ChildrenView`: indexable, iterable, sized,
+with the mutators above.
 
 Removal is deletion: a node cannot be detached and kept. To put a node
 somewhere else, move it, which is one operation and does not trip
@@ -206,8 +212,9 @@ reparenting never trips the check. Undo restores deleted nodes with their
 original IDs, so references survive undo and redo.
 
 The index is derived state: it is never serialized, and `Doc.restore`
-rebuilds it. A dump whose references do not resolve fails to restore in
-strict mode and warns otherwise, leaving the field reading as `None`.
+rebuilds it. A dump whose references do not resolve fails to restore
+with `strict_mode=True` (the default, on `Doc(...)` and `Doc.restore`)
+and warns otherwise, leaving the field reading as `None`.
 
 References never cross documents. To point at something outside the
 document — another document's node, a file, an ontology term — use a
@@ -242,8 +249,9 @@ doc.handles(strength="strong")    # [(vol, "data", VoxelData(...))]: the hard
                                   # dependency list, without resolving anything
 ```
 
-`Handle` has `uri`, and optional `media_type` and `digest`; subclasses may
-add fields. Declare `strength` as a plain class attribute, not an
+`Handle` has `uri` (required) and `media_type` and `digest`, which
+default to `""` and are always present in dumps and patches; subclasses
+may add fields. Declare `strength` as a plain class attribute, not an
 annotated field. Strength is exported per field (`handles` in the schema), so a
 service can answer "can I open this?" from the schema and a dump alone.
 
@@ -284,10 +292,15 @@ smallest unit that ships. Documents compose by **adoption**: a subtree
 dumped from one document is inserted into another, keeping its IDs.
 
 ```python
-fragment = scene_doc.dump(scene_doc.root)           # or any node
+fragment = scene_doc.dump(scene_doc.root)           # or any node; a subtree dump feeds adopt, not restore
 with library.transaction():
     [scene] = library.adopt(fragment, library.root, "scenes")
 ```
+
+`adopt(fragments, parent, slot, position="append", target=None)` takes
+one dump or a list of them, inserts them into `slot` of `parent` (which
+must accept the fragment's node type), at the end, at the start, or
+`"before"`/`"after"` a `target` sibling, and returns the new nodes.
 
 Nothing inside the fragment is rewritten — references between its nodes
 stay intact and outside citations of its node IDs remain valid. The only
@@ -378,7 +391,7 @@ doc.to_json()
 
 # Wire format — includes IDs, for dump/restore and operation replay
 wire = doc.dump()
-doc2 = Doc.restore(wire, root_type=Page)
+doc2 = Doc.restore(wire, root_type=Page)   # root_type= (or the class in nodes=) is required
 ```
 
 ### Undo / redo
@@ -389,6 +402,7 @@ with `UndoManagerConfig`:
 ```python
 from atomdoc import Doc, UndoManagerConfig
 
+# UndoManagerConfig has two fields: max_steps (0 disables) and merge_interval (seconds)
 doc = Doc(Page(title="Hello"), undo_manager=UndoManagerConfig(max_steps=100))
 
 with doc.transaction():
@@ -444,9 +458,10 @@ steps.
 
 ```python
 doc.on_change(lambda event: print(
-    "inserted:", event.diff.inserted,
-    "deleted:", event.diff.deleted,
-    "updated:", event.diff.updated,
+    "inserted:", event.diff.inserted,   # set of node IDs
+    "deleted:", event.diff.deleted,     # dict: node ID -> the removed node
+    "moved:", event.diff.moved,         # set of node IDs
+    "updated:", event.diff.updated,     # set of node IDs
 ))
 ```
 
@@ -541,9 +556,9 @@ validation or referential integrity is rejected and kept for a retry.
 Global is right when one user looks at the document through several
 views; under `global`, if `doc.undo_manager` is enabled the session uses
 it, so host and clients share one history (`Session(doc,
-undo_manager=...)` selects that manager explicitly). Otherwise the host's
-own `doc.undo_manager` is separate from the clients' histories.
-`undo_steps=` sizes the per-client histories.
+undo_manager=...)` selects that `UndoManager` instance explicitly).
+Otherwise the host's own `doc.undo_manager` is separate from the clients'
+histories. `undo_steps=` sizes the per-client histories.
 
 ### Wire protocol
 
@@ -551,10 +566,10 @@ Messages from server to client:
 
 | Message | Description |
 |---------|-------------|
-| `schema` | JSON Schema with `x-atomdoc` extensions (sent on connect) |
+| `schema` | The document schema, as `atomdoc_schema()` exports it (sent on connect) |
 | `snapshot` | Full document state (sent on connect) |
-| `patch` | Incremental operations (broadcast after each change). `ref` is the `ref` of the client request that produced it (`null` for a host-side change). `source_client` is set only when the patch is the verbatim echo of that client's `op`; a `create`, `undo` or `redo` result, or an `op` the server recorded differently in any way (a normalizer, a coerced value, a different anchor), has `source_client: null`. An `op` that changes nothing (a move to where the node already is, a write of the value held) is answered with a `patch` to the requester alone at the current version: its `ref`, no ordered operations, and the stored values of the fields it wrote. |
-| `error` | Error response. `code` is `unknown_type` or `invalid_op` for a malformed request, `unsupported` for a request kind the session refuses (undo under `undo="none"`), or `rejected` when a well-formed request is invalid against the current document (a dangling reference, a validation failure, a node that is gone, an unknown `create` position, an undo step that fails validation or referential integrity — one whose targets are merely gone is skipped and consumed). A rejected request is rolled back and not broadcast; the sender of a rejected `op` or `create` then receives a fresh `snapshot` to replace its local copy (an undo step applied nothing on the client, so no snapshot follows; the steps of a multi-step undo before the failing one stand). |
+| `patch` | Incremental operations (broadcast after each change). `ref` is the `ref` of the client request that produced it (`null` for a host-side change). `source_client` is set only when the patch is the verbatim echo of that client's `op`; a `create`, `undo` or `redo` result, or an `op` the server recorded differently in any way (a normalizer, a coerced value, a different anchor), has `source_client: null`. Every request that carries a `ref` is answered: an `op` that changes nothing (a move to where the node already is, a write of the value held), or an undo with nothing left to revert, gets a `patch` to the requester alone at the current version with its `ref`, no ordered operations, and (for an `op`) the stored values of the fields it wrote. |
+| `error` | Error response. `code` is `unknown_type` or `invalid_op` for a malformed request (missing fields, an unknown node type, operation code, field, or `create` position — nothing applied, no snapshot), `unsupported` for a request kind the session refuses (undo under `undo="none"`), or `rejected` when a well-formed request is invalid against the current document (a dangling reference, a validation failure, a node that is gone, an unknown `create` position, an undo step that fails validation or referential integrity — one whose targets are merely gone is skipped and consumed). A rejected request is rolled back and not broadcast; the sender of a rejected `op` or `create` then receives a fresh `snapshot` to replace its local copy (an undo step applied nothing on the client, so no snapshot follows; the steps of a multi-step undo before the failing one stand). |
 
 Messages from client to server:
 
@@ -583,10 +598,14 @@ class MyTransport(Transport):
 
 ## Schema export
 
-`Doc.atomdoc_schema()` produces a JSON Schema document with `x-atomdoc`
-extensions that describe field tiers, slots, and value types. This
-enables language-agnostic clients to understand the document structure
-without importing Python code.
+`Doc.atomdoc_schema()` describes the document to language-agnostic
+clients without importing Python code: `root_type`, and for every node
+type its `json_schema` (a JSON Schema for the node's fields),
+`field_tiers`, `field_defaults`, `slots` (`allowed_type`, the one
+declared type or `null`; `allowed_types`, every type the slot accepts,
+registered subclasses included), `refs`, and `handles`; and every value
+type's `json_schema`, `frozen`, and `handle`. Inheritance is not
+exported: a subclass appears in `allowed_types` where it is accepted.
 
 ```python
 schema = doc.atomdoc_schema()
@@ -765,10 +784,10 @@ doc.parent(ann)
 doc.next_sibling(ann)
 doc.prev_sibling(ann)
 
-for ancestor in doc.ancestors(ann):
+for ancestor in doc.ancestors(ann):     # nearest first; ann itself is not included
     ...
 
-for desc in doc.descendants(doc.root):
+for desc in doc.descendants(doc.root):  # pre-order; the root itself is not included
     ...
 ```
 
@@ -785,6 +804,7 @@ The tier is inferred automatically from the type annotation:
 | **Opaque** | `bytes` | Stored as base64, not diffed or merged. |
 | **Atomic** | union of `frozen=True` models | A tagged union of values. Still one value, replaced as a unit. |
 | **Ref** | `Ref[T]`, `list[Ref[T]]` | A node ID. Replaced as a unit; referential integrity checked at commit. |
+| **Mergeable** | `Literal[...]`, `list[...]`, `tuple[...]`, `dict[str, ...]`, `JsonValue` | One field, one operation: the whole value is written per edit (a list of models serializes each element). |
 
 `Array[T]` is not a field tier: it is a child slot, taken out of the state
 before fields are classified, with its own per-node insert, delete, and
@@ -813,7 +833,7 @@ def register(doc):
 
 ext = Extension(nodes=[Page, Annotation], register=register)
 
-doc = Doc(Document, extensions=[ext])
+doc = Doc(Document, extensions=[ext])   # a root class (fields at their defaults) or an instance
 assert len(doc.root.pages) == 1  # normalizers run on construction
 ```
 
@@ -844,7 +864,9 @@ doc = Doc(Page(), node_id_generator=gen)
 Without `extract_time`, `generate` is used for every node and every ID is
 validated on `Doc.restore`. With `extract_time` (returning milliseconds
 since the epoch), child nodes keep the compact scheme and only the
-document ID is validated.
+document ID is validated. A session accepts whatever node IDs a client
+mints in its `op` frames (a thick client generates its own); only
+uniqueness within the document is enforced.
 
 All peers of a document must use the same ID scheme. Node IDs travel
 inside operations, and a validating generator rejects operations that

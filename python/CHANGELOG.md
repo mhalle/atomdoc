@@ -21,6 +21,22 @@ Fixes from a review of 0.5.0. No wire or schema changes.
   called `id` (or any other AtomNode attribute) silently overrode the
   node API. Members and fields are both checked now.
 - `WebSocketTransport` is exported from `atomdoc`.
+- **`Doc.restore(wire)` without `root_type=`** built a stand-in root
+  class whose fields were unreachable, failing far from the call. It now
+  resolves the root class from `nodes=` or raises a `TypeError`.
+- **An `undo`/`redo` whose step applied nothing** (its targets were
+  gone), or with nothing left to revert, got no reply. Every request
+  that carries a `ref` is now answered: such a request gets an empty
+  `patch` at the current version.
+- **Malformed `op` frames** (an unknown operation code, a field the
+  node's type does not have) were answered as `rejected` with a resync;
+  they are `invalid_op` errors now, with nothing applied and no
+  snapshot.
+- **`allowed_types` omitted subclasses** a slot accepts by isinstance
+  (`Array[Shape]` also holds a registered `Circle`); every accepted type
+  is listed now. `allowed_type` stays the one declared type.
+- An `op` that names the root by its ID is compared as the root spelled
+  `0` when deciding whether its echo is verbatim (`source_client`).
 
 ### Changed
 

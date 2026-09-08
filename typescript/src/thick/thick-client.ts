@@ -22,7 +22,8 @@ import type {
   WireOperations,
 } from "../types.js";
 import type { DocNode } from "./doc-node.js";
-import { LocalDoc } from "./local-doc.js";
+import { LocalDoc, RefIntegrityError } from "./local-doc.js";
+import { descendantsInclusive } from "./local-range.js";
 import { bridgeDocToStore, type StoreBridge } from "./store-bridge.js";
 import { UndoManager } from "./undo-manager.js";
 
@@ -38,6 +39,12 @@ export interface ThickClientOptions {
    * `flushStore()` brings the store up to date on demand.
    */
   coalesce?: boolean;
+  /**
+   * The WebSocket constructor to use. Defaults to the global `WebSocket`
+   * (browsers, Node 22 and later); pass one (the `ws` package, say) on a
+   * runtime without it.
+   */
+  webSocket?: new (url: string) => WebSocket;
 }
 
 /**
@@ -188,7 +195,9 @@ export class ThickAtomDocClient {
   private maxUndoSteps: number;
   private mergeInterval: number;
   private coalesce: boolean;
+  private webSocket: new (url: string) => WebSocket;
   private clientId: string = crypto.randomUUID();
+  private readyCallbacks: Array<() => void> = [];
 
   private bridge: StoreBridge | null = null;
   private docUnsub: (() => void) | null = null;
@@ -216,6 +225,7 @@ export class ThickAtomDocClient {
     this.maxUndoSteps = options.maxUndoSteps ?? 100;
     this.mergeInterval = options.mergeInterval ?? 0;
     this.coalesce = options.coalesce ?? true;
+    this.webSocket = options.webSocket ?? WebSocket;
   }
 
   // --- Lifecycle ---
@@ -230,7 +240,7 @@ export class ThickAtomDocClient {
         previous.close();
         this._wentOffline();
       }
-      const ws = new WebSocket(this.url);
+      const ws = new this.webSocket(this.url);
       this.ws = ws;
 
       ws.onopen = () => {
@@ -298,6 +308,17 @@ export class ThickAtomDocClient {
     if (wasOnline) {
       for (const cb of this.offlineCallbacks) cb();
     }
+  }
+
+  /**
+   * Resolves once the document is loaded: after the schema and snapshot
+   * that follow `connect()`. `connect()` itself resolves when the socket
+   * opens, before either has arrived. Resolves at once if the document
+   * is already loaded.
+   */
+  ready(): Promise<void> {
+    if (this.doc) return Promise.resolve();
+    return new Promise((resolve) => this.readyCallbacks.push(resolve));
   }
 
   // --- State access ---
@@ -403,7 +424,12 @@ export class ThickAtomDocClient {
     return node.id;
   }
 
-  /** Delete a node (and its subtree) once the server confirms. */
+  /**
+   * Delete a node (and its subtree) once the server confirms. A node
+   * that another node still references (from outside the subtree) is
+   * refused here with `RefIntegrityError`, as the server would refuse
+   * it, rather than sent and answered with a resync.
+   */
   deleteNode(nodeId: string): void {
     const doc = this._doc();
     const model = this._pendingModel();
@@ -411,6 +437,17 @@ export class ThickAtomDocClient {
     if (node === doc.root) throw new Error("Root node cannot be deleted");
     if ((!node && !model.inserted.has(nodeId)) || model.gone(nodeId)) {
       throw new Error(`Node not found: ${nodeId}`);
+    }
+    if (node) {
+      const subtree = new Set(descendantsInclusive(node).map((n) => n.id));
+      for (const id of subtree) {
+        for (const referrer of doc.referrers(id)) {
+          if (subtree.has(referrer.id) || model.gone(referrer.id)) continue;
+          throw new RefIntegrityError(
+            `Cannot delete node '${id}': still referenced by ${referrer.type} '${referrer.id}'`,
+          );
+        }
+      }
     }
     this._sendBuilt({ ordered: [[1, nodeId, 0]], state: {} });
   }
@@ -529,7 +566,7 @@ export class ThickAtomDocClient {
   // --- Internal ---
 
   private _doc(): LocalDoc {
-    if (!this.doc) throw new Error("Not connected");
+    if (!this.doc) throw new Error("Document not loaded yet: wait for ready() or onConnected()");
     return this.doc;
   }
 
@@ -662,6 +699,9 @@ export class ThickAtomDocClient {
       this._sendBuilt(ops);
     }
 
+    const ready = this.readyCallbacks;
+    this.readyCallbacks = [];
+    for (const cb of ready) cb();
     for (const cb of this.connectedCallbacks) cb();
     if (isResync) {
       for (const cb of this.resyncCallbacks) cb();

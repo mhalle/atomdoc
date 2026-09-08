@@ -311,3 +311,30 @@ describe("handles and unions", () => {
     expect(() => registry.validate("Override", { value: { kind: "vec", v: "x" }, maybe: 1 })).toThrow();
   });
 });
+
+describe("defineNode: slots, tiers, inlined value types", () => {
+  it("exports single, union, and any-type slots like the Python exporter", () => {
+    const A = defineNode("A", {});
+    const B = defineNode("B", {});
+    const Holder = defineNode("Holder", {}, { slots: { one: "A", either: ["A", "B"], any: null } });
+    const built = buildSchema("Holder", [Holder, A, B]);
+    expect(built.node_types.Holder.slots).toEqual({
+      one: { allowed_type: "A", allowed_types: ["A"] },
+      either: { allowed_type: null, allowed_types: ["A", "B"] },
+      any: { allowed_type: null, allowed_types: [] },
+    });
+  });
+
+  it("defaults a value-typed object field to the atomic tier and inlines required", () => {
+    const Asset = defineValue("Asset", { uri: { type: "string" }, note: { type: "string", default: "" } });
+    const N = defineNode("N", {
+      file: { type: "object", schema: Asset, default: null },
+      tags: { type: "array", items: { type: "string" }, default: [] },
+    });
+    const built = buildSchema("N", [N], [Asset]);
+    expect(built.node_types.N.field_tiers).toEqual({ file: "atomic", tags: "mergeable" });
+    const file = built.node_types.N.json_schema.properties as Record<string, { anyOf: Array<Record<string, unknown>> }>;
+    expect(file.file.anyOf[0].required).toEqual(["uri"]);
+    expect(built.value_types.Asset.json_schema.required).toEqual(["uri"]);
+  });
+});

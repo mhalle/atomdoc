@@ -118,7 +118,7 @@ Sent once on connect. Contains the full document schema.
     referenced node fails). A thick client should keep a reverse index and
     run the same check locally so a violating transaction is rolled back
     before it is sent. The server rejects one that slips through with an
-    `error` (`invalid_op`) and does not broadcast it.
+    `error` (`rejected`, followed by a snapshot) and does not broadcast it.
 - `value_types` — frozen compound types (like Color) that are replaced atomically. A handle type carries `"handle": { "strength": ... }`. A field whose type is a union of value types exports as an inlined `anyOf`/`oneOf` (with a `discriminator` when the server declared one); it is still one atomic value on the wire.
 - `root_type` — the type name of the root node
 
@@ -185,20 +185,24 @@ for a change the host made directly). A request that commits more than
 once (a multi-step `undo`, an `op` a server-side normalizer split) produces
 one `patch` per commit, all carrying the same `ref`. Requests from one
 client are answered strictly in the order they were sent, and every
-request is answered: by its patches, by an `error`, or — for an `op` that
-changed nothing (a move to where the node already is, a write of the value
-already held) — by a `patch` to the requester alone at the *current*
-version, carrying the `ref`, `source_client: null`, no ordered operations,
-and the stored values of the fields the request wrote. A client must
+request that carries a `ref` is answered: by its patches, by an `error`,
+or — when it committed nothing (a move to where the node already is, a
+write of the value already held, an undo with nothing left to revert) —
+by a `patch` to the requester alone at the *current* version, carrying
+the `ref`, `source_client: null`, no ordered operations, and (for an
+`op`) the stored values of the fields the request wrote. A client must
 accept a patch whose version equals its current one.
 
 `source_client` is set only when the patch is the verbatim echo of that
-client's `op`: the commit carries exactly the operations sent. It is
-`null` whenever the commit differs in any way — a `create`, `undo` or
-`redo` result, a value the server coerced (`"7"` sent to an integer
-field), an insert or move the server anchored between different neighbors
-than the request named, a normalizer's additions — and for a host-side
-change. Clients match their requests by `ref`, not by this field. A
+client's `op`: the commit carries exactly the operations sent, with the
+root spelled as `0` (a request naming the root by its ID is compared as
+`0`). It is `null` whenever the commit differs in any way — a `create`,
+`undo` or `redo` result, a value the server coerced (`"7"` sent to an
+integer field), an insert or move whose neighbors the server filled in
+(an append sent as `prev = next = 0` is recorded after the actual last
+node, so it is never verbatim; name the neighbor to get a verbatim echo),
+a normalizer's additions — and for a host-side change. Clients match
+their requests by `ref`, not by this field. A
 client that connects during a commit receives the change either in its
 snapshot or as a patch after it, never both.
 
@@ -215,7 +219,10 @@ Sent to one client when its request could not be applied. Nothing is broadcast.
 `code` is one of:
 
 - `unknown_type` — unrecognized message type.
-- `invalid_op` — malformed request (missing fields, unknown node type).
+- `invalid_op` — malformed request: missing fields, an unknown node
+  type, an unknown operation code, a field the node's type does not
+  have, an unknown `create` position. Nothing was applied and no
+  snapshot follows; resending the same frame will fail the same way.
 - `unsupported` — a request kind this session refuses (`undo`/`redo`
   when the session's undo policy is `none`).
 - `rejected` — a well-formed request that is invalid against the current
@@ -288,8 +295,10 @@ gone (someone else deleted what it would revert) applies as far as it
 can and is consumed: there is nothing left to retry. A step that fails
 validation or referential integrity is answered with an `error` of code
 `rejected` and kept for a retry; no snapshot follows, since the client
-applied nothing itself. A client with nothing to undo gets no reply.
-Thick clients never send these messages (nor `create`): they undo locally
+applied nothing itself. A client with nothing to undo, or whose step
+applied nothing, gets an empty `patch` at the current version carrying
+its `ref` (nothing, if it sent none). Thick clients never send these
+messages (nor `create`): they undo locally
 and send every change as an `op` with client-minted node IDs, because a
 thick client needs an ID before the echo to anchor its next edit. Under the `global` policy an `undo` reverts the
 document's last commit, whoever made it. Under `none` the request is
@@ -677,11 +686,11 @@ per patch. `flush()` on the handle (or `client.flushStore()`) applies the
 queue immediately; disposing the bridge discards it, which is what a
 resync does before loading the new snapshot.
 
-Note that a snapshot omits fields at their default and a `create` patch
-carries a node's full state, so a thin `NodeStore` holds `undefined` for
-a defaulted field of a node that arrived in the snapshot and the default
-value for one created during the session. Read defaults through
-`SchemaRegistry.getDefaults()` rather than comparing raw store state.
+Note that neither a snapshot nor a `create` patch carries fields at
+their default (an insert `op` carries whatever state its sender put in
+it), so a thin `NodeStore` holds `undefined` for a defaulted field. Read
+defaults through `SchemaRegistry.getDefaults()` rather than comparing
+raw store state.
 
 #### 12. Self-Echo Handling
 
