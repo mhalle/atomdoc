@@ -52,6 +52,7 @@ export {
   LocalDoc,
   RefIntegrityError,
   ListenerError,
+  OutOfScopeError,
   UndoManager,
   bridgeDocToStore,
   createNodeIdFactory,

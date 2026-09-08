@@ -21,8 +21,10 @@ import type {
   ServerMsg,
   WireOperations,
 } from "../types.js";
-import type { DocNode } from "./doc-node.js";
-import { LocalDoc, RefIntegrityError } from "./local-doc.js";
+import { OutOfScopeError, type DocNode } from "./doc-node.js";
+import { LocalDoc, RefIntegrityError, type LocalDocOptions } from "./local-doc.js";
+
+const STUB_PARENT = "is a stub: nothing can be inserted under it";
 import { descendantsInclusive } from "./local-range.js";
 import { bridgeDocToStore, type StoreBridge } from "./store-bridge.js";
 import { UndoManager } from "./undo-manager.js";
@@ -400,11 +402,12 @@ export class ThickAtomDocClient {
   /**
    * A node's state with the schema defaults filled in (the document,
    * like a snapshot, omits nothing, but a node created from a patch may
-   * lack defaulted fields), or undefined if the node is absent.
+   * lack defaulted fields), or undefined if the node is absent or a
+   * stub (held by identity only; see `DocNode.stub`).
    */
   getState(nodeId: string): Record<string, unknown> | undefined {
     const node = this.doc?.getNode(nodeId);
-    if (!node) return undefined;
+    if (!node || node.stub) return undefined;
     return { ...(this.rawSchema?.node_types[node.type]?.field_defaults ?? {}), ...node.state };
   }
 
@@ -462,6 +465,7 @@ export class ThickAtomDocClient {
     const model = this._pendingModel();
     if (model.gone(nodeId)) throw new Error(`Node not found: ${nodeId}`);
     const node = doc.getNode(nodeId);
+    if (node?.stub) throw new OutOfScopeError(nodeId);
     const type = node ? node.type : model.inserted.get(nodeId);
     if (!type) throw new Error(`Node not found: ${nodeId}`);
     this._checkField(type, field);
@@ -523,6 +527,7 @@ export class ThickAtomDocClient {
     if ((!node && !model.inserted.has(nodeId)) || model.gone(nodeId)) {
       throw new Error(`Node not found: ${nodeId}`);
     }
+    if (node?.stub) throw new OutOfScopeError(nodeId);
     if (node) {
       const subtree = new Set(descendantsInclusive(node).map((n) => n.id));
       for (const id of subtree) {
@@ -574,6 +579,7 @@ export class ThickAtomDocClient {
     const parentId = key.slice(0, key.indexOf(" "));
     const slot = key.slice(key.indexOf(" ") + 1);
     const parent = doc.getNode(parentId);
+    if (parent?.stub) throw new OutOfScopeError(parent.id, STUB_PARENT);
     if (node && parent) {
       for (let anc: DocNode | null = parent; anc; anc = anc.parent) {
         if (anc === node) throw new Error("Target is descendant of the range");
@@ -683,6 +689,7 @@ export class ThickAtomDocClient {
     let parentType: string;
     if (parent) {
       if (model.gone(parent.id)) throw new Error(`Node not found: ${parentId}`);
+      if (parent.stub) throw new OutOfScopeError(parent.id, STUB_PARENT);
       parentType = parent.type;
     } else {
       const pending = model.inserted.get(parentId);
@@ -703,6 +710,7 @@ export class ThickAtomDocClient {
     if ((!node && !model.inserted.has(nodeId)) || model.gone(nodeId)) {
       throw new Error(`Node not found: ${nodeId}`);
     }
+    if (node?.stub) throw new OutOfScopeError(nodeId);
     return node;
   }
 
@@ -732,7 +740,7 @@ export class ThickAtomDocClient {
 
       case "snapshot":
         if (msg.client_id) this.clientId = msg.client_id;
-        this._initDoc(msg.data, msg.version);
+        this._initDoc(msg.data, msg.version, { partial: msg.partial, stubs: msg.stubs });
         break;
 
       case "patch":
@@ -764,7 +772,7 @@ export class ThickAtomDocClient {
     return entry;
   }
 
-  private _initDoc(snapshot: JsonDoc, version: number): void {
+  private _initDoc(snapshot: JsonDoc, version: number, options: LocalDocOptions = {}): void {
     if (!this.rawSchema) return;
 
     const isResync = this.doc !== null;
@@ -787,7 +795,7 @@ export class ThickAtomDocClient {
     this.applyingRemote = false;
 
     this.version = version;
-    this.doc = new LocalDoc(this.rawSchema, snapshot);
+    this.doc = new LocalDoc(this.rawSchema, snapshot, options);
     this.undoMgr = new UndoManager(this.doc, this.maxUndoSteps, {
       mergeInterval: this.mergeInterval,
       dispatch: (ops, kind, token) => this._dispatchHistory(ops, kind, token),

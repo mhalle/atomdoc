@@ -103,7 +103,7 @@ export function bridgeDocToStore(
   let live = true;
 
   // Initial load
-  store.loadSnapshot(doc.toSnapshot());
+  store.loadSnapshot(doc.toSnapshot(), doc.detachedStubs());
 
   const flush = () => {
     if (cancel) {

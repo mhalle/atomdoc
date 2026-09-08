@@ -116,6 +116,7 @@ function copyInsertedToDiff(
   } else {
     diff.inserted.add(node.id);
   }
+  if (node.stub) return; // a stub has no state to record
   // Record non-default state for the insert op (native JSON values)
   const jsonState: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(node.state)) {
@@ -262,6 +263,8 @@ function copyDeletedToDiff(
     diff.inserted.delete(node.id);
     diff.moved.delete(node.id);
   } else {
+    diff.deleted.set(node.id, node);
+    if (node.stub) return; // a stub has no state to restore
     // Capture current state for undo (native JSON values)
     const currentState: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(node.state)) {
@@ -269,7 +272,6 @@ function copyDeletedToDiff(
     }
     const prevInv = inverseOps.state[node.id] ?? {};
     inverseOps.state[node.id] = { ...currentState, ...prevInv };
-    diff.deleted.set(node.id, node);
   }
 }
 

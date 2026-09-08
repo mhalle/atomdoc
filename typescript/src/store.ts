@@ -81,12 +81,29 @@ export class NodeStore {
 
   // --- Snapshot loading ---
 
-  loadSnapshot(data: JsonDoc): void {
+  /**
+   * Replace the store's contents with a snapshot. `stubs` lists the
+   * stubs of a partial snapshot that have no place in the tree
+   * (reference targets outside every held chain), as `[id, type]`.
+   */
+  loadSnapshot(data: JsonDoc, stubs: [string, string][] = []): void {
     const previous = [...this.nodes.keys()];
     this.batch(() => {
       this.nodes.clear();
       this.rootId = data[0];
       this._loadNode(data, null, null);
+      for (const [id, type] of stubs) {
+        if (this.nodes.has(id)) continue;
+        this.nodes.set(id, {
+          id,
+          type,
+          state: {},
+          slots: {},
+          parentId: null,
+          slotName: null,
+          stub: true,
+        });
+      }
       // Every node that existed before or exists now has (potentially)
       // changed: a resync must reach every subscriber.
       for (const id of new Set([...previous, ...this.nodes.keys()])) {
@@ -114,14 +131,16 @@ export class NodeStore {
         }
       }
 
-      this.nodes.set(id, {
+      const node: StoreNode = {
         id,
         type,
-        state: { ...state },
+        state: state === null ? {} : { ...state },
         slots,
         parentId: pid,
         slotName: sname,
-      });
+      };
+      if (state === null) node.stub = true;
+      this.nodes.set(id, node);
     }
   }
 

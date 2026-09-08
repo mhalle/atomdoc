@@ -4,6 +4,23 @@
 
 ### Added
 
+- Stubs, the client half of partial replication (the server side
+  follows): a node a scoped client holds by identity only. A snapshot
+  carries a stub as `[id, type, null]` with only the children the client
+  holds; `SnapshotMsg.partial` marks a scoped view and
+  `SnapshotMsg.stubs` lists reference targets that have no place in the
+  tree. `DocNode.stub` is true for one, and its `state` throws
+  `OutOfScopeError` on every access: a stub never reads as an empty
+  node. `StoreNode.stub` carries the flag to the store, where `state` is
+  `{}`; `getState()` on either client returns undefined for a stub, so
+  renderers check the flag. References may point at stubs. A local edit
+  may not write a stub, delete or move one, or insert or move under one
+  (`OutOfScopeError`, before anything is sent); a stub may be the
+  neighbor a held node lands beside, and a held node goes with its stub
+  descendants. `LocalDoc.partial`, `LocalDoc.detachedStubs()`,
+  `NodeStore.loadSnapshot(data, stubs)`, and the `fillStub` / `makeStub`
+  helpers for the scope changes to come. A whole-document client is
+  unaffected.
 - `onSchemaMismatch: "adopt" | "disconnect"` on the thick client. The
   default adopts the new schema and reports it; `"disconnect"` refuses
   the reconnect, keeps the old schema and document, closes the socket,

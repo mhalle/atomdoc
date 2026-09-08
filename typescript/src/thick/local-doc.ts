@@ -12,7 +12,8 @@ import type {
   RefDef,
   WireOperations,
 } from "../types.js";
-import { createDocNode, resetDocNode, type DocNode } from "./doc-node.js";
+import { createDocNode, resetDocNode, OutOfScopeError, type DocNode } from "./doc-node.js";
+export { OutOfScopeError } from "./doc-node.js";
 import {
   createOpsAccumulator,
   createDiff,
@@ -87,6 +88,7 @@ function refIds(value: unknown): string[] {
 }
 
 const REF_SEP = "\u0000";
+const STUB_PARENT = "is a stub: nothing can be inserted under it";
 
 function copyState(
   state: Record<string, Record<string, unknown>>,
@@ -107,10 +109,24 @@ function isMapField(jsonSchema: Record<string, unknown> | undefined, field: stri
   );
 }
 
+/** Options for {@link LocalDoc}. */
+export interface LocalDocOptions {
+  /** The snapshot is a scoped view (see `SnapshotMsg.partial`). */
+  partial?: boolean;
+  /** Stubs for reference targets outside every held chain, `[id, type]`. */
+  stubs?: [string, string][];
+}
+
 export class LocalDoc {
   readonly id: string;
   readonly root: DocNode;
+  /** Every node the document holds, stubs included. */
   readonly nodeMap: Map<string, DocNode>;
+  /**
+   * True when the document is a scoped view of a larger one: some nodes
+   * are stubs (`DocNode.stub`), held by identity only.
+   */
+  readonly partial: boolean;
 
   _lifecycleStage: LifecycleStage = "idle";
   _forwardOps: OpsAccumulator = createOpsAccumulator();
@@ -132,15 +148,20 @@ export class LocalDoc {
    * Derived state — never serialized, rebuilt from a snapshot.
    */
   private refIndex = new Map<string, Set<string>>();
+  /**
+   * True while operations from the server (or a rollback) are applied:
+   * they may delete stubs and place nodes beside them, which a local
+   * edit may not.
+   */
+  private applyingRemote = false;
 
-  constructor(schema: AtomDocSchema, snapshot: JsonDoc) {
+  constructor(schema: AtomDocSchema, snapshot: JsonDoc, options: LocalDocOptions = {}) {
     this.schema = schema;
     this.id = snapshot[0];
     this.nodeMap = new Map();
     this.idGen = createNodeIdFactory(this.id);
 
     // Build root
-    const rootType = snapshot[1];
     this.root = this._createNodeFromJson(snapshot);
     this.nodeMap.set(this.root.id, this.root);
 
@@ -148,6 +169,18 @@ export class LocalDoc {
     if (snapshot[3]) {
       this._loadSlots(this.root, snapshot[3]);
     }
+    for (const [id, type] of options.stubs ?? []) {
+      if (this.nodeMap.has(id)) continue;
+      this.nodeMap.set(id, createDocNode(id, type, this._slotOrderFor(type), true));
+    }
+    let anyStub = false;
+    for (const node of this.nodeMap.values()) {
+      if (node.stub) {
+        anyStub = true;
+        break;
+      }
+    }
+    this.partial = options.partial === true || anyStub;
     this._rebuildRefIndex();
   }
 
@@ -155,6 +188,21 @@ export class LocalDoc {
 
   getNode(id: string): DocNode | undefined {
     return this.nodeMap.get(id);
+  }
+
+  /**
+   * Stubs that have no place in the tree: reference targets outside
+   * every held chain, as `[id, type]` (the `stubs` list of a partial
+   * snapshot).
+   */
+  detachedStubs(): [string, string][] {
+    const result: [string, string][] = [];
+    for (const node of this.nodeMap.values()) {
+      if (node.stub && node.parent === null && node !== this.root) {
+        result.push([node.id, node.type]);
+      }
+    }
+    return result;
   }
 
   // --- References ---
@@ -196,6 +244,7 @@ export class LocalDoc {
       strength: "weak" | "strong";
     }> = [];
     for (const node of this.nodeMap.values()) {
+      if (node.stub) continue;
       const defs: Record<string, HandleDef> = this.schema.node_types[node.type]?.handles ?? {};
       for (const [field, def] of Object.entries(defs)) {
         if (strength !== undefined && def.strength !== strength) continue;
@@ -231,6 +280,7 @@ export class LocalDoc {
   }
 
   private _refsAdd(node: DocNode): void {
+    if (node.stub) return;
     for (const field of Object.keys(this._refDefsFor(node.type))) {
       for (const targetId of refIds(node.state[field])) {
         this._refIndexAdd(targetId, node.id, field);
@@ -239,6 +289,7 @@ export class LocalDoc {
   }
 
   private _refsRemove(node: DocNode): void {
+    if (node.stub) return;
     for (const field of Object.keys(this._refDefsFor(node.type))) {
       for (const targetId of refIds(node.state[field])) {
         this._refIndexDiscard(targetId, node.id, field);
@@ -286,7 +337,7 @@ export class LocalDoc {
     const diff = this._diff;
     for (const nodeId of [...diff.inserted, ...diff.updated]) {
       const node = this.nodeMap.get(nodeId);
-      if (!node) continue;
+      if (!node || node.stub) continue;
       for (const [field, rdef] of Object.entries(this._refDefsFor(node.type))) {
         for (const targetId of refIds(node.state[field])) {
           const target = this.nodeMap.get(targetId);
@@ -346,6 +397,7 @@ export class LocalDoc {
   setNodeState(nodeId: string, key: string, value: unknown): void {
     const node = this.nodeMap.get(nodeId);
     if (!node) throw new Error(`Node not found: ${nodeId}`);
+    if (node.stub) throw new OutOfScopeError(nodeId);
     this._checkField(node.type, key);
 
     withTransaction(this, () => {
@@ -373,6 +425,16 @@ export class LocalDoc {
     withTransaction(this, () => {
       if (!parent.slotFirst.has(slotName)) {
         throw new Error(`Slot '${slotName}' does not exist on ${parent.type}`);
+      }
+      if (!this.applyingRemote) {
+        // A local edit works on held nodes only: nothing goes under a
+        // stub, and a stub is never made locally.
+        if (parent.stub) throw new OutOfScopeError(parent.id, STUB_PARENT);
+        for (const top of nodes) {
+          for (const desc of descendantsInclusive(top)) {
+            if (desc.stub) throw new OutOfScopeError(desc.id);
+          }
+        }
       }
       // The parent (and the sibling target) must be the live objects for
       // their IDs: a stale handle to a deleted-and-restored node would
@@ -480,6 +542,13 @@ export class LocalDoc {
       if (range[range.length - 1] !== end) {
         throw new Error(`Node '${end.id}' is not a later sibling of '${start.id}'`);
       }
+      if (!this.applyingRemote) {
+        // Only the server deletes a stub; a held node goes with its
+        // whole subtree, stub descendants included.
+        for (const node of range) {
+          if (node.stub) throw new OutOfScopeError(node.id);
+        }
+      }
 
       onDeleteRange(
         this._diff, this._forwardOps, this._inverseOps,
@@ -578,6 +647,14 @@ export class LocalDoc {
     for (let anc = newParent.parent; anc; anc = anc.parent) {
       if (range.includes(anc)) throw new Error("Target is descendant of the range");
     }
+    if (!this.applyingRemote) {
+      // Held nodes move between held parents; a stub may be the
+      // neighbor they land beside.
+      for (const node of range) {
+        if (node.stub) throw new OutOfScopeError(node.id);
+      }
+      if (newParent.stub) throw new OutOfScopeError(newParent.id, STUB_PARENT);
+    }
 
     onMoveRange(
       this._diff, this._forwardOps, this._inverseOps,
@@ -631,6 +708,16 @@ export class LocalDoc {
    * maintained on every path.
    */
   private _applyOps(ops: WireOperations): void {
+    const wasRemote = this.applyingRemote;
+    this.applyingRemote = true;
+    try {
+      this._applyOpsInner(ops);
+    } finally {
+      this.applyingRemote = wasRemote;
+    }
+  }
+
+  private _applyOpsInner(ops: WireOperations): void {
     for (const op of ops.ordered) {
       {
         if (op[0] === 0) {
@@ -708,6 +795,10 @@ export class LocalDoc {
     for (const [nodeId, patches] of Object.entries(ops.state)) {
       const node = this.nodeMap.get(nodeId);
       if (!node) continue;
+      // The server sends no state for a stub; a patch that does is a
+      // protocol error, and applying it would make the stub read as
+      // partially known.
+      if (node.stub) throw new OutOfScopeError(nodeId, "is a stub: a patch carried state for it");
       const defaults = this.schema.node_types[node.type]?.field_defaults ?? {};
       for (const [key, value] of Object.entries(patches)) {
         this._checkField(node.type, key);
@@ -877,6 +968,7 @@ export class LocalDoc {
   }
 
   private _applyDefaults(node: DocNode): void {
+    if (node.stub) return;
     const defaults = this.schema.node_types[node.type]?.field_defaults;
     if (!defaults) return;
     for (const [k, v] of Object.entries(defaults)) {
@@ -917,6 +1009,7 @@ export class LocalDoc {
   private _createNodeFromJson(data: JsonDoc): DocNode {
     const [id, type, state] = data;
     const slotOrder = this._slotOrderFor(type);
+    if (state === null) return createDocNode(id, type, slotOrder, true);
     const node = createDocNode(id, type, slotOrder);
     for (const [k, v] of Object.entries(state)) {
       node.state[k] = v;
@@ -972,7 +1065,19 @@ export class LocalDoc {
    * document order as they are visited.
    */
   private _nodeToWire(root: DocNode): JsonDoc {
+    const hasChildren = (node: DocNode): boolean =>
+      node.slotOrder.some((slotName) => (node.slotFirst.get(slotName) ?? null) !== null);
     const entryFor = (node: DocNode): JsonDoc => {
+      if (node.stub) {
+        // A stub carries no state and lists only the children it holds.
+        const result: JsonDoc = [node.id, node.type, null];
+        if (hasChildren(node)) {
+          const slots: Record<string, JsonDoc[]> = {};
+          for (const slotName of node.slotOrder) slots[slotName] = [];
+          result.push(slots);
+        }
+        return result;
+      }
       const state: Record<string, unknown> = {};
       const defaults = this.schema.node_types[node.type]?.field_defaults ?? {};
       for (const [k, v] of Object.entries(node.state)) {
@@ -995,7 +1100,8 @@ export class LocalDoc {
       const [node, into, entry] = stack.pop()!;
       if (into) into.push(entry);
       if (node.slotOrder.length === 0) continue;
-      const slots = entry[3]!;
+      const slots = entry[3];
+      if (!slots) continue;
       const pending: Array<[DocNode, JsonDoc[] | null, JsonDoc]> = [];
       for (const slotName of node.slotOrder) {
         let child = node.slotFirst.get(slotName) ?? null;

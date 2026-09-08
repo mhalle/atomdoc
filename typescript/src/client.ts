@@ -85,11 +85,12 @@ export class AtomDocClient {
 
   /**
    * A node's state with the schema defaults filled in (a snapshot and
-   * a patch omit fields at their default), or undefined if absent.
+   * a patch omit fields at their default), or undefined if the node is
+   * absent or a stub (held by identity only; see `StoreNode.stub`).
    */
   getState(nodeId: string): Record<string, unknown> | undefined {
     const node = this.store.getNode(nodeId);
-    if (!node) return undefined;
+    if (!node || node.stub) return undefined;
     return { ...(this.schema?.getDefaults(node.type) ?? {}), ...node.state };
   }
 
@@ -202,7 +203,7 @@ export class AtomDocClient {
 
       case "snapshot":
         this.version = msg.version;
-        this.store.loadSnapshot(msg.data);
+        this.store.loadSnapshot(msg.data, msg.stubs);
         for (const cb of this.connectedCallbacks) cb();
         break;
 

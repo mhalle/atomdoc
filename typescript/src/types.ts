@@ -18,6 +18,13 @@ export interface StoreNode {
   slots: Record<string, string[]>;
   parentId: string | null;
   slotName: string | null;
+  /**
+   * True for a node a scoped client holds by identity only (an ancestor
+   * of its scope, a reference target outside it, a child past its depth):
+   * `state` is empty and says nothing about the node. A renderer must
+   * check this flag; `getState()` returns undefined for a stub.
+   */
+  stub?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -75,6 +82,13 @@ export interface SnapshotMsg {
   version: number;
   data: JsonDoc;
   client_id?: string;
+  /** True when `data` is a scoped view: stubs stand in for unheld nodes. */
+  partial?: boolean;
+  /**
+   * Stubs for reference targets outside every held chain, as `[id, type]`;
+   * they have no place in `data`.
+   */
+  stubs?: [string, string][];
 }
 
 export interface PatchMsg {
@@ -201,10 +215,15 @@ export interface AtomDocSchema {
 // Snapshot wire format
 // ---------------------------------------------------------------------------
 
-/** [id, type, {state}, {slotName: [children...]}?] */
+/**
+ * [id, type, {state}, {slotName: [children...]}?]
+ *
+ * A stub (see {@link StoreNode.stub}) has `null` in place of its state
+ * and lists only the children the client holds, if any.
+ */
 export type JsonDoc = [
   string,
   string,
-  Record<string, unknown>,
+  Record<string, unknown> | null,
   Record<string, JsonDoc[]>?,
 ];
