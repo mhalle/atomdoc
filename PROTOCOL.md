@@ -611,12 +611,24 @@ mid-slot restores it at the end.
 Projects LocalDoc changes into the NodeStore:
 
 ```
-bridgeDocToStore(doc, store):
+bridgeDocToStore(doc, store, {coalesce = true}):
   store.loadSnapshot(doc.toSnapshot())
-  doc.onChange(event => applyPatch(store, event.operations))
+  doc.onChange(event =>
+    if coalesce: queue event.operations; schedule flush on the next frame
+    else: applyPatch(store, event.operations))
+  flush():
+    store.batch(for ops in queue: applyPatch(store, ops))
 ```
 
-Reuses the same `applyPatch` as the thin client.
+Reuses the same `applyPatch` as the thin client. The document is always
+current; the store is the UI's view of it and, by default, catches up
+once per animation frame (`requestAnimationFrame`, with a short timer
+fallback so a hidden tab still flushes; a macrotask where there is no
+frame API). A device streaming patches or a transaction touching many
+nodes therefore notifies each subscriber once per frame rather than once
+per patch. `flush()` on the handle (or `client.flushStore()`) applies the
+queue immediately; disposing the bridge discards it, which is what a
+resync does before loading the new snapshot.
 
 Note that a snapshot omits fields at their default and a `create` patch
 carries a node's full state, so a thin `NodeStore` holds `undefined` for

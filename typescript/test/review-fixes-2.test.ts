@@ -358,6 +358,7 @@ describe("second review: thick client", () => {
         operations: { ordered: [], state: { a: { name: "A-normalized" } } },
       });
       expect(c.getDoc()!.getNode("a")!.state.name).toBe("A-normalized");
+      c.flushStore();
       expect(c.getStore().getNode("a")!.state.name).toBe("A-normalized");
       // Another client's change arrives before our second echo.
       ws.deliver({
@@ -436,6 +437,7 @@ describe("second review: thick client", () => {
         operations: { ordered: [], state: { a: { name: "mine" } } },
       });
       expect(c.getDoc()!.getNode("a")!.state.name).toBe("mine");
+      c.flushStore();
       expect(c.getStore().getNode("a")!.state.name).toBe("mine");
       expect(sentOps(ws).length).toBe(1); // the reconcile is not sent back
       expect(c.getUndoManager()!.canUndo).toBe(true); // and not a new undo step

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The thick client updates its `NodeStore` once per animation frame
+  (`setTimeout(0)` outside a browser, with a 100 ms fallback for hidden
+  tabs) instead of after every document change. The local document is
+  always current; `client.flushStore()` applies queued store updates
+  now, and `coalesce: false` restores synchronous updates.
+  `bridgeDocToStore` takes the same option and returns a handle with
+  `flush()`, `dispose()`, and `pending`; calling the handle still
+  disconnects.
+
 ## 0.4.7
 
 No changes; released in step with atomdoc 0.4.7.

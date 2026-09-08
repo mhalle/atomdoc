@@ -56,6 +56,8 @@ export {
   createNodeIdFactory,
   mergeOperations,
   type ThickClientOptions,
+  type StoreBridge,
+  type StoreBridgeOptions,
   type ChangeEvent,
   type DocNode,
   type Diff,

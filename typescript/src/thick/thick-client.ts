@@ -20,7 +20,7 @@ import type {
   WireOperations,
 } from "../types.js";
 import { LocalDoc, type ChangeEvent } from "./local-doc.js";
-import { bridgeDocToStore } from "./store-bridge.js";
+import { bridgeDocToStore, type StoreBridge } from "./store-bridge.js";
 import { UndoManager } from "./undo-manager.js";
 
 export interface ThickClientOptions {
@@ -29,6 +29,12 @@ export interface ThickClientOptions {
   maxUndoSteps?: number;
   /** Merge consecutive local transactions within this many ms into one undo step. Default 0. */
   mergeInterval?: number;
+  /**
+   * Update the store once per animation frame (default) rather than
+   * after every document change. The document itself is always current;
+   * `flushStore()` brings the store up to date on demand.
+   */
+  coalesce?: boolean;
 }
 
 /**
@@ -82,9 +88,10 @@ export class ThickAtomDocClient {
   private url: string;
   private maxUndoSteps: number;
   private mergeInterval: number;
+  private coalesce: boolean;
   private clientId: string = crypto.randomUUID();
 
-  private bridgeUnsub: (() => void) | null = null;
+  private bridge: StoreBridge | null = null;
   private docUnsub: (() => void) | null = null;
   private online = false;
   /**
@@ -116,6 +123,7 @@ export class ThickAtomDocClient {
     this.url = options.url;
     this.maxUndoSteps = options.maxUndoSteps ?? 100;
     this.mergeInterval = options.mergeInterval ?? 0;
+    this.coalesce = options.coalesce ?? true;
   }
 
   // --- Lifecycle ---
@@ -202,6 +210,15 @@ export class ThickAtomDocClient {
 
   getStore(): NodeStore {
     return this.store;
+  }
+
+  /**
+   * Apply to the store every document change still queued for the next
+   * frame. The store is otherwise updated once per frame; read it after
+   * this to see an edit made a moment ago.
+   */
+  flushStore(): void {
+    this.bridge?.flush();
   }
 
   getSchema(): SchemaRegistry | null {
@@ -372,7 +389,7 @@ export class ThickAtomDocClient {
     // Clean up previous doc. Anything in flight was either acknowledged
     // (and is in the snapshot) or rejected (and is not): the server
     // answered every request it received before taking this snapshot.
-    if (this.bridgeUnsub) this.bridgeUnsub();
+    if (this.bridge) this.bridge.dispose();
     if (this.docUnsub) this.docUnsub();
     if (this.undoMgr) this.undoMgr.dispose();
     this.pendingOps = [];
@@ -383,7 +400,7 @@ export class ThickAtomDocClient {
     this.undoMgr = new UndoManager(this.doc, this.maxUndoSteps, {
       mergeInterval: this.mergeInterval,
     });
-    this.bridgeUnsub = bridgeDocToStore(this.doc, this.store);
+    this.bridge = bridgeDocToStore(this.doc, this.store, { coalesce: this.coalesce });
 
     // Forward local changes to server (skip if we're applying a remote patch)
     this.docUnsub = this.doc.onChange((event) => {

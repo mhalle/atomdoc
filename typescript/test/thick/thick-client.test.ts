@@ -35,8 +35,8 @@ const snapshot: JsonDoc = [
   { items: [["i1", "Item", { label: "First" }]] },
 ];
 
-function setupClient(): ThickAtomDocClient {
-  const client = new ThickAtomDocClient({ url: "ws://unused" });
+function setupClient(options: { coalesce?: boolean } = { coalesce: false }): ThickAtomDocClient {
+  const client = new ThickAtomDocClient({ url: "ws://unused", ...options });
   client._injectMessage({ type: "schema", schema } as SchemaMsg);
   client._injectMessage({
     type: "snapshot",
@@ -170,9 +170,59 @@ describe("ThickAtomDocClient", () => {
   });
 });
 
+describe("ThickAtomDocClient store coalescing", () => {
+  it("updates the store once per frame by default", async () => {
+    const client = setupClient({});
+    const store = client.getStore();
+    const rootId = store.getRootId();
+    const notified = vi.fn();
+    store.subscribe(rootId, notified);
+
+    client.setField(rootId, "title", "A");
+    client.setField(rootId, "title", "B");
+    client.setField(rootId, "title", "C");
+    // The document is current; the store waits for the frame.
+    expect(client.getDoc()!.root.state.title).toBe("C");
+    expect(store.getRoot()!.state.title).toBe("Hello");
+    expect(notified).not.toHaveBeenCalled();
+
+    await new Promise((r) => setTimeout(r, 5));
+    expect(store.getRoot()!.state.title).toBe("C");
+    expect(notified).toHaveBeenCalledTimes(1);
+  });
+
+  it("flushStore brings the store up to date now", () => {
+    const client = setupClient({});
+    const store = client.getStore();
+    client.createNode("Item", { label: "New" }, store.getRootId(), "items");
+    client.deleteNode("i1");
+    expect(store.getNode("i1")).toBeDefined();
+    client.flushStore();
+    expect(store.getNode("i1")).toBeUndefined();
+    expect(store.getChildren(store.getRootId(), "items").length).toBe(1);
+  });
+
+  it("a resync discards queued store updates", async () => {
+    const client = setupClient({});
+    const store = client.getStore();
+    const rootId = store.getRootId();
+    // Online with a socket that swallows sends: the edit is in flight,
+    // not buffered for replay after the snapshot.
+    (client as unknown as { online: boolean; ws: unknown }).online = true;
+    (client as unknown as { ws: unknown }).ws = { send() {} };
+    client.setField(rootId, "title", "stale");
+    const corrected: JsonDoc = [rootId, "Page", { title: "server" }, { items: [] }];
+    client._injectMessage({ type: "snapshot", doc_id: rootId, version: 2, data: corrected });
+    expect(store.getRoot()!.state.title).toBe("server");
+    await new Promise((r) => setTimeout(r, 5));
+    expect(store.getRoot()!.state.title).toBe("server");
+    expect(store.getNode("i1")).toBeUndefined();
+  });
+});
+
 describe("ThickAtomDocClient resync", () => {
   it("rebuilds the document from a second snapshot and drops pending ops", () => {
-    const client = new ThickAtomDocClient({ url: "ws://test" });
+    const client = new ThickAtomDocClient({ url: "ws://test", coalesce: false });
     client._injectMessage({ type: "schema", schema });
     client._injectMessage({
       type: "snapshot",

@@ -10,7 +10,7 @@ export {
   ThickAtomDocClient,
   type ThickClientOptions,
 } from "./thick-client.js";
-export { bridgeDocToStore } from "./store-bridge.js";
+export { bridgeDocToStore, type StoreBridge, type StoreBridgeOptions } from "./store-bridge.js";
 export {
   createNodeIdFactory,
   numberToBase64,

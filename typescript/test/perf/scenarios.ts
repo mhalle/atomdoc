@@ -18,6 +18,18 @@ export function timed(fn: () => void): number {
   return (performance.now() - t0) / 1000;
 }
 
+/**
+ * A UI as a store sees it: one subscriber per node that re-renders it
+ * (stood in for by serializing the node), and a list view that re-reads
+ * the root's child list on any change.
+ */
+function subscribeUi(store: NodeStore, ids: string[]): void {
+  let sink = 0;
+  for (const id of ids) store.subscribe(id, () => { sink += JSON.stringify(store.getNode(id)).length; });
+  store.subscribeAll(() => { sink += store.getChildren(store.getRootId(), "volumes").length; });
+  void sink;
+}
+
 export const scenarios: Record<string, Scenario> = {
   load_snapshot: {
     desc: "new LocalDoc from a 2n+1 node snapshot",
@@ -46,6 +58,37 @@ export const scenarios: Record<string, Scenario> = {
       return timed(() => {
         for (let i = 0; i < n; i++) {
           doc.insertIntoSlot(doc.root, "volumes", "append", [doc.createNode("Volume", { name: `v${i}` })]);
+        }
+      });
+    },
+  },
+  device_burst_to_store: {
+    desc: "n one-field patches on 16 hot nodes through the coalescing bridge, one flush; subscribed UI",
+    run: (n) => {
+      const doc = new LocalDoc(schema, makeSnapshot(n));
+      const store = new NodeStore();
+      const bridge = bridgeDocToStore(doc, store);
+      const ids = getSlotChildren(doc.root, "volumes").map((v) => v.id);
+      subscribeUi(store, ids);
+      return timed(() => {
+        for (let i = 0; i < n; i++) {
+          doc.applyOperations({ ordered: [], state: { [ids[i % 16]]: { window: i } } }, { skipUndo: true });
+        }
+        bridge.flush();
+      });
+    },
+  },
+  device_burst_sync_store: {
+    desc: "same, store updated after every patch (coalesce: false)",
+    run: (n) => {
+      const doc = new LocalDoc(schema, makeSnapshot(n));
+      const store = new NodeStore();
+      bridgeDocToStore(doc, store, { coalesce: false });
+      const ids = getSlotChildren(doc.root, "volumes").map((v) => v.id);
+      subscribeUi(store, ids);
+      return timed(() => {
+        for (let i = 0; i < n; i++) {
+          doc.applyOperations({ ordered: [], state: { [ids[i % 16]]: { window: i } } }, { skipUndo: true });
         }
       });
     },

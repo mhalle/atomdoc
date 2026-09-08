@@ -320,8 +320,16 @@ const client = new ThickAtomDocClient({
   url: "ws://localhost:8765",
   maxUndoSteps: 100,          // optional, default 100; 0 disables undo
   mergeInterval: 500,         // optional ms, default 0; collapses quick edits into one undo step
+  coalesce: true,             // optional, default true; store updates once per animation frame
 });
 ```
+
+The local document is always current. The store, which the UI
+subscribes to, is updated once per animation frame (a macrotask outside a
+browser), so a burst of patches from a device or a transaction touching
+many nodes notifies each subscriber once. `client.flushStore()` applies
+queued changes now, for code that reads the store right after an edit;
+`coalesce: false` restores synchronous store updates.
 
 #### Same Read API
 

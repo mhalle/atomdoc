@@ -227,6 +227,7 @@ describe("review fixes: store and client", () => {
       operations: { ordered: [], state: { n3: { name: "good" } } },
     });
     expect(c.getDoc()!.getNode("n3")!.state.name).toBe("good");
+    c.flushStore();
     expect(c.getStore().getNode("n3")!.state.name).toBe("good");
     expect(sent.length).toBe(2); // the echo was not re-sent
   });
