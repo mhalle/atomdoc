@@ -870,3 +870,116 @@ def test_websocket_client_reads_partial_from_the_url():
     assert WebSocketClient(ws("/?partial=0")).wants_partial is False
     assert WebSocketClient(ws(None)).wants_partial is False
     assert WebSocketClient(SimpleNamespace()).wants_partial is False
+
+
+# --- Escapes found by an adversarial client ---
+
+
+@pytest.mark.asyncio
+async def test_range_delete_and_move_need_every_node_held():
+    # Anchored on i1 and i3 (depth 0) but not on i2, which lies between them.
+    session, transport, full, part, ids = await scoped_session([{"id": "i1", "depth": 0}])
+    await transport.send(part, {
+        "type": MSG_SCOPE, "ref": "s", "anchors": [{"id": ids["i1"].id, "depth": 0}, {"id": ids["i2"].id, "depth": 0}],
+    })
+    part.messages.clear()
+    with session.doc.transaction():
+        middle = session.doc.create_node(Item, label="middle")
+        ids["i1"].insert_after(middle)
+    part.messages.clear()
+    for ordered in (
+        [[1, ids["i1"].id, ids["i2"].id]],
+        [[2, ids["i1"].id, ids["i2"].id, ids["s1"].id, "items", 0, 0]],
+    ):
+        await transport.send(part, {"type": MSG_OP, "ref": "r", "operations": {"ordered": ordered, "state": {}}})
+        assert part.messages[0]["code"] == "out_of_scope", ordered
+        part.messages.clear()
+    assert session.doc.get_node_by_id(middle.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_neighbor_must_lie_in_the_declared_slot():
+    # s1 references i3 (under s2, unheld): a move "after i3" would land
+    # in s2 while declaring s1.
+    session, transport, full, part, ids = await scoped_session([{"id": "s1"}])
+    await transport.send(part, {
+        "type": MSG_OP, "ref": "r",
+        "operations": {"ordered": [[2, ids["i1"].id, 0, ids["s1"].id, "items", ids["i3"].id, 0]], "state": {}},
+    })
+    assert part.messages[0]["code"] == "out_of_scope"
+    assert ids["i1"]._parent is ids["s1"]
+    part.messages.clear()
+    await transport.send(part, {
+        "type": MSG_CREATE, "ref": "c", "node_type": "Item", "state": {},
+        "parent_id": ids["s1"].id, "slot": "items", "position": "after", "target_id": ids["i3"].id,
+    })
+    assert part.messages[0]["code"] == "out_of_scope"
+
+
+@pytest.mark.asyncio
+async def test_whole_document_client_move_with_a_stale_neighbor_is_rejected():
+    # Not scope-specific: a neighbor that moved to another slot makes the
+    # request stale instead of redirecting the node there.
+    session, transport, full, part, ids = await scoped_session([{"id": "s1"}])
+    await transport.send(full, {
+        "type": MSG_OP, "ref": "f",
+        "operations": {"ordered": [[2, ids["i1"].id, 0, ids["s1"].id, "items", ids["i3"].id, 0]], "state": {}},
+    })
+    assert [m["type"] for m in full.messages] == [MSG_ERROR, MSG_SNAPSHOT]
+    assert full.messages[0]["code"] == "rejected"
+    assert ids["i1"]._parent is ids["s1"]
+
+
+@pytest.mark.asyncio
+async def test_rejection_messages_do_not_name_unheld_nodes():
+    # Deleting i3 (held in full under s2) is refused because s1, which the
+    # client does not hold, references it.
+    session, transport, full, part, ids = await scoped_session([{"id": "s2"}])
+    await transport.send(part, {
+        "type": MSG_OP, "ref": "r", "operations": {"ordered": [[1, ids["i3"].id, 0]], "state": {}},
+    })
+    err = part.messages[0]
+    assert err["code"] == "rejected"
+    assert ids["s1"].id not in err["message"]
+    assert "outside your scope" in err["message"]
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_id_cannot_be_squatted():
+    session, transport, full, part, ids = await scoped_session([{"id": "s1"}])
+    await transport.send(full, {
+        "type": MSG_OP, "ref": "f", "operations": {"ordered": [[1, ids["n3"].id, 0]], "state": {}},
+    })
+    part.messages.clear()
+    await transport.send(part, {
+        "type": MSG_OP, "ref": "r",
+        "operations": {"ordered": [[0, [[ids["n3"].id, "Item"]], ids["s1"].id, "items", 0, 0]], "state": {}},
+    })
+    assert part.messages[0]["code"] == "out_of_scope"
+    # The other client's undo still works.
+    full.messages.clear()
+    await transport.send(full, {"type": MSG_UNDO, "ref": "u"})
+    assert full.messages[0]["type"] == MSG_PATCH
+    assert session.doc.get_node_by_id(ids["n3"].id) is not None
+
+
+@pytest.mark.asyncio
+async def test_global_undo_is_not_for_scoped_clients():
+    doc, ids = build_doc()
+    session = Session(doc, undo="global")
+    transport = MockTransport()
+    await session.bind(transport)
+    part = MockClient("part", partial=True)
+    await transport.connect(part)
+    await transport.send(part, {"type": MSG_SCOPE, "ref": "s", "anchors": [{"id": ids["s1"].id}]})
+    part.messages.clear()
+    await transport.send(part, {"type": MSG_UNDO, "ref": "u"})
+    assert part.messages[0]["code"] == "unsupported"
+
+
+@pytest.mark.asyncio
+async def test_malformed_create_is_invalid_op():
+    session, transport, full, part, ids = await scoped_session([{"id": "s1"}])
+    await transport.send(part, {"type": MSG_CREATE, "ref": "c", "state": {}})
+    assert part.messages[0]["code"] == "invalid_op"
+    assert "node_type" in part.messages[0]["message"]

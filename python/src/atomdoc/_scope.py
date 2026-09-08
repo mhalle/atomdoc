@@ -333,6 +333,34 @@ class ClientView:
     def _parent_id(self, raw: Any) -> Any:
         return self._doc.root.id if raw in (0, None, "") else raw
 
+    def _require_range(self, start_id: Any, end_id: Any) -> None:
+        """Every node of a sibling range must be held in full, not only
+        its ends: the nodes between them go with it."""
+        self._require_full(start_id, "Node")
+        if end_id in (0, None):
+            return
+        self._require_full(end_id, "Node")
+        node = self._doc.get_node_by_id(start_id)
+        while node is not None and node.id != end_id:
+            node = node._next_sibling
+            if node is None:
+                break
+            self._require_full(node.id, "Node")
+
+    def _require_sibling(self, parent_id: Any, slot: Any, sibling_id: Any) -> None:
+        """A neighbor must be held (a stub will do) and lie in the slot
+        the request names: the document places the node beside it,
+        wherever it is."""
+        if isinstance(sibling_id, bool) or sibling_id in (0, None, ""):
+            return
+        self._require_known(sibling_id, "Sibling")
+        sibling = self._doc.get_node_by_id(sibling_id)
+        parent = self._doc.get_node_by_id(parent_id)
+        if sibling is None or parent is None:
+            return  # the document decides
+        if sibling._parent is not parent or sibling._slot_name != slot:
+            raise OutOfScope(f"Sibling '{sibling_id}' is not in slot '{slot}' of '{parent_id}'")
+
     def check_operations(self, ops: Operations) -> None:
         """Refuse an ``op`` request that touches anything the client does
         not hold in full: it may not insert under, delete, move, or write
@@ -341,38 +369,52 @@ class ClientView:
         node lands beside); the nodes a request inserts count as full for
         the state it carries with them."""
         created: set[str] = set()
+        doc = self._doc
         for raw in ops[0]:
             op = cast(tuple[Any, ...], raw)
             if op[0] == 0:
-                self._require_full(self._parent_id(op[2]), "Parent")
+                parent_id = self._parent_id(op[2])
+                self._require_full(parent_id, "Parent")
                 for pair in op[1]:
-                    if len(pair) != 2:
-                        raise OutOfScope("A client may not insert a stub")
+                    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                        raise OutOfScope("A client inserts nodes as [id, type] pairs only")
                     node_id = pair[0]
-                    if node_id in self.held or self._doc.get_node_by_id(node_id) is not None:
+                    # An id that exists, or that a deleted node still
+                    # holds (an undo may bring it back), is not free.
+                    if (
+                        node_id in self.held
+                        or doc.get_node_by_id(node_id) is not None
+                        or node_id in doc._graveyard
+                    ):
                         raise OutOfScope(f"Node '{node_id}' already exists")
                     created.add(node_id)
-                self._require_known(op[4], "Sibling")
-                self._require_known(op[5], "Sibling")
+                self._require_sibling(parent_id, op[3], op[4])
+                self._require_sibling(parent_id, op[3], op[5])
             elif op[0] == 1:
-                self._require_full(op[1], "Node")
-                if op[2] not in (0, None):
-                    self._require_full(op[2], "Node")
+                self._require_range(op[1], op[2])
             elif op[0] == 2:
-                self._require_full(op[1], "Node")
-                if op[2] not in (0, None):
-                    self._require_full(op[2], "Node")
-                self._require_full(self._parent_id(op[3]), "Parent")
-                self._require_known(op[5], "Sibling")
-                self._require_known(op[6], "Sibling")
+                self._require_range(op[1], op[2])
+                parent_id = self._parent_id(op[3])
+                self._require_full(parent_id, "Parent")
+                self._require_sibling(parent_id, op[4], op[5])
+                self._require_sibling(parent_id, op[4], op[6])
         for node_id in ops[1]:
             if node_id not in created:
                 self._require_full(node_id, "Node")
 
-    def check_create(self, parent_id: Any, target_id: Any) -> None:
-        self._require_full(self._parent_id(parent_id), "Parent")
+    def check_create(self, parent_id: Any, slot: Any, target_id: Any) -> None:
+        parent_id = self._parent_id(parent_id)
+        self._require_full(parent_id, "Parent")
         if target_id:
-            self._require_known(target_id, "Sibling")
+            self._require_sibling(parent_id, slot, target_id)
+
+    def redact(self, message: str) -> str:
+        """Replace, in an error message, the id of any node this client
+        does not hold: it must not learn what lies outside its view."""
+        for node_id in self._doc._node_map:
+            if node_id not in self.held and node_id in message:
+                message = message.replace(node_id, "(a node outside your scope)")
+        return message
 
     # --- Projection ---
 

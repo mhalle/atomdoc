@@ -648,16 +648,21 @@ export class LocalDoc {
     const node = this.nodeMap.get(id);
     if (node && node.parent === null && node !== this.root) return; // already detached
     if (node === this.root) throw new Error("The root cannot become a detached stub");
+    let stub: DocNode;
     if (node) {
       this._removeRange(node, node, true);
       const ordered = this._forwardOps.ordered;
       ordered[ordered.length - 1] = [5, id, type];
+      // The same object, demoted: handles to it stay valid.
+      this.graveyard.delete(id);
+      resetDocNode(node);
+      makeStub(node);
+      stub = node;
     } else {
       this._forwardOps.ordered.push([5, id, type]);
+      stub = createDocNode(id, type, this._slotOrderFor(type), true);
     }
-    const stub = createDocNode(id, type, this._slotOrderFor(type), true);
     this.nodeMap.set(id, stub);
-    this.graveyard.delete(id);
     this._inverseOps.ordered.push([1, id, 0]);
     this._diff.inserted.add(id);
     this.partial = true;
@@ -895,6 +900,9 @@ export class LocalDoc {
           const node = this.nodeMap.get(op[1]);
           if (!node) throw new Error(`Fill of a node this document does not hold: '${op[1]}'`);
           if (!node.stub) throw new Error(`Fill of a node that is not a stub: '${op[1]}'`);
+          if (node.parent === null && node !== this.root) {
+            throw new Error(`Fill of a detached stub: '${op[1]}'`);
+          }
           this._fill(node);
         } else {
           throw new Error(`Unknown operation code: ${String((op as unknown[])[0])}`);
@@ -1016,13 +1024,19 @@ export class LocalDoc {
       ordered: [...this._inverseOps.ordered].reverse(),
       state: { ...this._inverseOps.state },
     };
+    // Detached stubs dropped (or placed) in this transaction come
+    // straight back as detached stubs: there is no wire operation for
+    // a detached insert. Taken before the inverse runs, since the
+    // inverse of a stub created here drops it and must not revive it.
+    const drops = this.detachedDrops;
+    this.detachedDrops = [];
     try {
       this._applyOps(inverse);
-      // Detached stubs dropped in this transaction come straight back:
-      // there is no wire operation for a detached insert.
-      for (const node of this.detachedDrops) {
+      for (const node of drops) {
         if (!this.nodeMap.has(node.id)) {
           this.graveyard.delete(node.id);
+          resetDocNode(node);
+          if (!node.stub) makeStub(node);
           this.nodeMap.set(node.id, node);
         }
       }
@@ -1083,8 +1097,10 @@ export class LocalDoc {
     if (held && held.parent === null && held !== this.root && held.stub && this.applyingOps) {
       // A detached stub taking its place in the tree (and filling, if
       // the pair is full): the same object, so handles stay valid. It
-      // holds no references; the insert re-registers it.
+      // holds no references; the insert re-registers it. A rollback
+      // puts it back detached.
       this.nodeMap.delete(id);
+      this.detachedDrops.push(held);
       if (!stub) {
         fillStub(held, {});
         this._applyDefaults(held);

@@ -77,8 +77,9 @@ export function applyPatch(
           break;
         }
         case 4:
-          // Leaves the view with its subtree (it still exists).
-          exitNode(store, slots, op[1]);
+          // Leaves the view with its subtree (it still exists). The root
+          // is always held.
+          if (op[1] !== store.getRootId()) exitNode(store, slots, op[1]);
           break;
         case 5: {
           // Is now a detached stub.

@@ -464,8 +464,12 @@ describe("ThickAtomDocClient scope", () => {
     } as PatchMsg);
     await settled;
     expect(client.getState("i1")).toEqual({ label: "A" });
+    // One request per step, so settled() waits for every answer.
     client.redo(2);
-    expect(ws.sent[ws.sent.length - 1]).toMatchObject({ type: "redo", steps: 2 });
+    expect(ws.sent.slice(-2)).toEqual([
+      { type: "redo", ref: expect.any(String), steps: 1 },
+      { type: "redo", ref: expect.any(String), steps: 1 },
+    ]);
   });
 
   it("createNode past the depth bound is refused before sending", async () => {
@@ -522,5 +526,234 @@ describe("ThickAtomDocClient scope", () => {
     client.onResync(cb);
     partialSnapshot(ws2, 3);
     expect(cb).toHaveBeenCalledWith(expect.objectContaining({ reason: "reconnect", partial: true }));
+  });
+});
+
+
+describe("adversarial findings", () => {
+  it("a rolled-back adoption of a detached stub puts it back detached", () => {
+    const doc = makeDoc();
+    const i3 = doc.getNode("i3")!;
+    expect(() =>
+      doc.applyOperations(
+        { ordered: [[0, [["i3", "Item"]], "s1", "items", "i1", "i2"], [6, "s1"]], state: { i3: { label: "C" } } },
+        undefined,
+        true,
+      ),
+    ).toThrow(/not a stub/);
+    expect(doc.getNode("i3")).toBe(i3);
+    expect(i3.stub).toBe(true);
+    expect(i3.parent).toBeNull();
+    expect(doc.detachedStubs()).toEqual([["i3", "Item"]]);
+    expect(getSlotChildren(doc.getNode("s1")!, "items").map((n) => n.id)).toEqual(["i1", "i2"]);
+    doc.setNodeState("s1", "heading", "still writable"); // the reference index is sound
+  });
+
+  it("a rolled-back detached-stub creation leaves nothing behind, and a detach keeps the object", () => {
+    const doc = makeDoc();
+    const i1 = doc.getNode("i1")!;
+    expect(() =>
+      doc.applyOperations({ ordered: [[5, "zz", "Item"], [5, "i1", "Item"], [6, "s1"]], state: {} }, undefined, true),
+    ).toThrow(/not a stub/);
+    expect(doc.getNode("zz")).toBeUndefined();
+    expect(doc.getNode("i1")).toBe(i1);
+    expect(i1.stub).toBe(false);
+    expect(i1.state.label).toBe("A");
+    expect(i1.parent!.id).toBe("s1");
+    expect(doc.getNode("n1")!.parent).toBe(i1);
+    // A detach that lands keeps the object too.
+    doc.applyOperations({ ordered: [[5, "i1", "Item"]], state: {} }, undefined, true);
+    expect(doc.getNode("i1")).toBe(i1);
+    expect(i1.stub).toBe(true);
+  });
+
+  it("[6] of a detached stub is a protocol error; [4] of the root leaves the store's root", () => {
+    const doc = makeDoc();
+    expect(() => doc.applyOperations({ ordered: [[6, "i3"]], state: {} }, undefined, true)).toThrow(/detached/);
+    const s = new NodeStore();
+    s.loadSnapshot(partial, referents);
+    applyPatch(s, { ordered: [[4, ROOT]], state: {} });
+    expect(s.getRoot()).toBeDefined();
+  });
+
+  it("disconnect rejects a scope request in flight; an offline one resolves with the handshake", async () => {
+    const { client, ws } = await scopedClient();
+    partialSnapshot(ws);
+    const inFlight = client.setScope([{ id: "s1", depth: 0 }]);
+    client.disconnect();
+    await expect(inFlight).rejects.toThrow(/Disconnected/);
+    // Offline: kept, and answered by the next connection's snapshot.
+    const offline = client.setScope([{ id: "s1", depth: 1 }]);
+    const reconnecting = client.connect();
+    const ws2 = FakeSocket.instances[FakeSocket.instances.length - 1];
+    ws2.onopen?.();
+    await reconnecting;
+    ws2.receive({ type: "schema", schema } as SchemaMsg);
+    expect(ws2.sent[0]).toMatchObject({ type: "scope", anchors: [{ id: "s1", depth: 1 }] });
+    const ref = (ws2.sent[0] as { ref: string }).ref;
+    ws2.receive({
+      type: "snapshot", doc_id: ROOT, version: 5, data: partial, partial: true, stubs: referents,
+      anchors: [{ id: "s1", depth: 1 }], client_id: "me", ref,
+    } as SnapshotMsg);
+    expect(await offline).toEqual([{ id: "s1", depth: 1 }]);
+  });
+
+  it("edits made offline are sent under the scope they were made in, then the new scope is set", async () => {
+    const { client, ws } = await scopedClient();
+    partialSnapshot(ws);
+    client.disconnect();
+    client.setField("i1", "label", "offline");
+    const narrowed = client.setScope([{ id: "i2" }]);
+    const reconnecting = client.connect();
+    const ws2 = FakeSocket.instances[FakeSocket.instances.length - 1];
+    ws2.onopen?.();
+    await reconnecting;
+    ws2.receive({ type: "schema", schema } as SchemaMsg);
+    // The handshake asks for the old scope, under which the edit applies.
+    expect(ws2.sent[0]).toMatchObject({ type: "scope", anchors: [{ id: "s1" }] });
+    ws2.receive({
+      type: "snapshot", doc_id: ROOT, version: 5, data: partial, partial: true, stubs: referents,
+      anchors: [{ id: "s1" }], client_id: "me", ref: (ws2.sent[0] as { ref: string }).ref,
+    } as SnapshotMsg);
+    const kinds = ws2.sent.map((m) => m.type);
+    expect(kinds).toEqual(["scope", "op", "scope"]);
+    expect((ws2.sent[1] as { operations: WireOperations }).operations.state).toEqual({ i1: { label: "offline" } });
+    expect(ws2.sent[2]).toMatchObject({ type: "scope", anchors: [{ id: "i2" }] });
+    ws2.receive({
+      type: "scope_ack", ref: (ws2.sent[2] as { ref: string }).ref, version: 6,
+      operations: { ordered: [[3, "s1"], [4, "i1"]], state: {} }, source_client: null, anchors: [{ id: "i2" }],
+    } as ScopeAckMsg);
+    expect(await narrowed).toEqual([{ id: "i2" }]);
+    expect(client.getDoc()!.getNode("i1")).toBeUndefined();
+  });
+
+  it("a scope set between a reconnect's schema and snapshot is sent after the snapshot", async () => {
+    const { client, ws } = await scopedClient();
+    partialSnapshot(ws);
+    client.disconnect();
+    const reconnecting = client.connect();
+    const ws2 = FakeSocket.instances[FakeSocket.instances.length - 1];
+    ws2.onopen?.();
+    await reconnecting;
+    ws2.receive({ type: "schema", schema } as SchemaMsg);
+    const changed = client.setScope([{ id: "s1", depth: 0 }]);
+    ws2.receive({
+      type: "snapshot", doc_id: ROOT, version: 5, data: partial, partial: true, stubs: referents,
+      anchors: [{ id: "s1" }], client_id: "me", ref: (ws2.sent[0] as { ref: string }).ref,
+    } as SnapshotMsg);
+    expect(ws2.sent[ws2.sent.length - 1]).toMatchObject({ type: "scope", anchors: [{ id: "s1", depth: 0 }] });
+    ws2.receive({
+      type: "scope_ack", ref: (ws2.sent[ws2.sent.length - 1] as { ref: string }).ref, version: 6,
+      operations: { ordered: [[3, "i1"]], state: {} }, source_client: null, anchors: [{ id: "s1", depth: 0 }],
+    } as ScopeAckMsg);
+    expect(await changed).toEqual([{ id: "s1", depth: 0 }]);
+  });
+
+  it("a whole-document client that narrows loses its local history", async () => {
+    FakeSocket.instances = [];
+    const client = new ThickAtomDocClient({
+      url: "ws://server/doc", coalesce: false, webSocket: FakeSocket as unknown as new (url: string) => WebSocket,
+    });
+    const connecting = client.connect();
+    const ws = FakeSocket.instances[0];
+    ws.onopen?.();
+    await connecting;
+    ws.receive({ type: "schema", schema } as SchemaMsg);
+    ws.receive({
+      type: "snapshot", doc_id: ROOT, version: 0, client_id: "me",
+      data: [ROOT, "Page", { title: "T" }, { sections: [["s2", "Section", { heading: "Two" }, { items: [] }]] }],
+    } as SnapshotMsg);
+    client.setField("s2", "heading", "edited");
+    expect(client.getUndoManager()!.undoDepth).toBe(1);
+    void client.setScope([{ id: "s2" }]);
+    ws.receive({
+      type: "scope_ack", ref: (ws.sent[ws.sent.length - 1] as { ref: string }).ref, version: 1,
+      operations: { ordered: [[3, ROOT]], state: {} }, source_client: null, anchors: [{ id: "s2" }],
+    } as ScopeAckMsg);
+    expect(client.getUndoManager()).toBeNull();
+    client.setField("s2", "heading", "again");
+    client.undo();
+    expect(ws.sent[ws.sent.length - 1]).toMatchObject({ type: "undo" });
+  });
+
+  it("the echo of a write to a node demoted meanwhile is retired, not fatal", async () => {
+    const { client, ws } = await scopedClient();
+    partialSnapshot(ws);
+    const errors: ErrorMsg[] = [];
+    client.onError((e) => errors.push(e));
+    client.setField("i1", "label", "AA");
+    const write = ws.sent[ws.sent.length - 1] as { ref: string; operations: WireOperations };
+    void client.setScope([{ id: "s1", depth: 0 }]);
+    ws.receive({
+      type: "scope_ack", ref: (ws.sent[ws.sent.length - 1] as { ref: string }).ref, version: 1,
+      operations: { ordered: [[3, "i1"], [4, "n1"]], state: {} }, source_client: null, anchors: [{ id: "s1", depth: 0 }],
+    } as ScopeAckMsg);
+    ws.receive({ type: "patch", version: 2, ref: write.ref, source_client: null, operations: write.operations } as PatchMsg);
+    expect(errors).toEqual([]);
+    expect(client.isOnline()).toBe(true);
+    expect(client.getDoc()!.getNode("i1")!.stub).toBe(true);
+    await client.settled();
+  });
+
+  it("the depth check merges duplicate anchors and follows pending parents", async () => {
+    const { client, ws } = await scopedClient([{ id: "s1", depth: 0 }, { id: "s1" }]);
+    partialSnapshot(ws);
+    // The generous duplicate wins: a deep create is fine.
+    client.createNode("Note", { text: "x" }, "i1", "notes");
+    const { client: bounded, ws: ws2 } = await scopedClient([{ id: "s1", depth: 1 }]);
+    partialSnapshot(ws2);
+    const item = bounded.createNode("Item", { label: "D" }, "s1", "items");
+    // Its child would be past the bound, pending parent or not.
+    expect(() => bounded.createNode("Note", { text: "x" }, item, "notes")).toThrow(OutOfScopeError);
+  });
+
+  it("an applied insert the server answers with a stub pair is demoted", async () => {
+    const { client, ws } = await scopedClient([{ id: "s1", depth: 1 }]);
+    partialSnapshot(ws);
+    const doc = client.getDoc()!;
+    const note = doc.createNode("Note", { text: "deep" });
+    doc.insertIntoSlot(doc.getNode("i1")!, "notes", "append", [note]); // past the bound, sent as applied
+    const sent = ws.sent[ws.sent.length - 1] as { ref: string };
+    ws.receive({
+      type: "patch", version: 1, ref: sent.ref, source_client: null,
+      operations: { ordered: [[0, [[note.id, "Note", null]], "i1", "notes", "n1", 0]], state: {} },
+    } as PatchMsg);
+    expect(doc.getNode(note.id)!.stub).toBe(true);
+    expect(client.getState(note.id)).toBeUndefined();
+  });
+
+  it("a throwing listener does not stop message handling", async () => {
+    const { client, ws } = await scopedClient();
+    partialSnapshot(ws);
+    vi.useFakeTimers();
+    client.onPatch(() => {
+      throw new Error("app bug");
+    });
+    const seen: number[] = [];
+    client.onPatch((v) => seen.push(v));
+    ws.receive({ type: "patch", version: 1, source_client: null, operations: { ordered: [], state: { i1: { label: "x" } } } } as PatchMsg);
+    ws.receive({ type: "patch", version: 2, source_client: null, operations: { ordered: [], state: { i1: { label: "y" } } } } as PatchMsg);
+    expect(seen).toEqual([1, 2]);
+    expect(client.getState("i1")).toEqual({ label: "y" });
+    expect(() => vi.runAllTimers()).toThrow(/app bug/); // surfaced, later
+    vi.useRealTimers();
+  });
+
+  it("an undo in flight at disconnect is dropped, not replayed as an empty edit", async () => {
+    const { client, ws } = await scopedClient();
+    partialSnapshot(ws);
+    client.undo();
+    client.disconnect();
+    const reconnecting = client.connect();
+    const ws2 = FakeSocket.instances[FakeSocket.instances.length - 1];
+    ws2.onopen?.();
+    await reconnecting;
+    ws2.receive({ type: "schema", schema } as SchemaMsg);
+    ws2.receive({
+      type: "snapshot", doc_id: ROOT, version: 5, data: partial, partial: true, stubs: referents,
+      anchors: [{ id: "s1" }], client_id: "me", ref: (ws2.sent[0] as { ref: string }).ref,
+    } as SnapshotMsg);
+    expect(ws2.sent.map((m) => m.type)).toEqual(["scope"]);
+    await client.settled();
   });
 });

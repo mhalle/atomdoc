@@ -102,6 +102,18 @@ export interface ResyncInfo {
   anchors?: ScopeAnchor[];
 }
 
+interface ScopeWaiter {
+  resolve: (anchors: ScopeAnchor[]) => void;
+  reject: (err: Error) => void;
+}
+
+function sameAnchors(a: ScopeAnchor[] | null, b: ScopeAnchor[] | null): boolean {
+  if (a === null || b === null) return a === b;
+  const key = (list: ScopeAnchor[]) =>
+    JSON.stringify([...list].map((x) => [x.id, x.depth ?? null]).sort());
+  return key(a) === key(b);
+}
+
 /**
  * An operation sent to the server and not yet answered (echoed or
  * rejected), matched by `ref`.
@@ -262,13 +274,14 @@ export class ThickAtomDocClient {
   private onSchemaMismatch: "adopt" | "disconnect";
   /** The anchors this client asked for (null: the whole document). */
   private scopeAnchors: ScopeAnchor[] | null;
+  /** The anchors the server holds for this connection, once known. */
+  private sentAnchors: ScopeAnchor[] | null = null;
   /** The anchors the server resolved, from the last snapshot or ack. */
   private resolvedAnchors: ScopeAnchor[] = [];
-  /** `setScope()` calls waiting for their `scope_ack`, by ref. */
-  private scopeWaiters = new Map<
-    string,
-    { resolve: (anchors: ScopeAnchor[]) => void; reject: (err: Error) => void }
-  >();
+  /** Scope requests on the wire, by ref: what they asked for and who waits. */
+  private scopeWaiters = new Map<string, { anchors: ScopeAnchor[]; waiters: ScopeWaiter[] }>();
+  /** `setScope()` calls made offline: answered once a connection holds the scope. */
+  private deferredScope: ScopeWaiter[] = [];
   private clientId: string = crypto.randomUUID();
   private readyCallbacks: Array<() => void> = [];
   private settledWaiters: Array<() => void> = [];
@@ -388,11 +401,41 @@ export class ThickAtomDocClient {
     // to this document, the reconnect snapshot replaces it and their
     // echoes apply them afresh.
     if (this.pendingOps.length > 0) {
-      this.bufferedOps = [...this.pendingOps.map((p) => p.ops), ...this.bufferedOps];
+      // An undo or redo request in flight is not an edit to replay: the
+      // server may or may not have applied it, and the reconnect
+      // snapshot shows which.
+      this.bufferedOps = [
+        ...this.pendingOps.filter((p) => !p.remote).map((p) => p.ops),
+        ...this.bufferedOps,
+      ];
       this.pendingOps = [];
     }
-    if (wasOnline) {
-      for (const cb of this.offlineCallbacks) cb();
+    // A scope request on this connection will not be answered; the
+    // scope itself is kept and sent with the next connection.
+    const waiting = [...this.scopeWaiters.values()];
+    this.scopeWaiters.clear();
+    for (const entry of waiting) {
+      for (const w of entry.waiters) {
+        w.reject(new Error("Disconnected before the scope was acknowledged; it is sent on reconnect"));
+      }
+    }
+    // `sentAnchors` stays: it names the scope the edits made offline
+    // were made under, which the reconnect asks for first.
+    if (wasOnline) this._fire(this.offlineCallbacks);
+  }
+
+  /** Call listeners; one that throws is reported, and the rest still run. */
+  private _fire<T>(callbacks: Iterable<(arg: T) => void>, arg?: T): void {
+    for (const cb of [...callbacks]) {
+      try {
+        cb(arg as T);
+      } catch (e) {
+        // The listener's failure is the application's to see; it must
+        // not stop this client from handling messages.
+        setTimeout(() => {
+          throw e;
+        }, 0);
+      }
     }
   }
 
@@ -511,14 +554,21 @@ export class ThickAtomDocClient {
    */
   setScope(anchors: ScopeAnchor[]): Promise<ScopeAnchor[]> {
     this.scopeAnchors = anchors.map((a) => ({ ...a }));
-    if (!this.online || !this.ws || this.onlinePending || !this.doc) {
-      return Promise.resolve(this.resolvedAnchors);
-    }
-    const ref = `${this.clientId}:scope:${this.nextRef++}`;
     return new Promise((resolve, reject) => {
-      this.scopeWaiters.set(ref, { resolve, reject });
-      this._send({ type: "scope", ref, anchors: this.scopeAnchors! });
+      if (!this.online || !this.ws || this.onlinePending || !this.doc) {
+        // Answered once a connection holds this scope (see _initDoc).
+        this.deferredScope.push({ resolve, reject });
+        return;
+      }
+      this._sendScope([{ resolve, reject }]);
     });
+  }
+
+  private _sendScope(waiters: ScopeWaiter[]): void {
+    const ref = `${this.clientId}:scope:${this.nextRef++}`;
+    const anchors = this.scopeAnchors!.map((a) => ({ ...a }));
+    this.scopeWaiters.set(ref, { anchors, waiters });
+    this._send({ type: "scope", ref, anchors });
   }
 
   // --- Mutations ---
@@ -565,7 +615,7 @@ export class ThickAtomDocClient {
     const node = doc.createNode(type, state); // validates type and fields
     const model = this._pendingModel();
     const { parent, parentRef, key } = this._parentFor(model, parentId, slot);
-    if (parent) this._checkDepth(parent);
+    this._checkDepth(parent ? parent.id : parentId, model);
     const order = model.order(key);
     let prev: string | 0 = 0;
     let next: string | 0 = 0;
@@ -698,9 +748,13 @@ export class ThickAtomDocClient {
 
   private _sendHistory(kind: "undo" | "redo", steps: number): void {
     if (!(this.online && this.ws && !this.onlinePending)) return; // nothing to revert offline
-    const ref = `${this.clientId}:${this.nextRef++}`;
-    this.pendingOps.push({ ref, ops: { ordered: [], state: {} }, applied: true, remote: true });
-    this._send({ type: kind, ref, steps });
+    // One request per step: each is answered once, so `settled()`
+    // waits for all of them.
+    for (let i = 0; i < steps; i++) {
+      const ref = `${this.clientId}:${this.nextRef++}`;
+      this.pendingOps.push({ ref, ops: { ordered: [], state: {} }, applied: true, remote: true });
+      this._send({ type: kind, ref, steps: 1 });
+    }
   }
 
   // --- Events ---
@@ -798,18 +852,37 @@ export class ThickAtomDocClient {
    * server would hold it, but answer with a stub the client cannot
    * write. Refused here instead, before anything is sent.
    */
-  private _checkDepth(parent: DocNode): void {
+  private _checkDepth(parentId: string, model: PendingModel): void {
     if (!this.scopeAnchors || !this.doc?.partial) return;
-    const anchors = new Map(this.scopeAnchors.map((a) => [a.id, a.depth]));
-    let distance = 1; // the child's distance from the parent's chain
-    for (let n: DocNode | null = parent; n; n = n.parent) {
-      if (anchors.has(n.id)) {
-        const depth = anchors.get(n.id);
+    // Overlapping anchors keep the more generous depth, as the server does.
+    const anchors = new Map<string, number | undefined>();
+    for (const a of this.scopeAnchors) {
+      if (!anchors.has(a.id)) anchors.set(a.id, a.depth);
+      else {
+        const current = anchors.get(a.id);
+        anchors.set(a.id, current === undefined || a.depth === undefined ? undefined : Math.max(current, a.depth));
+      }
+    }
+    const doc = this._doc();
+    let distance = 1; // the child's distance from the node considered
+    let id: string | undefined = parentId;
+    while (id !== undefined) {
+      if (anchors.has(id)) {
+        const depth = anchors.get(id);
         if (depth === undefined || distance <= depth) return;
+      }
+      // Up the chain: a live node's parent, or the parent a pending
+      // node will be placed under.
+      const node = doc.getNode(id);
+      if (node) {
+        id = node.parent?.id;
+      } else {
+        const key = model.keyOf(id);
+        id = key ? key.slice(0, key.indexOf(" ")) : undefined;
       }
       distance++;
     }
-    throw new OutOfScopeError(parent.id, "is at this client's depth bound: a child would be a stub");
+    throw new OutOfScopeError(parentId, "is at this client's depth bound: a child would be a stub");
   }
 
   /** The node a move may move: live and not pending deletion, or pending creation. */
@@ -838,15 +911,22 @@ export class ThickAtomDocClient {
             code: "schema_changed",
             message: "The server's schema differs from this client's; reconnect refused",
           };
-          for (const cb of this.errorCallbacks) cb(err);
+          this._fire(this.errorCallbacks, err);
           break;
         }
         this.schemaChanged = changed;
         this.rawSchema = msg.schema;
         this.schema = new SchemaRegistry(msg.schema);
         if (this.scopeAnchors) {
-          // The partial handshake: the snapshot answers this scope.
-          this._send({ type: "scope", ref: `${this.clientId}:scope:${this.nextRef++}`, anchors: this.scopeAnchors });
+          // The partial handshake: the snapshot answers this scope. Edits
+          // made offline were made under the scope of the last
+          // connection: that scope is asked for first, so they still
+          // apply, and the new one is set once they are sent.
+          const anchors =
+            this.bufferedOps.length > 0 && this.sentAnchors ? this.sentAnchors : this.scopeAnchors;
+          const ref = `${this.clientId}:scope:${this.nextRef++}`;
+          this.scopeWaiters.set(ref, { anchors: anchors.map((a) => ({ ...a })), waiters: [] });
+          this._send({ type: "scope", ref, anchors });
         }
         break;
       }
@@ -855,28 +935,41 @@ export class ThickAtomDocClient {
         this._handleScopeAck(msg);
         break;
 
-      case "snapshot":
+      case "snapshot": {
         if (msg.client_id) this.clientId = msg.client_id;
-        if (msg.partial) this.resolvedAnchors = msg.anchors ?? [];
+        if (msg.partial) {
+          this.resolvedAnchors = msg.anchors ?? [];
+          const request = typeof msg.ref === "string" ? this.scopeWaiters.get(msg.ref) : undefined;
+          if (request) {
+            this.scopeWaiters.delete(msg.ref as string);
+            this.sentAnchors = request.anchors;
+          }
+        }
         this._initDoc(msg.data, msg.version, { partial: msg.partial, stubs: msg.stubs });
         break;
+      }
 
       case "patch":
         this._handlePatch(msg);
         break;
 
       case "error": {
-        const waiter = typeof msg.ref === "string" ? this.scopeWaiters.get(msg.ref) : undefined;
-        if (waiter) {
+        const request = typeof msg.ref === "string" ? this.scopeWaiters.get(msg.ref) : undefined;
+        if (request) {
           this.scopeWaiters.delete(msg.ref as string);
-          waiter.reject(new Error(`${msg.code}: ${msg.message}`));
+          for (const w of request.waiters) w.reject(new Error(`${msg.code}: ${msg.message}`));
         }
         const entry = typeof msg.ref === "string" ? this._takePending(msg.ref) : null;
         if (entry?.reservation !== undefined) this.undoMgr?.cancel(entry.reservation);
-        if ((msg.code === "rejected" || msg.code === "out_of_scope") && entry && !entry.history) {
+        // A rejected edit is followed by a resync; a rejected undo or
+        // redo step is kept by the server and is not.
+        if (
+          msg.code === "out_of_scope" ||
+          (msg.code === "rejected" && !entry?.history && !entry?.remote)
+        ) {
           this.rejectedPending = true;
         }
-        for (const cb of this.errorCallbacks) cb(msg);
+        this._fire(this.errorCallbacks, msg);
         this._maybeSettled();
         break;
       }
@@ -888,15 +981,22 @@ export class ThickAtomDocClient {
     this.version = msg.version;
     this.resolvedAnchors = msg.anchors;
     if (this.doc) {
+      if (!this.doc.partial && this.undoMgr) {
+        // A whole-document client narrowing: its history moves to the
+        // server from here on.
+        this.undoMgr.dispose();
+        this.undoMgr = null;
+      }
       this.doc.partial = true;
       this._applyRemote(msg.operations, { skipUndo: true });
     }
-    const waiter = typeof msg.ref === "string" ? this.scopeWaiters.get(msg.ref) : undefined;
-    if (waiter) {
+    const request = typeof msg.ref === "string" ? this.scopeWaiters.get(msg.ref) : undefined;
+    if (request) {
       this.scopeWaiters.delete(msg.ref as string);
-      waiter.resolve(msg.anchors);
+      this.sentAnchors = request.anchors;
+      for (const w of request.waiters) w.resolve(msg.anchors);
     }
-    for (const cb of this.patchCallbacks) cb(msg.version);
+    this._fire(this.patchCallbacks, msg.version);
   }
 
   /**
@@ -967,16 +1067,25 @@ export class ThickAtomDocClient {
       this._sendBuilt(ops);
     }
 
+    // A scope asked for offline, or changed since the handshake was
+    // sent, goes out now that the edits made under the old one are on
+    // their way; otherwise the handshake already holds it.
+    if (this.scopeAnchors && !sameAnchors(this.scopeAnchors, this.sentAnchors)) {
+      const waiters = this.deferredScope;
+      this.deferredScope = [];
+      this._sendScope(waiters);
+    } else if (this.deferredScope.length > 0) {
+      const waiters = this.deferredScope;
+      this.deferredScope = [];
+      for (const w of waiters) w.resolve(this.resolvedAnchors);
+    }
+
     const ready = this.readyCallbacks;
     this.readyCallbacks = [];
-    for (const cb of ready) cb();
-    for (const cb of this.connectedCallbacks) cb();
-    if (isResync) {
-      for (const cb of this.resyncCallbacks) cb(info);
-    }
-    if (cameBackOnline) {
-      for (const cb of this.onlineCallbacks) cb();
-    }
+    this._fire(ready);
+    this._fire(this.connectedCallbacks);
+    if (isResync) this._fire(this.resyncCallbacks, info);
+    if (cameBackOnline) this._fire(this.onlineCallbacks);
     this._maybeSettled();
   }
 
@@ -1016,6 +1125,11 @@ export class ThickAtomDocClient {
         // unless a later pending write of ours covers it.
         const ordered = this._missingInserts(msg.operations.ordered);
         const state = this._maskState(msg.operations.state, false);
+        // A node this view demoted since the write was made takes no
+        // state: the write is retired, not applied.
+        for (const nodeId of Object.keys(state)) {
+          if (this.doc.getNode(nodeId)?.stub) delete state[nodeId];
+        }
         if (ordered.length > 0 || Object.keys(state).length > 0) {
           this._applyRemote({ ordered, state }, { skipUndo: true });
         }
@@ -1052,7 +1166,7 @@ export class ThickAtomDocClient {
       );
     }
 
-    for (const cb of this.patchCallbacks) cb(msg.version);
+    this._fire(this.patchCallbacks, msg.version);
     this._maybeSettled();
   }
 
@@ -1080,6 +1194,9 @@ export class ThickAtomDocClient {
         // places (and fills).
         if (!held || (held.parent === null && held !== doc.root)) {
           out.push([0, [pair], parentRef, slot, prev, i === pairs.length - 1 ? nextRef : 0]);
+        } else if (pair.length === 3 && !held.stub) {
+          // The server holds it past this view's depth bound: a stub here.
+          out.push([3, id]);
         }
         prev = id;
       });
@@ -1105,7 +1222,7 @@ export class ThickAtomDocClient {
         code: "protocol_error",
         message: `Patch rejected: ${e instanceof Error ? e.message : String(e)}`,
       };
-      for (const cb of this.errorCallbacks) cb(err);
+      this._fire(this.errorCallbacks, err);
     } finally {
       this.applyingRemote = false;
     }

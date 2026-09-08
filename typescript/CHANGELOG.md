@@ -21,7 +21,21 @@
   scoped view cannot apply is reported as `protocol_error` and
   disconnects. `ResyncInfo.partial` and `ResyncInfo.anchors`. The thin
   client applies a `scope_ack` like a patch. Verified end to end against
-  the Python session (`test/integration/scoped.test.ts`).
+  the Python session (`test/integration/scoped.test.ts`) and by
+  adversarial clients: `undo(n)` sends one request per step so
+  `settled()` waits for all of them; a `setScope()` in flight at
+  disconnect rejects, one made offline resolves with the next
+  connection's snapshot, and one made between a reconnect's schema and
+  snapshot is sent after it; edits made offline are sent under the scope
+  they were made in before a scope changed offline is set; the depth
+  check merges duplicate anchors and follows pending parents; a
+  whole-document client that narrows drops its local history; the echo
+  of a write to a node demoted meanwhile is retired rather than fatal;
+  an undo in flight at disconnect is dropped rather than replayed as an
+  empty edit. A listener that throws (`onPatch`, `onError`, ...) no
+  longer stops message handling: the error is rethrown asynchronously.
+  Rollbacks of the visibility operations restore a placed detached stub
+  as detached and leave no stub a rolled-back `[5]` created.
 - Stubs, the client half of partial replication (the server side
   follows): a node a scoped client holds by identity only. A snapshot
   carries a stub as `[id, type, null]` with only the children the client

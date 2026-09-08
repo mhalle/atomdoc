@@ -30,7 +30,18 @@ All notable changes to this project will be documented in this file.
   request before the first scope with `no_scope`; type filters with
   `invalid_op`. `Doc.dump_scope(anchors)` returns the partial snapshot
   and stubs. Whole-document clients are unaffected. Verified by a
-  randomized replica simulation (`tests/test_scope_fuzz.py`).
+  randomized replica simulation (`tests/test_scope_fuzz.py`) and an
+  adversarial protocol client: a range delete or move needs every node
+  of the range held, a neighbor must lie in the slot the request names,
+  an id a deleted node still holds cannot be reused, rejection messages
+  name no node outside the client's view, and `undo`/`redo` are refused
+  for a scoped client on a session with global undo.
+
+### Changed
+
+- A move whose named neighbor has since moved to another slot is
+  rejected (and resynced) rather than following the neighbor there. A
+  malformed request is logged as such, not as a server failure.
 
 ## [0.5.3] - 2026-09-08
 

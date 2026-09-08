@@ -390,17 +390,28 @@ def on_apply_operations(doc: Doc, operations: Operations, *, strict: bool = Fals
                 slot_name = op[4]
                 prev_id = op[5] if len(op) > 5 else 0
                 next_id = op[6] if len(op) > 6 else 0
+                parent = doc.get_node_by_id(str(parent_id)) if parent_id else doc.root
+                if parent is None:
+                    missing("Parent node", parent_id)
+                    continue
                 prev = doc.get_node_by_id(str(prev_id)) if prev_id else None
                 if prev is not None:
+                    # Strictly, a neighbor names a place in the declared
+                    # slot; one that has since moved elsewhere makes the
+                    # request stale rather than redirecting the node.
+                    if strict and (prev._parent is not parent or prev._slot_name != slot_name):
+                        raise ValueError(
+                            f"Node '{prev.id}' is not in slot '{slot_name}' of '{parent.id}'"
+                        )
                     start.to(end).move(prev, position="after")
                     continue
                 nxt = doc.get_node_by_id(str(next_id)) if next_id else None
                 if nxt is not None:
+                    if strict and (nxt._parent is not parent or nxt._slot_name != slot_name):
+                        raise ValueError(
+                            f"Node '{nxt.id}' is not in slot '{slot_name}' of '{parent.id}'"
+                        )
                     start.to(end).move(nxt, position="before")
-                    continue
-                parent = doc.get_node_by_id(str(parent_id)) if parent_id else doc.root
-                if parent is None:
-                    missing("Parent node", parent_id)
                     continue
                 start.to(end).move(parent, slot_name, "append")
             except Exception:

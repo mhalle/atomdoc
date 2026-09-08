@@ -471,17 +471,20 @@ class Session:
                 view.hold_everything()
                 self._views[cid] = view
             operations = view.change(anchors)
-            # Under the flush lock: a commit projected after this delta
-            # must not reach the client before it.
-            async with self._flush_lock:
-                await self._safe_send(client, {
+            # Queued like a patch: a commit projected after this delta
+            # is queued after it, and reaches the client after it.
+            self._pending_broadcasts.append((
+                {
                     "type": MSG_SCOPE_ACK,
                     "ref": ref,
                     "version": self._version,
                     "operations": operations,
                     "source_client": None,
                     "anchors": view.resolved_anchors(),
-                })
+                },
+                [cid],
+            ))
+            await self._flush_broadcast()
 
     async def _handle_message(
         self, client: ClientConnection, msg: dict[str, Any]
@@ -542,7 +545,9 @@ class Session:
         except _Unsupported as unsupported:
             error = {"code": "unsupported", "message": str(unsupported)}
         except Exception as exc:
-            logger.exception("Error handling message from %s", client.client_id)
+            # A malformed request is the client's problem: log it as
+            # such, not as a server failure.
+            logger.info("Invalid %s from %s: %s", msg_type, client.client_id, exc)
             error = {"code": "invalid_op", "message": str(exc)}
         finally:
             self._request = None
@@ -559,11 +564,15 @@ class Session:
                 "Rejected %s from %s: %s", msg_type, client.client_id, rejected
             )
             await self._flush_broadcast()
+            message = str(rejected)
+            view = self._views.get(client.client_id)
+            if view is not None:
+                message = view.redact(message)
             await client.send({
                 "type": MSG_ERROR,
                 "ref": ref,
                 "code": rejected.code,
-                "message": str(rejected),
+                "message": message,
             })
             if rejected.resync:
                 await self._send_snapshot(client)
@@ -700,10 +709,14 @@ class Session:
         return state
 
     def _handle_create(self, client: ClientConnection, msg: dict[str, Any]) -> None:
-        node_type = msg["node_type"]
+        node_type = msg.get("node_type")
         state = msg.get("state", {})
         parent_id = msg.get("parent_id")
-        slot = msg["slot"]
+        slot = msg.get("slot")
+        if not isinstance(node_type, str):
+            raise ValueError("'node_type' must be a string")
+        if not isinstance(slot, str):
+            raise ValueError("'slot' must be a string")
         position = msg.get("position", "append")
         target_id = msg.get("target_id")
 
@@ -716,7 +729,7 @@ class Session:
             raise ValueError(f"Unknown position: {position!r}")
         if position in ("before", "after") and not target_id:
             raise ValueError(f"position {position!r} needs a 'target_id'")
-        self._check_scope(client, lambda view: view.check_create(parent_id, target_id))
+        self._check_scope(client, lambda view: view.check_create(parent_id, slot, target_id))
 
         try:
             with self._doc.transaction():
@@ -755,6 +768,10 @@ class Session:
         manager = self._undo_for(client.client_id)
         if manager is None:
             raise _Unsupported(f"{direction} is disabled on this session")
+        if self._undo_policy == "global" and client.client_id in self._views:
+            # A global step may revert commits touching nodes this
+            # client never held; its own history is per-client.
+            raise _Unsupported(f"{direction} is global on this session: not for a scoped client")
         steps = msg.get("steps", 1)
         if not isinstance(steps, int) or steps < 1:
             raise ValueError("'steps' must be a positive integer")
