@@ -115,6 +115,8 @@ store.getRoot();                        // root node
 store.getRootId();                      // root ID
 store.getChildren(nodeId, slotName);    // ordered child IDs
 store.getAllNodeIds();                   // all IDs
+client.getState(id);                     // the node's state with schema defaults filled in
+                                         // (a snapshot and a patch omit fields at their default)
 ```
 
 Subscribing:
@@ -371,7 +373,9 @@ client.getVersion();     // server version
 
 ```ts
 await client.ready();     // resolves once the document is loaded (connect() resolves on socket open)
-await client.settled();   // resolves once every edit has been answered and the store is flushed
+await client.settled();   // resolves once every edit has been answered (echoed, rejected, or
+                          // answered as a no-op) and the store is flushed; edits made while
+                          // disconnected count and are answered after the reconnect
 client.getState(nodeId);  // the node's state with schema defaults filled in
 client.getDoc();          // LocalDoc | null — the local document model (null until the snapshot)
 client.getUndoManager();  // UndoManager | null
@@ -420,7 +424,9 @@ default `setField` validates the value against the exported schema
 (`ge`, `le`, enums, required fields of a value type) before applying it
 and throws a `ZodError`, so an invalid value never reaches the local
 document or the server; `validate: false` sends values as given, and
-`schema.validateField(type, field, value)` runs the same check by hand. `createNode` takes `"append"` or `"prepend"` only; place a
+`schema.validateField(type, field, value)` runs the same check by hand.
+A field the exported JSON Schema does not describe (a schema built
+without `properties`) is not checked; the server still validates it. `createNode` takes `"append"` or `"prepend"` only; place a
 node next to a sibling with `moveNodeRelative` afterwards.
 
 #### Local Undo/Redo
@@ -437,8 +443,10 @@ client.redo();
 client.undo(3);  // undo 3 steps at once
 
 // Check availability
-client.getUndoManager()!.canUndo;   // false while the newest step awaits confirmation
+client.getUndoManager()!.canUndo;   // false while any step awaits confirmation
 client.getUndoManager()!.canRedo;
+client.getUndoManager()!.undoDepth; // steps on each stack, reservations excluded
+client.getUndoManager()!.redoDepth;
 ```
 
 Steps enter history in the order the user acted, not the order the

@@ -656,6 +656,8 @@ UndoManager(doc, maxSteps = 100, { mergeInterval = 0, clock = Date.now, dispatch
   commitAs(token, fn)       # fn's commit is that step: filed on the opposite stack,
                             # or discarded if a newer local step made an undo's redo stale
   refreshOriginal(source, nodeId, key, value)  # see "Masking" in §12
+  canUndo, canRedo          # false while any step awaits the server
+  undoDepth, redoDepth      # steps on each stack, reservations excluded
 ```
 
 Replaying a move operation must honor its `prev_id` / `next_id` (after
@@ -692,7 +694,8 @@ Note that neither a snapshot nor a `create` patch carries fields at
 their default (an insert `op` carries whatever state its sender put in
 it), so a thin `NodeStore` holds `undefined` for a defaulted field. Read
 defaults through `SchemaRegistry.getDefaults()` rather than comparing
-raw store state.
+raw store state; both clients offer `getState(id)`, the node's state
+with those defaults filled in.
 
 #### 12. Self-Echo Handling
 
@@ -785,6 +788,16 @@ or refused, is consumed. If the socket drops before an echo, pending ops
 are kept ahead of anything buffered since and sent again after the
 reconnect snapshot; the snapshot rebuilds the document and drops the undo
 history.
+
+**Before anything is sent.** A field write is validated against the
+exported schema first (`SchemaRegistry.validateField`; constraints the
+JSON Schema carries, such as `ge`/`le`, enums, and a value type's
+required fields), so a value the server would reject throws at the call
+and never reaches the local document; a field the JSON Schema does not
+describe passes through and the server judges it. A resync (a rejected
+request, a reconnect) rebuilds the document and drops the undo history;
+`onResync` is told which (`reason`) and how many undo and redo steps
+were dropped, so the UI can say so.
 
 The thick client's API is narrower than the wire format on purpose:
 `createNode` takes `"append"` or `"prepend"`, `moveNode` appends, and
