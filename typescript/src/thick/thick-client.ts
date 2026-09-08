@@ -62,6 +62,12 @@ export interface ResyncInfo {
   undoStepsDropped: number;
   /** Redo steps this client had, now gone. */
   redoStepsDropped: number;
+  /**
+   * The schema that came with this snapshot differs from the one the
+   * client had: the server was restarted with new node types. Anything
+   * built from `getSchema()` (field lists, widgets per type) is stale.
+   */
+  schemaChanged: boolean;
 }
 
 /**
@@ -219,6 +225,8 @@ export class ThickAtomDocClient {
   private settledWaiters: Array<() => void> = [];
   /** A `rejected` error arrived; the next snapshot on this socket is its resync. */
   private rejectedPending = false;
+  /** The schema message before the latest one differed from it. */
+  private schemaChanged = false;
 
   private bridge: StoreBridge | null = null;
   private docUnsub: (() => void) | null = null;
@@ -689,6 +697,8 @@ export class ThickAtomDocClient {
   private _handleMessage(msg: ServerMsg): void {
     switch (msg.type) {
       case "schema":
+        this.schemaChanged =
+          this.rawSchema !== null && JSON.stringify(this.rawSchema) !== JSON.stringify(msg.schema);
         this.rawSchema = msg.schema;
         this.schema = new SchemaRegistry(msg.schema);
         break;
@@ -735,8 +745,10 @@ export class ThickAtomDocClient {
       reason: this.onlinePending ? "reconnect" : this.rejectedPending ? "rejected" : "snapshot",
       undoStepsDropped: this.undoMgr?.undoDepth ?? 0,
       redoStepsDropped: this.undoMgr?.redoDepth ?? 0,
+      schemaChanged: this.schemaChanged,
     };
     this.rejectedPending = false;
+    this.schemaChanged = false;
 
     // Clean up previous doc. Anything in flight was either acknowledged
     // (and is in the snapshot) or rejected (and is not): the server

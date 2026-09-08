@@ -493,7 +493,11 @@ client.onResync((info) => { ... });    // server replaced the local doc with a
                                        // fresh snapshot: info.reason is "rejected",
                                        // "reconnect", or "snapshot"; the undo history
                                        // is dropped (info.undoStepsDropped,
-                                       // info.redoStepsDropped) and getUndoManager() is new.
+                                       // info.redoStepsDropped) and getUndoManager() is new;
+                                       // info.schemaChanged says the reconnect brought a
+                                       // different schema (a server restarted with new
+                                       // node types), so getSchema() and anything built
+                                       // from it must be re-read.
 client.onOffline(() => { ... });       // connection lost
 client.onOnline(() => { ... });        // reconnected
 ```

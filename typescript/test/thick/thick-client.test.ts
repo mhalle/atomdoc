@@ -611,7 +611,31 @@ describe("ThickAtomDocClient conveniences", () => {
     client.undo();
     client._injectMessage({ type: "error", ref: sent[0].ref, code: "rejected", message: "no" });
     client._injectMessage({ type: "snapshot", doc_id: ROOT, version: 5, data: snapshot } as SnapshotMsg);
-    expect(seen).toEqual([{ reason: "rejected", undoStepsDropped: 1, redoStepsDropped: 1 }]);
+    expect(seen).toEqual([{ reason: "rejected", undoStepsDropped: 1, redoStepsDropped: 1, schemaChanged: false }]);
+  });
+
+  it("onResync says when a reconnect brought a different schema", () => {
+    const { client } = onlineClient();
+    const seen: Array<{ reason: string; schemaChanged: boolean }> = [];
+    client.onResync((info) => seen.push({ reason: info.reason, schemaChanged: info.schemaChanged }));
+    (client as unknown as { onlinePending: boolean }).onlinePending = true;
+    client._injectMessage({ type: "schema", schema } as SchemaMsg); // the same schema again
+    client._injectMessage({ type: "snapshot", doc_id: ROOT, version: 3, data: snapshot } as SnapshotMsg);
+    const grown: AtomDocSchema = {
+      ...schema,
+      node_types: {
+        ...schema.node_types,
+        Item: { ...schema.node_types.Item, field_tiers: { label: "mergeable", note: "mergeable" }, field_defaults: { label: "", note: "" } },
+      },
+    };
+    (client as unknown as { onlinePending: boolean }).onlinePending = true;
+    client._injectMessage({ type: "schema", schema: grown } as SchemaMsg);
+    client._injectMessage({ type: "snapshot", doc_id: ROOT, version: 4, data: snapshot } as SnapshotMsg);
+    expect(seen).toEqual([
+      { reason: "reconnect", schemaChanged: false },
+      { reason: "reconnect", schemaChanged: true },
+    ]);
+    expect(client.getSchema()!.getDefaults("Item")).toEqual({ label: "", note: "" });
   });
 });
 

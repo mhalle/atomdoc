@@ -796,8 +796,12 @@ required fields), so a value the server would reject throws at the call
 and never reaches the local document; a field the JSON Schema does not
 describe passes through and the server judges it. A resync (a rejected
 request, a reconnect) rebuilds the document and drops the undo history;
-`onResync` is told which (`reason`) and how many undo and redo steps
-were dropped, so the UI can say so.
+`onResync` is told which (`reason`), how many undo and redo steps
+were dropped, and whether the `schema` message that preceded the
+snapshot differed from the one the client had (`schemaChanged`; the
+schema is fixed for a document's lifetime, so this means the server was
+restarted with new node types and everything built from the old schema
+is stale).
 
 The thick client's API is narrower than the wire format on purpose:
 `createNode` takes `"append"` or `"prepend"`, `moveNode` appends, and

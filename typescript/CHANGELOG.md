@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `ResyncInfo.schemaChanged`: a reconnect delivered a schema different
+  from the one the client had (the server was restarted with new node
+  types), so `getSchema()` and anything derived from it are stale. The
+  schema cannot change while a document is alive; this is the one case
+  a client has to notice.
+
 ## 0.5.3
 
 Released in step with atomdoc 0.5.3. What four documentation-only
