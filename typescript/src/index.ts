@@ -46,7 +46,7 @@ export {
   type FieldType,
 } from "./define.js";
 
-// Thick client (offline-capable)
+// Thick client (local replica with confirmed structure)
 export {
   ThickAtomDocClient,
   LocalDoc,

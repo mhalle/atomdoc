@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.5.0] - 2026-09-08
 
 Confirmed structure. The thick client (atomdoc-ts 0.5.0) no longer
 applies structural edits before the server confirms them, and the
