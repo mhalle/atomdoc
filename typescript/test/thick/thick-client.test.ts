@@ -611,7 +611,9 @@ describe("ThickAtomDocClient conveniences", () => {
     client.undo();
     client._injectMessage({ type: "error", ref: sent[0].ref, code: "rejected", message: "no" });
     client._injectMessage({ type: "snapshot", doc_id: ROOT, version: 5, data: snapshot } as SnapshotMsg);
-    expect(seen).toEqual([{ reason: "rejected", undoStepsDropped: 1, redoStepsDropped: 1, schemaChanged: false }]);
+    expect(seen).toEqual([
+      { reason: "rejected", undoStepsDropped: 1, redoStepsDropped: 1, schemaChanged: false, partial: false },
+    ]);
   });
 
   it("onResync says when a reconnect brought a different schema", () => {

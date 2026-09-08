@@ -484,33 +484,37 @@ describe("thick client with stubs", () => {
     expect(sent[0].operations.ordered).toEqual([[2, "i1", 0, "s1", "items", "i3", 0]]);
   });
 
-  it("keeps the store's stub flag through a confirmed delete and its undo", () => {
+  it("keeps the store's stub flag through a confirmed delete and its server-side undo", () => {
     const { client, sent } = scopedClient();
     let version = 0;
-    const echo = (i: number) =>
+    const echo = (i: number, operations: WireOperations = sent[i].operations) =>
       client._injectMessage({
         type: "patch",
         version: ++version,
         ref: sent[i].ref,
-        source_client: "me",
-        operations: sent[i].operations,
+        source_client: null,
+        operations,
       } as PatchMsg);
     client.deleteNode("s1");
     echo(0);
     expect(client.getStore().getNode("i3")).toBeUndefined();
+    // A scoped client's history lives on the server: undo is a request.
     client.undo();
-    expect(sent[1].operations.ordered).toContainEqual([
-      0,
-      [["i1", "Item"], ["i2", "Item"], ["i3", "Item", null]],
-      "s1",
-      "items",
-      0,
-      0,
-    ]);
-    echo(1);
+    expect(sent[1]).toEqual({ type: "undo", ref: sent[1].ref, steps: 1 });
+    // The server restores s1 into this client's view, its stub child
+    // marked as one.
+    echo(1, {
+      ordered: [
+        [0, [["s1", "Section"]], 0, "sections", 0, "s2"],
+        [0, [["i1", "Item"], ["i2", "Item"], ["i3", "Item", null]], "s1", "items", 0, 0],
+      ],
+      state: { s1: { heading: "One", related: "s9" }, i1: { label: "A" }, i2: { label: "B" } },
+    });
+    expect(client.getDoc()!.getNode("s1")!.state.heading).toBe("One");
     expect(client.getDoc()!.getNode("i3")!.stub).toBe(true);
     expect(client.getStore().getNode("i3")!.stub).toBe(true);
     expect(client.getState("i3")).toBeUndefined();
+    expect(client.getUndoManager()).toBeNull();
   });
 
   it("a patch carrying state for a stub is reported and the client disconnects", () => {

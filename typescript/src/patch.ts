@@ -70,6 +70,36 @@ export function applyPatch(
         case 2:
           applyMove(store, slots, op);
           break;
+        case 3: {
+          // Becomes a stub: its state goes, it stays where it is.
+          const node = store.getNode(op[1]);
+          if (node) store._setNode(op[1], { ...node, state: {}, stub: true });
+          break;
+        }
+        case 4:
+          // Leaves the view with its subtree (it still exists).
+          exitNode(store, slots, op[1]);
+          break;
+        case 5: {
+          // Is now a detached stub.
+          const [, id, type] = op;
+          const node = store.getNode(id);
+          if (node && node.parentId === null && id !== store.getRootId()) break;
+          if (node) exitNode(store, slots, id);
+          store._setNode(id, { id, type, state: {}, slots: {}, parentId: null, slotName: null, stub: true });
+          break;
+        }
+        case 6: {
+          // A stub in the tree fills; its state follows in this patch.
+          const node = store.getNode(op[1]);
+          if (node) {
+            const { stub: _stub, ...rest } = node;
+            store._setNode(op[1], rest);
+          }
+          break;
+        }
+        default:
+          throw new Error(`Unknown operation code: ${String((op as unknown[])[0])}`);
       }
     }
     slots.flush();
@@ -104,10 +134,20 @@ function applyInsert(
   const newIds: string[] = [];
   for (const pair of nodePairs) {
     const [id, type] = pair;
-    if (!store.getNode(id)) {
+    const existing = store.getNode(id);
+    if (!existing) {
       const node: StoreNode = { id, type, state: {}, slots: {}, parentId, slotName };
       if (pair.length === 3) node.stub = true;
       store._setNode(id, node);
+    } else if (existing.parentId === null && id !== store.getRootId()) {
+      // A detached stub taking its place in the tree, filled if the
+      // pair is full (its state follows in the same patch).
+      const { stub, ...rest } = existing;
+      const node: StoreNode = { ...rest, parentId, slotName };
+      if (pair.length === 3 && stub) node.stub = true;
+      store._setNode(id, node);
+    } else {
+      continue; // already in the tree: nothing to place
     }
     newIds.push(id);
   }
@@ -178,6 +218,18 @@ function applyDelete(
   for (const id of toRemove) {
     removeRecursive(store, slots, id);
   }
+}
+
+/** Take a node out of its slot (if it is in one) and drop its subtree. */
+function exitNode(store: NodeStore, slots: SlotEdits, id: string): void {
+  const node = store.getNode(id);
+  if (!node) return;
+  if (node.parentId && node.slotName) {
+    const children = slots.get(node.parentId, node.slotName);
+    const idx = children.indexOf(id);
+    if (idx >= 0) children.splice(idx, 1);
+  }
+  removeRecursive(store, slots, id);
 }
 
 /**

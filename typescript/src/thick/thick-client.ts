@@ -18,6 +18,8 @@ import type {
   JsonDoc,
   OrderedOp,
   PatchMsg,
+  ScopeAckMsg,
+  ScopeAnchor,
   ServerMsg,
   WireOperations,
 } from "../types.js";
@@ -64,6 +66,16 @@ export interface ThickClientOptions {
    * than run code written for the old schema against a new document.
    */
   onSchemaMismatch?: "adopt" | "disconnect";
+  /**
+   * Partial replication: hold only the subtrees under these anchors
+   * (see `ScopeAnchor`), with stubs for their ancestors, the children
+   * past a depth bound, and the targets of references held by full
+   * nodes. The client connects with `?partial=1`, sends the scope after
+   * the schema, and receives a partial snapshot. Undo and redo are then
+   * kept by the server for this client; `setScope()` changes the scope
+   * without reconnecting.
+   */
+  scope?: ScopeAnchor[];
 }
 
 /** What a resync (see `onResync`) replaced. */
@@ -80,6 +92,14 @@ export interface ResyncInfo {
    * built from `getSchema()` (field lists, widgets per type) is stale.
    */
   schemaChanged: boolean;
+  /** The snapshot is a scoped view (the client has a scope). */
+  partial: boolean;
+  /**
+   * For a scoped client, the anchors of its scope that resolved to a
+   * node; one whose node was deleted is missing here, though the client
+   * keeps asking for it (`getScope()`), so it comes back if the node does.
+   */
+  anchors?: ScopeAnchor[];
 }
 
 /**
@@ -104,6 +124,11 @@ interface PendingOp {
   history?: { kind: "undo" | "redo"; token: number };
   /** The undo history place held for a built op until its echo fills it. */
   reservation?: number;
+  /**
+   * An undo or redo step the server keeps for this scoped client: its
+   * answer is a projected patch, applied like any other client's.
+   */
+  remote?: boolean;
 }
 
 /**
@@ -137,8 +162,10 @@ class PendingModel {
           this.deleted.add(op[1]);
           this.inserted.delete(op[1]);
           this.placed.delete(op[1]);
-        } else {
+        } else if (op[0] === 2) {
           this.placed.set(op[1], this.key(op[3], op[4]));
+        } else {
+          throw new Error(`A client does not send operation code ${String(op[0])}`);
         }
       }
     }
@@ -185,7 +212,7 @@ class PendingModel {
         }
       } else if (op[0] === 1) {
         remove(list, op[1]);
-      } else {
+      } else if (op[0] === 2) {
         remove(list, op[1]);
         if (this.key(op[3], op[4]) === key) place(list, [op[1]], op[5], op[6]);
       }
@@ -233,6 +260,15 @@ export class ThickAtomDocClient {
   private webSocket: new (url: string) => WebSocket;
   private validate: boolean;
   private onSchemaMismatch: "adopt" | "disconnect";
+  /** The anchors this client asked for (null: the whole document). */
+  private scopeAnchors: ScopeAnchor[] | null;
+  /** The anchors the server resolved, from the last snapshot or ack. */
+  private resolvedAnchors: ScopeAnchor[] = [];
+  /** `setScope()` calls waiting for their `scope_ack`, by ref. */
+  private scopeWaiters = new Map<
+    string,
+    { resolve: (anchors: ScopeAnchor[]) => void; reject: (err: Error) => void }
+  >();
   private clientId: string = crypto.randomUUID();
   private readyCallbacks: Array<() => void> = [];
   private settledWaiters: Array<() => void> = [];
@@ -270,6 +306,7 @@ export class ThickAtomDocClient {
     this.webSocket = options.webSocket ?? WebSocket;
     this.validate = options.validate ?? true;
     this.onSchemaMismatch = options.onSchemaMismatch ?? "adopt";
+    this.scopeAnchors = options.scope ? options.scope.map((a) => ({ ...a })) : null;
   }
 
   // --- Lifecycle ---
@@ -284,7 +321,12 @@ export class ThickAtomDocClient {
         previous.close();
         this._wentOffline();
       }
-      const ws = new this.webSocket(this.url);
+      // A scoped client asks for the schema alone and sends its scope
+      // after it; the server answers with a partial snapshot.
+      const url = this.scopeAnchors
+        ? this.url + (this.url.includes("?") ? "&" : "?") + "partial=1"
+        : this.url;
+      const ws = new this.webSocket(url);
       this.ws = ws;
 
       ws.onopen = () => {
@@ -452,6 +494,33 @@ export class ThickAtomDocClient {
     );
   }
 
+  // --- Scope (partial replication) ---
+
+  /** The anchors this client asked for, or null for the whole document. */
+  getScope(): ScopeAnchor[] | null {
+    return this.scopeAnchors ? this.scopeAnchors.map((a) => ({ ...a })) : null;
+  }
+
+  /**
+   * Replace the scope. The server answers with the delta from the old
+   * view to the new (nodes that enter arrive in full, stubs fill in
+   * place, nodes that leave go), applied like any patch; the promise
+   * resolves with the anchors that resolved to a node. A client that
+   * held the whole document narrows the same way. Offline, the new
+   * scope is sent with the next connection.
+   */
+  setScope(anchors: ScopeAnchor[]): Promise<ScopeAnchor[]> {
+    this.scopeAnchors = anchors.map((a) => ({ ...a }));
+    if (!this.online || !this.ws || this.onlinePending || !this.doc) {
+      return Promise.resolve(this.resolvedAnchors);
+    }
+    const ref = `${this.clientId}:scope:${this.nextRef++}`;
+    return new Promise((resolve, reject) => {
+      this.scopeWaiters.set(ref, { resolve, reject });
+      this._send({ type: "scope", ref, anchors: this.scopeAnchors! });
+    });
+  }
+
   // --- Mutations ---
 
   /**
@@ -495,7 +564,8 @@ export class ThickAtomDocClient {
     const doc = this._doc();
     const node = doc.createNode(type, state); // validates type and fields
     const model = this._pendingModel();
-    const { parentRef, key } = this._parentFor(model, parentId, slot);
+    const { parent, parentRef, key } = this._parentFor(model, parentId, slot);
+    if (parent) this._checkDepth(parent);
     const order = model.order(key);
     let prev: string | 0 = 0;
     let next: string | 0 = 0;
@@ -597,7 +667,16 @@ export class ThickAtomDocClient {
     this._sendBuilt({ ordered: [[2, nodeId, 0, parentRef, slot, prev, next]], state: {} });
   }
 
+  /**
+   * Undo. A scoped client's history lives on the server: the request is
+   * sent and its answer, the inverse projected onto this client's view,
+   * applied when it arrives. `canUndo` is then unknown here.
+   */
   undo(steps = 1): void {
+    if (this.doc?.partial) {
+      this._sendHistory("undo", steps);
+      return;
+    }
     if (!this.undoMgr) return;
     for (let i = 0; i < steps; i++) {
       if (!this.undoMgr.canUndo) break;
@@ -606,11 +685,22 @@ export class ThickAtomDocClient {
   }
 
   redo(steps = 1): void {
+    if (this.doc?.partial) {
+      this._sendHistory("redo", steps);
+      return;
+    }
     if (!this.undoMgr) return;
     for (let i = 0; i < steps; i++) {
       if (!this.undoMgr.canRedo) break;
       this.undoMgr.redo();
     }
+  }
+
+  private _sendHistory(kind: "undo" | "redo", steps: number): void {
+    if (!(this.online && this.ws && !this.onlinePending)) return; // nothing to revert offline
+    const ref = `${this.clientId}:${this.nextRef++}`;
+    this.pendingOps.push({ ref, ops: { ordered: [], state: {} }, applied: true, remote: true });
+    this._send({ type: kind, ref, steps });
   }
 
   // --- Events ---
@@ -703,6 +793,25 @@ export class ThickAtomDocClient {
     return { parent, parentRef: parent === doc.root ? 0 : id, key: `${id} ${slot}` };
   }
 
+  /**
+   * A scoped client may not create a node past its own depth bound: the
+   * server would hold it, but answer with a stub the client cannot
+   * write. Refused here instead, before anything is sent.
+   */
+  private _checkDepth(parent: DocNode): void {
+    if (!this.scopeAnchors || !this.doc?.partial) return;
+    const anchors = new Map(this.scopeAnchors.map((a) => [a.id, a.depth]));
+    let distance = 1; // the child's distance from the parent's chain
+    for (let n: DocNode | null = parent; n; n = n.parent) {
+      if (anchors.has(n.id)) {
+        const depth = anchors.get(n.id);
+        if (depth === undefined || distance <= depth) return;
+      }
+      distance++;
+    }
+    throw new OutOfScopeError(parent.id, "is at this client's depth bound: a child would be a stub");
+  }
+
   /** The node a move may move: live and not pending deletion, or pending creation. */
   private _movable(doc: LocalDoc, model: PendingModel, nodeId: string): DocNode | undefined {
     const node = doc.getNode(nodeId);
@@ -735,11 +844,20 @@ export class ThickAtomDocClient {
         this.schemaChanged = changed;
         this.rawSchema = msg.schema;
         this.schema = new SchemaRegistry(msg.schema);
+        if (this.scopeAnchors) {
+          // The partial handshake: the snapshot answers this scope.
+          this._send({ type: "scope", ref: `${this.clientId}:scope:${this.nextRef++}`, anchors: this.scopeAnchors });
+        }
         break;
       }
 
+      case "scope_ack":
+        this._handleScopeAck(msg);
+        break;
+
       case "snapshot":
         if (msg.client_id) this.clientId = msg.client_id;
+        if (msg.partial) this.resolvedAnchors = msg.anchors ?? [];
         this._initDoc(msg.data, msg.version, { partial: msg.partial, stubs: msg.stubs });
         break;
 
@@ -748,14 +866,37 @@ export class ThickAtomDocClient {
         break;
 
       case "error": {
+        const waiter = typeof msg.ref === "string" ? this.scopeWaiters.get(msg.ref) : undefined;
+        if (waiter) {
+          this.scopeWaiters.delete(msg.ref as string);
+          waiter.reject(new Error(`${msg.code}: ${msg.message}`));
+        }
         const entry = typeof msg.ref === "string" ? this._takePending(msg.ref) : null;
         if (entry?.reservation !== undefined) this.undoMgr?.cancel(entry.reservation);
-        if (msg.code === "rejected" && entry && !entry.history) this.rejectedPending = true;
+        if ((msg.code === "rejected" || msg.code === "out_of_scope") && entry && !entry.history) {
+          this.rejectedPending = true;
+        }
         for (const cb of this.errorCallbacks) cb(msg);
         this._maybeSettled();
         break;
       }
     }
+  }
+
+  /** The delta of a scope change: applied like another client's patch. */
+  private _handleScopeAck(msg: ScopeAckMsg): void {
+    this.version = msg.version;
+    this.resolvedAnchors = msg.anchors;
+    if (this.doc) {
+      this.doc.partial = true;
+      this._applyRemote(msg.operations, { skipUndo: true });
+    }
+    const waiter = typeof msg.ref === "string" ? this.scopeWaiters.get(msg.ref) : undefined;
+    if (waiter) {
+      this.scopeWaiters.delete(msg.ref as string);
+      waiter.resolve(msg.anchors);
+    }
+    for (const cb of this.patchCallbacks) cb(msg.version);
   }
 
   /**
@@ -781,7 +922,9 @@ export class ThickAtomDocClient {
       undoStepsDropped: this.undoMgr?.undoDepth ?? 0,
       redoStepsDropped: this.undoMgr?.redoDepth ?? 0,
       schemaChanged: this.schemaChanged,
+      partial: options.partial === true,
     };
+    if (options.partial) info.anchors = this.resolvedAnchors;
     this.rejectedPending = false;
     this.schemaChanged = false;
 
@@ -796,10 +939,14 @@ export class ThickAtomDocClient {
 
     this.version = version;
     this.doc = new LocalDoc(this.rawSchema, snapshot, options);
-    this.undoMgr = new UndoManager(this.doc, this.maxUndoSteps, {
-      mergeInterval: this.mergeInterval,
-      dispatch: (ops, kind, token) => this._dispatchHistory(ops, kind, token),
-    });
+    // A scoped client's history lives on the server: a step's inverse
+    // may touch nodes this client does not hold.
+    this.undoMgr = this.doc.partial
+      ? null
+      : new UndoManager(this.doc, this.maxUndoSteps, {
+          mergeInterval: this.mergeInterval,
+          dispatch: (ops, kind, token) => this._dispatchHistory(ops, kind, token),
+        });
     this.bridge = bridgeDocToStore(this.doc, this.store, { coalesce: this.coalesce });
 
     // Forward local changes to server (skip if we're applying a remote patch)
@@ -854,7 +1001,14 @@ export class ThickAtomDocClient {
     const entry = typeof msg.ref === "string" ? this._takePending(msg.ref) : null;
 
     if (entry && this.doc) {
-      if (entry.applied) {
+      if (entry.remote) {
+        // The server's answer to a step it keeps for this client: the
+        // inverse, projected onto this view, applied like anyone's.
+        this._applyRemote(
+          { ordered: msg.operations.ordered, state: this._maskState(msg.operations.state) },
+          { skipUndo: true },
+        );
+      } else if (entry.applied) {
         // Confirmation of an edit already in the local document. Its
         // own structure is in place; a node the server added alongside
         // (a normalizer's) is not, and is inserted. Each field is set to
@@ -921,7 +1075,10 @@ export class ThickAtomDocClient {
       let prev: string | 0 = prevRef;
       pairs.forEach((pair, i) => {
         const id = pair[0];
-        if (!doc.getNode(id)) {
+        const held = doc.getNode(id);
+        // Missing, or held only as a detached stub that this insert
+        // places (and fills).
+        if (!held || (held.parent === null && held !== doc.root)) {
           out.push([0, [pair], parentRef, slot, prev, i === pairs.length - 1 ? nextRef : 0]);
         }
         prev = id;
@@ -935,17 +1092,18 @@ export class ThickAtomDocClient {
     try {
       this.doc!.applyOperations(ops, flags, true);
     } catch (e) {
-      if (!(e instanceof OutOfScopeError)) return; // best effort, as before
-      // The server sent state for a node this client holds as a stub.
-      // The patch was rolled back, so the local document has diverged:
-      // report it and drop the connection; a reconnect brings a fresh
-      // snapshot.
+      // A whole-document client applies best effort, as before. A
+      // scoped view has no slack: a patch that does not apply (state
+      // for a stub, an unknown operation, a fill of a full node) was
+      // rolled back, so the local document has diverged. Report it and
+      // drop the connection; a reconnect brings a fresh snapshot.
+      if (!(e instanceof OutOfScopeError) && !this.doc?.partial) return;
       this.disconnect();
       const err: ErrorMsg = {
         type: "error",
         ref: null,
         code: "protocol_error",
-        message: `Patch rejected: ${e.message}`,
+        message: `Patch rejected: ${e instanceof Error ? e.message : String(e)}`,
       };
       for (const cb of this.errorCallbacks) cb(err);
     } finally {

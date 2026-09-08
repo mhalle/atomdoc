@@ -546,52 +546,121 @@ export class LocalDoc {
     const end = endId ? this.nodeMap.get(endId) : start;
     if (!end) throw new Error(`Node not found: ${endId}`);
 
-    withTransaction(this, () => {
-      if (start === this.root) throw new Error("Root node cannot be deleted");
-      // Validate before recording anything, so a bad range inside an
-      // enclosing transaction leaves it untouched.
-      this._checkLive(start);
-      this._checkLive(end);
-      if (start.parent === null) {
-        // A detached stub: a reference target outside every held chain.
-        // Only the server drops one; it leaves no slot and its inverse
-        // (a detached re-insert) has no wire form, so a rollback revives
-        // it directly (see `abort`).
-        if (!this.applyingOps || !start.stub || end !== start) throw new OutOfScopeError(startId);
-        this._forwardOps.ordered.push([1, startId, 0]);
-        this._diff.deleted.set(startId, start);
-        this.nodeMap.delete(startId);
-        this.graveyard.set(startId, new WeakRef(start));
-        this.detachedDrops.push(start);
-        return;
-      }
-      const range = iterRange(start, end);
-      if (range[range.length - 1] !== end) {
-        throw new Error(`Node '${end.id}' is not a later sibling of '${start.id}'`);
-      }
-      if (!this.applyingOps) {
-        // Only the server deletes a stub; a held node goes with its
-        // whole subtree, stub descendants included.
-        for (const node of range) {
-          if (node.stub) throw new OutOfScopeError(node.id);
-        }
-      }
+    withTransaction(this, () => this._removeRange(start, end, false));
+  }
 
-      onDeleteRange(
-        this._diff, this._forwardOps, this._inverseOps,
-        this.root, start, end,
-      );
-
-      // Remove from node map and drop the deleted nodes' own references
+  /**
+   * Take a range out of the document: a delete, or (`exit`) a scoped
+   * client's view losing it while it still exists on the server, which
+   * is recorded as `[4, id]`, is not checked for references, and lands
+   * in `diff.exited` rather than `diff.deleted`.
+   */
+  private _removeRange(start: DocNode, end: DocNode, exit: boolean): void {
+    if (start === this.root) throw new Error("Root node cannot be deleted");
+    // Validate before recording anything, so a bad range inside an
+    // enclosing transaction leaves it untouched.
+    this._checkLive(start);
+    this._checkLive(end);
+    if (start.parent === null) {
+      // A detached stub: a reference target outside every held chain.
+      // Only the server drops one; it leaves no slot and its inverse
+      // (a detached re-insert) has no wire form, so a rollback revives
+      // it directly (see `abort`).
+      if (!this.applyingOps || !start.stub || end !== start) throw new OutOfScopeError(start.id);
+      this._forwardOps.ordered.push(exit ? [4, start.id] : [1, start.id, 0]);
+      if (exit) this._diff.exited.add(start.id);
+      else this._diff.deleted.set(start.id, start);
+      this.nodeMap.delete(start.id);
+      this.graveyard.set(start.id, new WeakRef(start));
+      this.detachedDrops.push(start);
+      return;
+    }
+    const range = iterRange(start, end);
+    if (range[range.length - 1] !== end) {
+      throw new Error(`Node '${end.id}' is not a later sibling of '${start.id}'`);
+    }
+    if (!this.applyingOps) {
+      // Only the server deletes a stub; a held node goes with its
+      // whole subtree, stub descendants included.
       for (const node of range) {
-        for (const desc of descendantsInclusive(node)) {
-          this.nodeMap.delete(desc.id);
-          this.graveyard.set(desc.id, new WeakRef(desc));
-          this._refsRemove(desc);
+        if (node.stub) throw new OutOfScopeError(node.id);
+      }
+    }
+
+    onDeleteRange(
+      this._diff, this._forwardOps, this._inverseOps,
+      this.root, start, end,
+    );
+
+    // Remove from node map and drop the deleted nodes' own references
+    for (const node of range) {
+      for (const desc of descendantsInclusive(node)) {
+        this.nodeMap.delete(desc.id);
+        this.graveyard.set(desc.id, new WeakRef(desc));
+        this._refsRemove(desc);
+        if (exit) {
+          this._diff.deleted.delete(desc.id);
+          this._diff.exited.add(desc.id);
         }
       }
-      if (this.graveyard.size > 4096) this._sweepGraveyard();
-    });
+    }
+    if (exit) {
+      // Recorded as an exit, not a delete: the node still exists.
+      const ordered = this._forwardOps.ordered;
+      const last = ordered[ordered.length - 1];
+      if (last && last[0] === 1 && last[1] === start.id) ordered[ordered.length - 1] = [4, start.id];
+    }
+    if (this.graveyard.size > 4096) this._sweepGraveyard();
+  }
+
+  /**
+   * A node the scoped view no longer holds in full: its state goes, it
+   * stays in the tree as a stub (`[3, id]`).
+   */
+  private _demote(node: DocNode): void {
+    if (node.stub) return;
+    if (!this._diff.inserted.has(node.id) && !(node.id in this._inverseOps.state)) {
+      this._inverseOps.state[node.id] = { ...node.state };
+    }
+    this._inverseOps.ordered.push([6, node.id]);
+    this._forwardOps.ordered.push([3, node.id]);
+    delete this._forwardOps.state[node.id];
+    this._refsRemove(node);
+    makeStub(node);
+    this._diff.updated.add(node.id);
+    this.partial = true;
+  }
+
+  /** A stub in the tree enters the view: its state follows (`[6, id]`). */
+  private _fill(node: DocNode): void {
+    this._inverseOps.ordered.push([3, node.id]);
+    this._forwardOps.ordered.push([6, node.id]);
+    fillStub(node, {});
+    this._applyDefaults(node);
+    this._diff.updated.add(node.id);
+  }
+
+  /**
+   * A node is now a detached stub (`[5, id, type]`): out of the tree
+   * with its subtree if it was in it, created if unknown. Idempotent.
+   */
+  private _detach(id: string, type: string): void {
+    const node = this.nodeMap.get(id);
+    if (node && node.parent === null && node !== this.root) return; // already detached
+    if (node === this.root) throw new Error("The root cannot become a detached stub");
+    if (node) {
+      this._removeRange(node, node, true);
+      const ordered = this._forwardOps.ordered;
+      ordered[ordered.length - 1] = [5, id, type];
+    } else {
+      this._forwardOps.ordered.push([5, id, type]);
+    }
+    const stub = createDocNode(id, type, this._slotOrderFor(type), true);
+    this.nodeMap.set(id, stub);
+    this.graveyard.delete(id);
+    this._inverseOps.ordered.push([1, id, 0]);
+    this._diff.inserted.add(id);
+    this.partial = true;
   }
 
   /** Move a range to the end of `slotName` on `parentId` ("0" or "" = root). */
@@ -814,6 +883,19 @@ export class LocalDoc {
           } catch {
             // Skipped: the move no longer applies.
           }
+        } else if (op[0] === 3) {
+          const node = this.nodeMap.get(op[1]);
+          if (node) this._demote(node);
+        } else if (op[0] === 4) {
+          const node = this.nodeMap.get(op[1]);
+          if (node) this._removeRange(node, node, true);
+        } else if (op[0] === 5) {
+          this._detach(op[1], op[2]);
+        } else if (op[0] === 6) {
+          const node = this.nodeMap.get(op[1]);
+          if (!node) throw new Error(`Fill of a node this document does not hold: '${op[1]}'`);
+          if (!node.stub) throw new Error(`Fill of a node that is not a stub: '${op[1]}'`);
+          this._fill(node);
         } else {
           throw new Error(`Unknown operation code: ${String((op as unknown[])[0])}`);
         }
@@ -861,7 +943,9 @@ export class LocalDoc {
     const hasChanges =
       this._diff.inserted.size > 0 ||
       this._diff.deleted.size > 0 ||
+      this._diff.exited.size > 0 ||
       this._diff.moved.size > 0 ||
+      this._diff.updated.size > 0 ||
       Object.keys(this._forwardOps.state).length > 0;
 
     if (hasChanges) {
@@ -892,6 +976,7 @@ export class LocalDoc {
           deleted: new Map(this._diff.deleted),
           moved: new Set(this._diff.moved),
           updated: new Set(this._diff.updated),
+          exited: new Set(this._diff.exited),
         },
         flags: { ...this._transactionFlags },
       };
@@ -994,6 +1079,18 @@ export class LocalDoc {
    * whether the node is a stub; a revived node takes that kind.
    */
   private _nodeForInsert(id: string, type: string, stub: boolean): DocNode {
+    const held = this.nodeMap.get(id);
+    if (held && held.parent === null && held !== this.root && held.stub && this.applyingOps) {
+      // A detached stub taking its place in the tree (and filling, if
+      // the pair is full): the same object, so handles stay valid. It
+      // holds no references; the insert re-registers it.
+      this.nodeMap.delete(id);
+      if (!stub) {
+        fillStub(held, {});
+        this._applyDefaults(held);
+      }
+      return held;
+    }
     const old = this.graveyard.get(id)?.deref();
     this.graveyard.delete(id);
     if (old && old.type === type) {

@@ -63,7 +63,21 @@ export type MoveOp = [
   string | 0,
 ];
 
-export type OrderedOp = InsertOp | DeleteOp | MoveOp;
+/**
+ * Visibility changes, sent only to a scoped client (partial replication):
+ * `[3, id]` the node becomes a stub (its state is dropped; children that
+ * leave get their own operations); `[4, id]` the node and its subtree
+ * leave the view (the node still exists; ignored if already gone);
+ * `[5, id, type]` the node is now a detached stub (created if unknown,
+ * else taken out of the tree with its subtree and demoted); `[6, id]` a
+ * stub in the tree fills with the state in the same patch.
+ */
+export type StubOp = [3, string];
+export type ExitOp = [4, string];
+export type DetachedOp = [5, string, string];
+export type FillOp = [6, string];
+
+export type OrderedOp = InsertOp | DeleteOp | MoveOp | StubOp | ExitOp | DetachedOp | FillOp;
 
 export interface WireOperations {
   ordered: OrderedOp[];
@@ -97,6 +111,32 @@ export interface SnapshotMsg {
    * they have no place in `data`.
    */
   stubs?: [string, string][];
+  /** The anchors of the scope that resolved to a node (partial only). */
+  anchors?: ScopeAnchor[];
+  /** The `ref` of the `scope` request this partial snapshot answers. */
+  ref?: string | null;
+}
+
+/** An anchor of a scope: a node and how deep below it the client holds. */
+export interface ScopeAnchor {
+  id: string;
+  /**
+   * `0`: the anchor's own state, its children as stubs; `1`: its
+   * children in full, their children as stubs; and so on. Absent: the
+   * whole subtree.
+   */
+  depth?: number;
+}
+
+/** Answer to a `scope` request after the first: the delta, shaped as a patch. */
+export interface ScopeAckMsg {
+  type: "scope_ack";
+  ref: string | null;
+  version: number;
+  operations: WireOperations;
+  source_client: null;
+  /** The anchors that resolved to a node. */
+  anchors: ScopeAnchor[];
 }
 
 export interface PatchMsg {
@@ -121,7 +161,7 @@ export interface ErrorMsg {
   message: string;
 }
 
-export type ServerMsg = SchemaMsg | SnapshotMsg | PatchMsg | ErrorMsg;
+export type ServerMsg = SchemaMsg | SnapshotMsg | PatchMsg | ErrorMsg | ScopeAckMsg;
 
 // ---------------------------------------------------------------------------
 // Protocol messages — client to server
@@ -156,7 +196,14 @@ export interface RedoMsg {
   steps?: number;
 }
 
-export type ClientMsg = OpMsg | CreateMsg | UndoMsg | RedoMsg;
+/** Set (or replace) the client's scope; see `ScopeAnchor`. */
+export interface ScopeMsg {
+  type: "scope";
+  ref?: string;
+  anchors: ScopeAnchor[];
+}
+
+export type ClientMsg = OpMsg | CreateMsg | UndoMsg | RedoMsg | ScopeMsg;
 
 // ---------------------------------------------------------------------------
 // Schema types (from atomdoc_schema())

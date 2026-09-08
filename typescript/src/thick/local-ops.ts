@@ -28,6 +28,11 @@ export interface Diff {
   deleted: Map<string, DocNode>;
   moved: Set<string>;
   updated: Set<string>;
+  /**
+   * Nodes that left a scoped client's view without being deleted (they
+   * still exist on the server). Not subject to reference integrity.
+   */
+  exited: Set<string>;
 }
 
 export function createOpsAccumulator(): OpsAccumulator {
@@ -40,6 +45,7 @@ export function createDiff(): Diff {
     deleted: new Map(),
     moved: new Set(),
     updated: new Set(),
+    exited: new Set(),
   };
 }
 
@@ -497,6 +503,8 @@ export function applyOperations(
       } else {
         insertIntoSlotFn(parent, slotName, "append", movedNodes);
       }
+    } else {
+      throw new Error(`Unknown operation code: ${String((op as unknown[])[0])}`);
     }
   }
 

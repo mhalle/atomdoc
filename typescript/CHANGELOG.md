@@ -4,6 +4,24 @@
 
 ### Added
 
+- Partial replication, client side. `ThickAtomDocClient` takes a
+  `scope` (anchors `{id, depth?}`): it connects with `?partial=1`, sends
+  the scope after the schema, and loads the partial snapshot; `setScope()`
+  replaces the scope in place and resolves with the anchors that
+  resolved (nodes that enter arrive in full, stubs fill where they are,
+  nodes that leave go); `getScope()` returns the anchors asked for, which
+  a reconnect re-sends. The document and store apply the four visibility
+  operations a scoped patch may carry (`[3, id]` becomes a stub, `[4, id]`
+  leaves the view, `[5, id, type]` is now a detached stub, `[6, id]` a
+  stub in the tree fills) and an insert that places a detached stub. A
+  scoped client's undo and redo are requests the server answers (its
+  history lives there; `getUndoManager()` is null). `createNode` past the
+  scope's depth bound throws `OutOfScopeError` before sending; an
+  `out_of_scope` rejection resyncs like a `rejected` one; a patch a
+  scoped view cannot apply is reported as `protocol_error` and
+  disconnects. `ResyncInfo.partial` and `ResyncInfo.anchors`. The thin
+  client applies a `scope_ack` like a patch. Verified end to end against
+  the Python session (`test/integration/scoped.test.ts`).
 - Stubs, the client half of partial replication (the server side
   follows): a node a scoped client holds by identity only. A snapshot
   carries a stub as `[id, type, null]` with only the children the client

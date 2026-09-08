@@ -208,6 +208,7 @@ export class AtomDocClient {
         break;
 
       case "patch":
+      case "scope_ack":
         this.version = msg.version;
         applyPatch(this.store, msg.operations);
         for (const cb of this.patchCallbacks) cb(msg.version);
