@@ -157,6 +157,21 @@ describe("bridgeDocToStore coalescing", () => {
     expect(store.getRoot()!.state.title).toBe("Hello");
   });
 
+  it("a numeric coalesce is a fixed window, frames or not", async () => {
+    const doc = new LocalDoc(schema, snapshot);
+    const store = new NodeStore();
+    bridgeDocToStore(doc, store, { coalesce: 30 });
+    const notified = vi.fn();
+    store.subscribe(doc.id, notified);
+    doc.setNodeState(doc.id, "title", "a");
+    await new Promise((r) => setTimeout(r, 10));
+    doc.setNodeState(doc.id, "title", "b"); // within the window
+    expect(notified).not.toHaveBeenCalled();
+    await new Promise((r) => setTimeout(r, 40));
+    expect(notified).toHaveBeenCalledTimes(1);
+    expect(store.getRoot()!.state.title).toBe("b");
+  });
+
   it("uses requestAnimationFrame when the host provides one", async () => {
     const g = globalThis as { requestAnimationFrame?: unknown; cancelAnimationFrame?: unknown };
     const frames: Array<() => void> = [];

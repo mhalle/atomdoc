@@ -9,6 +9,7 @@ export {
 export {
   ThickAtomDocClient,
   type ThickClientOptions,
+  type ResyncInfo,
 } from "./thick-client.js";
 export { bridgeDocToStore, type StoreBridge, type StoreBridgeOptions } from "./store-bridge.js";
 export {

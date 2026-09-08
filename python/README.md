@@ -575,7 +575,10 @@ A host process writes into a bound session like any other code: mutate
 inside `doc.transaction()` and the session broadcasts the commit (with
 `ref: null`, `source_client: null`) as it happens. Host commits enter
 `doc.undo_manager` unless made with `skip_undo`; they never enter a
-client's per-client history. Stop a session with `await session.unbind()`
+client's per-client history. `session.snapshot()` is the document as a client receives it
+(`doc.dump()` at `session.version`), for checking a client against the
+server; `await session.settled()` waits until every commit so far has
+been sent to every client. Stop a session with `await session.unbind()`
 (which stops the transport it was bound to).
 
 ### Wire protocol

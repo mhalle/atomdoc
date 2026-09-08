@@ -340,6 +340,8 @@ const client = new ThickAtomDocClient({
   maxUndoSteps: 100,          // optional, default 100; 0 disables undo
   mergeInterval: 500,         // optional ms, default 0; collapses quick edits into one undo step
   coalesce: true,             // optional, default true; store updates once per animation frame
+                              // (a number is a window in ms: patches within it notify once, frames or not)
+  validate: true,             // optional, default true; a field value the schema rejects throws at setField
 });
 ```
 
@@ -352,7 +354,8 @@ subscribes to, is updated once per animation frame (a macrotask outside a
 browser), so a burst of patches that arrive within one frame, or a
 transaction touching many nodes, notifies each subscriber once. Patches
 spaced further apart than a frame (a device at 50 Hz in Node, where a
-frame is one macrotask) each notify. `client.flushStore()` applies
+frame is one macrotask) each notify; `coalesce: 16` (a window in
+milliseconds) batches them regardless of frames. `client.flushStore()` applies
 queued changes now, for code that reads the store right after an edit;
 `coalesce: false` restores synchronous store updates.
 
@@ -368,6 +371,8 @@ client.getVersion();     // server version
 
 ```ts
 await client.ready();     // resolves once the document is loaded (connect() resolves on socket open)
+await client.settled();   // resolves once every edit has been answered and the store is flushed
+client.getState(nodeId);  // the node's state with schema defaults filled in
 client.getDoc();          // LocalDoc | null — the local document model (null until the snapshot)
 client.getUndoManager();  // UndoManager | null
 client.isOnline();        // connection status
@@ -407,14 +412,15 @@ different handling for each:
 | Caught | Cases | What happens |
 |---|---|---|
 | Locally, synchronous throw | unknown or already-deleted node (including one another client deleted a moment ago), node pending deletion, unknown field or slot, unsupported `createNode` position, `deleteNode` of a node another node still references, `setField` of a ref to a node that does not exist (`RefIntegrityError`, the checks the server also runs) | nothing sent, nothing changed |
-| Locally applied, then rejected by the server | a field value that violates a schema constraint or type (the local document shows it until the answer comes back), a node type the slot does not accept | `onError` with code `rejected`, then a resync: the local document is rebuilt from the server's snapshot and **this view's undo history is dropped** |
+| Locally applied, then rejected by the server | a field value that violates a constraint the exported schema does not carry (with `validate: false`, any invalid value), a node type the slot does not accept | `onError` with code `rejected`, then a resync: the local document is rebuilt from the server's snapshot and **this view's undo history is dropped** |
 | Rejected by the server only | a structural edit whose target was deleted on the server first | same `error` + resync |
 
-Wrap mutations in `try`/`catch` where other parties edit too, and
-validate values before writing them: `schema.validate(type, state)`
-applies the exported constraints (`ge`, `le`, enums, required fields)
-and throws a `ZodError`, so the invalid value never reaches the local
-document. `createNode` takes `"append"` or `"prepend"` only; place a
+Wrap mutations in `try`/`catch` where other parties edit too. By
+default `setField` validates the value against the exported schema
+(`ge`, `le`, enums, required fields of a value type) before applying it
+and throws a `ZodError`, so an invalid value never reaches the local
+document or the server; `validate: false` sends values as given, and
+`schema.validateField(type, field, value)` runs the same check by hand. `createNode` takes `"append"` or `"prepend"` only; place a
 node next to a sibling with `moveNodeRelative` afterwards.
 
 #### Local Undo/Redo
@@ -475,10 +481,11 @@ edits keep their undo entry.
 client.onConnected(() => { ... });     // initial load complete
 client.onPatch((version) => { ... });  // remote change applied
 client.onError((err) => { ... });      // server error
-client.onResync(() => { ... });        // server replaced the local doc with a
-                                       // fresh snapshot: after rejecting an op,
-                                       // and on every reconnect. The undo history
-                                       // is dropped and getUndoManager() is new.
+client.onResync((info) => { ... });    // server replaced the local doc with a
+                                       // fresh snapshot: info.reason is "rejected",
+                                       // "reconnect", or "snapshot"; the undo history
+                                       // is dropped (info.undoStepsDropped,
+                                       // info.redoStepsDropped) and getUndoManager() is new.
 client.onOffline(() => { ... });       // connection lost
 client.onOnline(() => { ... });        // reconnected
 ```

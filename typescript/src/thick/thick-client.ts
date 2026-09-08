@@ -38,13 +38,30 @@ export interface ThickClientOptions {
    * after every document change. The document itself is always current;
    * `flushStore()` brings the store up to date on demand.
    */
-  coalesce?: boolean;
+  coalesce?: boolean | number;
   /**
    * The WebSocket constructor to use. Defaults to the global `WebSocket`
    * (browsers, Node 22 and later); pass one (the `ws` package, say) on a
    * runtime without it.
    */
   webSocket?: new (url: string) => WebSocket;
+  /**
+   * Validate a field value against the schema before applying and
+   * sending it (default). A value the server would reject then throws
+   * a `ZodError` at the call, instead of showing locally until the
+   * server answers with a rejection and a resync.
+   */
+  validate?: boolean;
+}
+
+/** What a resync (see `onResync`) replaced. */
+export interface ResyncInfo {
+  /** Why the server sent a fresh snapshot. */
+  reason: "rejected" | "reconnect" | "snapshot";
+  /** Undo steps this client had, now gone. */
+  undoStepsDropped: number;
+  /** Redo steps this client had, now gone. */
+  redoStepsDropped: number;
 }
 
 /**
@@ -194,10 +211,14 @@ export class ThickAtomDocClient {
   private url: string;
   private maxUndoSteps: number;
   private mergeInterval: number;
-  private coalesce: boolean;
+  private coalesce: boolean | number;
   private webSocket: new (url: string) => WebSocket;
+  private validate: boolean;
   private clientId: string = crypto.randomUUID();
   private readyCallbacks: Array<() => void> = [];
+  private settledWaiters: Array<() => void> = [];
+  /** A `rejected` error arrived; the next snapshot on this socket is its resync. */
+  private rejectedPending = false;
 
   private bridge: StoreBridge | null = null;
   private docUnsub: (() => void) | null = null;
@@ -214,7 +235,7 @@ export class ThickAtomDocClient {
   private onlinePending = false;
 
   private connectedCallbacks = new Set<() => void>();
-  private resyncCallbacks = new Set<() => void>();
+  private resyncCallbacks = new Set<(info: ResyncInfo) => void>();
   private errorCallbacks = new Set<(err: ErrorMsg) => void>();
   private patchCallbacks = new Set<(version: number) => void>();
   private offlineCallbacks = new Set<() => void>();
@@ -226,6 +247,7 @@ export class ThickAtomDocClient {
     this.mergeInterval = options.mergeInterval ?? 0;
     this.coalesce = options.coalesce ?? true;
     this.webSocket = options.webSocket ?? WebSocket;
+    this.validate = options.validate ?? true;
   }
 
   // --- Lifecycle ---
@@ -321,10 +343,49 @@ export class ThickAtomDocClient {
     return new Promise((resolve) => this.readyCallbacks.push(resolve));
   }
 
+  /**
+   * Resolves once every edit this client has made has been answered by
+   * the server (echoed, rejected, or answered as a no-op) and the store
+   * is up to date, so what the document and store show is what the
+   * server holds. Edits made while disconnected count: they are
+   * answered after the reconnect. Resolves at once if nothing is
+   * pending.
+   */
+  settled(): Promise<void> {
+    if (this._isSettled()) {
+      this.flushStore();
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => this.settledWaiters.push(resolve));
+  }
+
+  private _isSettled(): boolean {
+    return this.pendingOps.length === 0 && this.bufferedOps.length === 0;
+  }
+
+  private _maybeSettled(): void {
+    if (!this._isSettled() || this.settledWaiters.length === 0) return;
+    this.flushStore();
+    const waiters = this.settledWaiters;
+    this.settledWaiters = [];
+    for (const cb of waiters) cb();
+  }
+
   // --- State access ---
 
   getStore(): NodeStore {
     return this.store;
+  }
+
+  /**
+   * A node's state with the schema defaults filled in (the document,
+   * like a snapshot, omits nothing, but a node created from a patch may
+   * lack defaulted fields), or undefined if the node is absent.
+   */
+  getState(nodeId: string): Record<string, unknown> | undefined {
+    const node = this.doc?.getNode(nodeId);
+    if (!node) return undefined;
+    return { ...(this.rawSchema?.node_types[node.type]?.field_defaults ?? {}), ...node.state };
   }
 
   /**
@@ -380,13 +441,17 @@ export class ThickAtomDocClient {
     const doc = this._doc();
     const model = this._pendingModel();
     if (model.gone(nodeId)) throw new Error(`Node not found: ${nodeId}`);
-    if (doc.getNode(nodeId)) {
+    const node = doc.getNode(nodeId);
+    const type = node ? node.type : model.inserted.get(nodeId);
+    if (!type) throw new Error(`Node not found: ${nodeId}`);
+    this._checkField(type, field);
+    if (this.validate && this.schema && !(field in (this.rawSchema?.node_types[type]?.refs ?? {}))) {
+      value = this.schema.validateField(type, field, value);
+    }
+    if (node) {
       doc.setNodeState(nodeId, field, value);
       return;
     }
-    const type = model.inserted.get(nodeId);
-    if (!type) throw new Error(`Node not found: ${nodeId}`);
-    this._checkField(type, field);
     this._sendBuilt({ ordered: [], state: { [nodeId]: { [field]: value } } });
   }
 
@@ -538,12 +603,13 @@ export class ThickAtomDocClient {
    * Fires when the server replaces the local document with a fresh
    * snapshot after connecting — because it rejected one of this client's
    * operations (error code `rejected`) or on reconnect. The local doc, store,
-   * and undo history are rebuilt from the snapshot. Operations still in
-   * flight are dropped: the server either applied them (they are in the
-   * snapshot) or rejected them. UI that caches DocNode references must
-   * re-read them.
+   * and undo history are rebuilt from the snapshot; the callback is told
+   * why, and how many undo and redo steps were dropped. Operations still
+   * in flight are dropped: the server either applied them (they are in
+   * the snapshot) or rejected them. UI that caches DocNode references
+   * must re-read them.
    */
-  onResync(cb: () => void): () => void {
+  onResync(cb: (info: ResyncInfo) => void): () => void {
     this.resyncCallbacks.add(cb);
     return () => this.resyncCallbacks.delete(cb);
   }
@@ -639,7 +705,9 @@ export class ThickAtomDocClient {
       case "error": {
         const entry = typeof msg.ref === "string" ? this._takePending(msg.ref) : null;
         if (entry?.reservation !== undefined) this.undoMgr?.cancel(entry.reservation);
+        if (msg.code === "rejected" && entry && !entry.history) this.rejectedPending = true;
         for (const cb of this.errorCallbacks) cb(msg);
+        this._maybeSettled();
         break;
       }
     }
@@ -663,6 +731,12 @@ export class ThickAtomDocClient {
     if (!this.rawSchema) return;
 
     const isResync = this.doc !== null;
+    const info: ResyncInfo = {
+      reason: this.onlinePending ? "reconnect" : this.rejectedPending ? "rejected" : "snapshot",
+      undoStepsDropped: this.undoMgr?.undoDepth ?? 0,
+      redoStepsDropped: this.undoMgr?.redoDepth ?? 0,
+    };
+    this.rejectedPending = false;
 
     // Clean up previous doc. Anything in flight was either acknowledged
     // (and is in the snapshot) or rejected (and is not): the server
@@ -704,11 +778,12 @@ export class ThickAtomDocClient {
     for (const cb of ready) cb();
     for (const cb of this.connectedCallbacks) cb();
     if (isResync) {
-      for (const cb of this.resyncCallbacks) cb();
+      for (const cb of this.resyncCallbacks) cb(info);
     }
     if (cameBackOnline) {
       for (const cb of this.onlineCallbacks) cb();
     }
+    this._maybeSettled();
   }
 
   /**
@@ -777,6 +852,7 @@ export class ThickAtomDocClient {
     }
 
     for (const cb of this.patchCallbacks) cb(msg.version);
+    this._maybeSettled();
   }
 
   /**

@@ -1070,3 +1070,17 @@ async def test_root_named_by_id_is_a_verbatim_echo():
     echo = next(m for m in a.messages if m["type"] == MSG_PATCH)
     assert echo["source_client"] == a.client_id
     assert echo["operations"]["ordered"][0][2] == 0
+
+
+@pytest.mark.asyncio
+async def test_snapshot_and_settled():
+    session, transport, a, b, t, v = await setup_scene_session()
+    assert session.snapshot() == session.doc.dump()
+    # A host commit is broadcast by a scheduled task; settled() waits for it.
+    b.messages.clear()
+    with session.doc.transaction():
+        session.doc.get_node_by_id(t.id).name = "host"
+    await session.settled()
+    assert [m["type"] for m in b.messages] == [MSG_PATCH]
+    assert session.snapshot() == session.doc.dump()
+    await session.settled()  # nothing pending: returns at once

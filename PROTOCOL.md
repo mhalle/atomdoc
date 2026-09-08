@@ -683,8 +683,10 @@ fallback so a hidden tab still flushes; a macrotask where there is no
 frame API). A device streaming patches or a transaction touching many
 nodes therefore notifies each subscriber once per frame rather than once
 per patch. `flush()` on the handle (or `client.flushStore()`) applies the
-queue immediately; disposing the bridge discards it, which is what a
-resync does before loading the new snapshot.
+queue immediately; a numeric `coalesce` is a window in milliseconds
+instead of a frame; disposing the bridge discards the queue, which is
+what a resync does before loading the new snapshot. `client.settled()`
+resolves once every request has been answered and the store flushed.
 
 Note that neither a snapshot nor a `create` patch carries fields at
 their default (an insert `op` carries whatever state its sender put in

@@ -535,6 +535,86 @@ describe("ThickAtomDocClient confirmed structure", () => {
   });
 });
 
+describe("ThickAtomDocClient conveniences", () => {
+  const typed: AtomDocSchema = {
+    version: 1,
+    root_type: "Page",
+    node_types: {
+      Page: {
+        json_schema: { type: "object", properties: { count: { type: "integer" }, title: { type: "string" } } },
+        field_tiers: { count: "mergeable", title: "mergeable" },
+        slots: { items: { allowed_type: "Item" } },
+        field_defaults: { count: 0, title: "" },
+      },
+      Item: { json_schema: {}, field_tiers: { label: "mergeable" }, slots: {}, field_defaults: { label: "" } },
+    },
+    value_types: {},
+  };
+  const typedSnapshot: JsonDoc = [ROOT, "Page", { title: "Hello" }, { items: [["i1", "Item", {}]] }];
+
+  function typedClient(options: { validate?: boolean } = {}) {
+    const client = new ThickAtomDocClient({ url: "ws://unused", coalesce: false, ...options });
+    client._injectMessage({ type: "schema", schema: typed } as SchemaMsg);
+    client._injectMessage({ type: "snapshot", doc_id: ROOT, version: 0, data: typedSnapshot, client_id: "me" } as SnapshotMsg);
+    const sent: Sent[] = [];
+    const internals = client as unknown as { online: boolean; ws: unknown };
+    internals.online = true;
+    internals.ws = { send: (text: string) => sent.push(JSON.parse(text)) };
+    return { client, sent };
+  }
+
+  it("validates a field value before applying and sending it", () => {
+    const { client, sent } = typedClient();
+    expect(() => client.setField(ROOT, "count", "seven")).toThrow();
+    expect(client.getDoc()!.root.state.count).toBe(0);
+    expect(sent.length).toBe(0);
+    client.setField(ROOT, "count", 7);
+    expect(sent.length).toBe(1);
+    // Off: sent as given, for the server to judge.
+    const raw = typedClient({ validate: false });
+    raw.client.setField(ROOT, "count", "seven");
+    expect(raw.sent.length).toBe(1);
+  });
+
+  it("getState fills in schema defaults", () => {
+    const { client } = typedClient();
+    expect(client.getState("i1")).toEqual({ label: "" });
+    expect(client.getState(ROOT)).toEqual({ count: 0, title: "Hello" });
+    expect(client.getState("nope")).toBeUndefined();
+  });
+
+  it("settled() resolves once every edit is answered", async () => {
+    const { client, sent, echo } = onlineClient({});
+    let done = false;
+    await client.settled(); // nothing pending
+    client.setField(ROOT, "title", "a");
+    const id = client.createNode("Item", {}, ROOT, "items");
+    client.settled().then(() => { done = true; });
+    await Promise.resolve();
+    expect(done).toBe(false);
+    echo(sent[0]);
+    await Promise.resolve();
+    expect(done).toBe(false);
+    echo(sent[1]);
+    await Promise.resolve();
+    expect(done).toBe(true);
+    // The store was flushed as part of settling.
+    expect(client.getStore().getNode(id)).toBeDefined();
+  });
+
+  it("onResync reports why and what was lost", () => {
+    const { client, sent } = onlineClient();
+    const seen: unknown[] = [];
+    client.onResync((info) => seen.push(info));
+    client.setField(ROOT, "title", "one");
+    client.setField(ROOT, "title", "two");
+    client.undo();
+    client._injectMessage({ type: "error", ref: sent[0].ref, code: "rejected", message: "no" });
+    client._injectMessage({ type: "snapshot", doc_id: ROOT, version: 5, data: snapshot } as SnapshotMsg);
+    expect(seen).toEqual([{ reason: "rejected", undoStepsDropped: 1, redoStepsDropped: 1 }]);
+  });
+});
+
 describe("ThickAtomDocClient readiness and integrity", () => {
   it("ready() resolves once the snapshot is in; mutators explain the wait", async () => {
     const client = new ThickAtomDocClient({ url: "ws://unused", coalesce: false });

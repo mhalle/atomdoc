@@ -292,6 +292,16 @@ export class UndoManager {
     return false;
   }
 
+  /** Steps on the undo stack, reservations excluded. */
+  get undoDepth(): number {
+    return this.undoStack.filter((item) => !item.pending).length;
+  }
+
+  /** Steps on the redo stack. */
+  get redoDepth(): number {
+    return this.redoStack.length;
+  }
+
   /**
    * True when there is a step to undo and nothing is awaiting the
    * server: neither the newest step (a reservation) nor a dispatched

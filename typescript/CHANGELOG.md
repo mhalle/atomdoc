@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.5.3
+
+Released in step with atomdoc 0.5.3. What four documentation-only
+developers asked for after building against 0.5.2.
+
+### Added
+
+- `ThickAtomDocClient.settled()`: resolves once every edit has been
+  answered by the server and the store is flushed.
+- `setField` validates the value against the exported schema before
+  applying and sending it (`validate: false` to send as given);
+  `SchemaRegistry.validateField(type, field, value)`.
+- `onResync` receives `{ reason, undoStepsDropped, redoStepsDropped }`.
+- `coalesce` accepts a window in milliseconds, for hosts without frames
+  (a device at 50 Hz in Node coalesced nothing under `setTimeout(0)`).
+- `getState(nodeId)` on both clients: the node's state with schema
+  defaults filled in. `UndoManager.undoDepth` / `redoDepth`.
+
 ## 0.5.2
 
 Released in step with atomdoc 0.5.2.

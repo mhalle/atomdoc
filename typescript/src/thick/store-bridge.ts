@@ -20,10 +20,13 @@ import type { LocalDoc } from "./local-doc.js";
 
 export interface StoreBridgeOptions {
   /**
-   * Batch store updates per animation frame (default) rather than
-   * applying each document change to the store as it commits.
+   * Batch store updates per animation frame (`true`, the default) or
+   * per fixed interval in milliseconds (a number: patches arriving
+   * within that window notify once, whether or not the host has
+   * frames), rather than applying each document change to the store as
+   * it commits (`false`).
    */
-  coalesce?: boolean;
+  coalesce?: boolean | number;
 }
 
 /**
@@ -46,8 +49,11 @@ export interface StoreBridge {
  */
 const FALLBACK_MS = 100;
 
-/** Run `cb` on the next frame; returns a cancel function. */
-function scheduleFrame(cb: () => void): () => void {
+/**
+ * Run `cb` on the next frame (or after `interval` ms when given);
+ * returns a cancel function.
+ */
+function scheduleFrame(cb: () => void, interval?: number): () => void {
   const g = globalThis as {
     requestAnimationFrame?: (cb: () => void) => number;
     cancelAnimationFrame?: (handle: number) => void;
@@ -65,7 +71,9 @@ function scheduleFrame(cb: () => void): () => void {
     clear();
     cb();
   };
-  if (typeof g.requestAnimationFrame === "function") {
+  if (interval !== undefined) {
+    timer = setTimeout(fire, interval);
+  } else if (typeof g.requestAnimationFrame === "function") {
     frame = g.requestAnimationFrame(fire);
     timer = setTimeout(fire, FALLBACK_MS);
   } else {
@@ -89,6 +97,7 @@ export function bridgeDocToStore(
   options: StoreBridgeOptions = {},
 ): StoreBridge {
   const coalesce = options.coalesce ?? true;
+  const interval = typeof coalesce === "number" ? coalesce : undefined;
   let queue: WireOperations[] = [];
   let cancel: (() => void) | null = null;
   let live = true;
@@ -117,7 +126,7 @@ export function bridgeDocToStore(
       return;
     }
     queue.push(event.operations);
-    if (!cancel) cancel = scheduleFrame(flush);
+    if (!cancel) cancel = scheduleFrame(flush, interval);
   });
 
   const dispose = () => {

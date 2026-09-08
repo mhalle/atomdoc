@@ -83,6 +83,16 @@ export class AtomDocClient {
     return this.version;
   }
 
+  /**
+   * A node's state with the schema defaults filled in (a snapshot and
+   * a patch omit fields at their default), or undefined if absent.
+   */
+  getState(nodeId: string): Record<string, unknown> | undefined {
+    const node = this.store.getNode(nodeId);
+    if (!node) return undefined;
+    return { ...(this.schema?.getDefaults(node.type) ?? {}), ...node.state };
+  }
+
   // --- Send operations ---
 
   send(msg: ClientMsg): void {

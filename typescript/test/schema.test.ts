@@ -143,3 +143,25 @@ describe("SchemaRegistry", () => {
     expect(reg.getNodeType("Nope")).toBeUndefined();
   });
 });
+
+describe("SchemaRegistry.validateField", () => {
+  it("parses one field and rejects unknown fields and types", () => {
+    const reg = new SchemaRegistry({
+      version: 1,
+      root_type: "N",
+      node_types: {
+        N: {
+          json_schema: { type: "object", properties: { n: { type: "integer" }, s: { type: "string" } } },
+          field_tiers: { n: "mergeable", s: "mergeable" },
+          slots: {},
+          field_defaults: { n: 0, s: "" },
+        },
+      },
+      value_types: {},
+    });
+    expect(reg.validateField("N", "n", 3)).toBe(3);
+    expect(() => reg.validateField("N", "n", "3")).toThrow();
+    expect(() => reg.validateField("N", "x", 1)).toThrow(/Unknown field/);
+    expect(() => reg.validateField("M", "n", 1)).toThrow(/Unknown type/);
+  });
+});

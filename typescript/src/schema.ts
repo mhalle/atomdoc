@@ -87,6 +87,28 @@ export class SchemaRegistry {
     return schema.parse(data);
   }
 
+  /**
+   * Validate one field's value against the type's schema and return it
+   * as parsed (nested defaults filled). Throws a `ZodError` for a value
+   * the server would reject, and an `Error` for an unknown type or field.
+   */
+  validateField(typeName: string, field: string, value: unknown): unknown {
+    const schema = this.getZodSchema(typeName);
+    if (!schema) {
+      throw new Error(`Unknown type: ${typeName}`);
+    }
+    const shape = (schema as unknown as { shape?: Record<string, z.ZodType> }).shape;
+    const fieldSchema = shape?.[field];
+    if (!fieldSchema) {
+      // A field the type declares but its JSON Schema does not describe
+      // (a schema exported without properties) has nothing to check.
+      const tiers = this.nodeTypes.get(typeName)?.field_tiers ?? {};
+      if (field in tiers) return value;
+      throw new Error(`Unknown field '${field}' on ${typeName}`);
+    }
+    return fieldSchema.parse(value);
+  }
+
   /** List all node type names. */
   nodeTypeNames(): string[] {
     return [...this.nodeTypes.keys()];

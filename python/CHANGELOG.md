@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.3] - 2026-09-08
+
+### Added
+
+- `Session.snapshot()` (the document as a client receives it) and
+  `await Session.settled()` (every commit so far sent to every client),
+  so a client can be checked against the server without a side channel.
+
 ## [0.5.2] - 2026-09-08
 
 ### Fixed

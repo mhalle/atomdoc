@@ -21,7 +21,7 @@ from ._protocol import (
     operations_to_wire,
 )
 from ._transport import ClientConnection, Transport
-from ._types import ChangeEvent, ListenerError, Operations
+from ._types import ChangeEvent, JsonDoc, ListenerError, Operations
 from ._undo import UndoManager
 
 logger = logging.getLogger(__name__)
@@ -147,6 +147,19 @@ class Session:
     @property
     def doc(self) -> Doc:
         return self._doc
+
+    def snapshot(self) -> JsonDoc:
+        """The document as a client would receive it: ``doc.dump()`` at
+        the current version. For checking a client against the server."""
+        return self._doc.dump()
+
+    async def settled(self) -> None:
+        """Wait until every commit so far has been sent to every client:
+        the host's own broadcasts included."""
+        for task in list(self._flush_tasks):
+            if not task.done():
+                await task
+        await self._flush_broadcast()
 
     @property
     def version(self) -> int:

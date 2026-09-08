@@ -57,6 +57,7 @@ export {
   createNodeIdFactory,
   mergeOperations,
   type ThickClientOptions,
+  type ResyncInfo,
   type StoreBridge,
   type StoreBridgeOptions,
   type ChangeEvent,
