@@ -14,19 +14,22 @@ projected patch may carry:
 
 - ``[3, id]``: the node becomes a stub: its state is dropped. Children
   that leave the view with it get their own operations.
-- ``[4, id]``: the node and its subtree leave the view (it still exists).
-- ``[5, id, type]``: a detached stub appears (a reference target outside
-  every held chain).
+- ``[4, id]``: the node and its subtree leave the view (it still
+  exists). A node the client no longer has is ignored.
+- ``[5, id, type]``: the node is now a detached stub (a reference target
+  outside every held chain): created if unknown, otherwise taken out of
+  the tree with its subtree and demoted.
+- ``[6, id]``: the node, a stub in the client's tree, is filled with the
+  state that follows: it entered the view in place.
 
-An insert whose pair names a node the client already holds places it
-there and, if the pair is full, fills it with the state that follows:
-that is how a stub enters the view in place. A stub pair is
-``[id, type, None]``. An insert naming the root fills it and places
-nothing.
+A stub pair is ``[id, type, None]``. An insert may name a node the
+client holds *detached*: it is placed there and, if the pair is full,
+filled. An insert never names a node the client has in its tree.
 
 Operations are emitted in an order that keeps every operation's
-preconditions true on the client: deletes, then appearances and
-entries top-down, then moves, then exits and demotions, then state.
+preconditions true on the client: deletes, then arrivals top-down
+(entries, fills, and placements), then moves, then exits, demotions,
+and detachments, then state.
 """
 
 from __future__ import annotations
@@ -47,6 +50,7 @@ Anchors = dict[str, int | None]
 OP_STUB = 3
 OP_EXIT = 4
 OP_DETACHED = 5
+OP_FILL = 6
 
 
 class OutOfScope(Exception):
@@ -233,13 +237,30 @@ class ClientView:
         self.placed = set(self.held)
 
     def _recompute_placed(self) -> None:
+        """A held node is in the client's tree when every ancestor up to
+        the root is held; the rest are detached stubs."""
         doc = self._doc
         placed: set[str] = set()
+        known: dict[str, bool] = {}
         for node_id in self.held:
             node = doc.get_node_by_id(node_id)
             if node is None:
                 continue
-            if node is doc.root or (node._parent is not None and node._parent.id in self.held):
+            chain: list[str] = []
+            current: AtomNode | None = node
+            result = True
+            while current is not None:
+                if current.id in known:
+                    result = known[current.id]
+                    break
+                if current.id not in self.held:
+                    result = False
+                    break
+                chain.append(current.id)
+                current = current._parent
+            for chain_id in chain:
+                known[chain_id] = result
+            if result:
                 placed.add(node_id)
         self.placed = placed
 
@@ -304,7 +325,7 @@ class ClientView:
             raise OutOfScope(f"{what} '{node_id}' is not held in full by this client")
 
     def _require_known(self, node_id: Any, what: str) -> None:
-        if node_id in (0, None, ""):
+        if not isinstance(node_id, bool) and node_id in (0, None, ""):
             return
         if not isinstance(node_id, str) or node_id not in self.held:
             raise OutOfScope(f"{what} '{node_id}' is not held by this client")
@@ -315,8 +336,11 @@ class ClientView:
     def check_operations(self, ops: Operations) -> None:
         """Refuse an ``op`` request that touches anything the client does
         not hold in full: it may not insert under, delete, move, or write
-        a node it holds as a stub or not at all. Neighbors need only be
-        held (a stub may be the neighbor a node lands beside)."""
+        a node it holds as a stub or not at all, nor insert a node that
+        exists. Neighbors need only be held (a stub may be the neighbor a
+        node lands beside); the nodes a request inserts count as full for
+        the state it carries with them."""
+        created: set[str] = set()
         for raw in ops[0]:
             op = cast(tuple[Any, ...], raw)
             if op[0] == 0:
@@ -324,6 +348,10 @@ class ClientView:
                 for pair in op[1]:
                     if len(pair) != 2:
                         raise OutOfScope("A client may not insert a stub")
+                    node_id = pair[0]
+                    if node_id in self.held or self._doc.get_node_by_id(node_id) is not None:
+                        raise OutOfScope(f"Node '{node_id}' already exists")
+                    created.add(node_id)
                 self._require_known(op[4], "Sibling")
                 self._require_known(op[5], "Sibling")
             elif op[0] == 1:
@@ -338,7 +366,8 @@ class ClientView:
                 self._require_known(op[5], "Sibling")
                 self._require_known(op[6], "Sibling")
         for node_id in ops[1]:
-            self._require_full(node_id, "Node")
+            if node_id not in created:
+                self._require_full(node_id, "Node")
 
     def check_create(self, parent_id: Any, target_id: Any) -> None:
         self._require_full(self._parent_id(parent_id), "Parent")
@@ -390,7 +419,8 @@ class ClientView:
                 elif isinstance(value, str):
                     candidates.add(value)
         # Stubs are few and cheap to re-check; an anchor that moved
-        # changes which ancestors are stubs.
+        # changes which ancestors are stubs, and a stub whose ancestor
+        # left the view is detached.
         candidates.update(node_id for node_id, kind in self.held.items() if kind == "stub")
         candidates -= deleted.keys()
         if not candidates and not (deleted.keys() & self.held.keys()):
@@ -422,31 +452,67 @@ class ClientView:
         old = self.held
         node: AtomNode | None
         ordered: list[Any] = []
-        # A simulation of what the client has as each operation lands.
+        # A simulation of what the client has as each operation lands:
+        # ``present`` is every node it holds, ``placed`` those in its
+        # tree (the rest are detached stubs).
         present: set[str] = set(old)
         placed: set[str] = set(self.placed)
         emitted: set[str] = set()
         entered_state: dict[str, dict[str, Any]] = {}
-        # Nodes still waiting for their move are in their old place on
-        # the client, so they cannot serve as neighbors until moved.
-        pending_moves: set[str] = set()
 
         def kind_after(node_id: str) -> Kind | None:
             if node_id in new_kinds:
                 return new_kinds[node_id]
             return old.get(node_id)
 
+        placed_after_cache: dict[str, bool] = {}
+
+        def placed_after(node: AtomNode) -> bool:
+            """Whether the node is in the client's tree once this patch
+            has landed: it and every ancestor are held."""
+            chain: list[str] = []
+            current: AtomNode | None = node
+            result = True
+            while current is not None:
+                if current.id in placed_after_cache:
+                    result = placed_after_cache[current.id]
+                    break
+                if kind_after(current.id) is None:
+                    result = False
+                    break
+                chain.append(current.id)
+                current = current._parent
+            for chain_id in chain:
+                placed_after_cache[chain_id] = result
+            return result
+
         def parent_ref(node: AtomNode) -> Any:
             parent = node._parent
             assert parent is not None
             return 0 if parent is doc.root else parent.id
 
+        # Nodes the client keeps in its tree that this commit moved: in
+        # their old place until step 3, so not neighbors before that.
+        pending_moves: set[str] = set()
+        movers: list[AtomNode] = []
+        for node_id in moved:
+            if node_id not in placed:
+                continue
+            node = doc.get_node_by_id(node_id)
+            if node is None or kind_after(node_id) is None or not placed_after(node):
+                continue
+            pending_moves.add(node_id)
+            movers.append(node)
+
+        def in_place(node: AtomNode) -> bool:
+            return node.id in placed and node.id not in pending_moves
+
         def neighbors(node: AtomNode) -> tuple[Any, Any]:
             prev = node._prev_sibling
-            while prev is not None and not (prev.id in placed and prev.id not in pending_moves):
+            while prev is not None and not in_place(prev):
                 prev = prev._prev_sibling
             nxt = node._next_sibling
-            while nxt is not None and not (nxt.id in placed and nxt.id not in pending_moves):
+            while nxt is not None and not in_place(nxt):
                 nxt = nxt._next_sibling
             return (prev.id if prev else 0, nxt.id if nxt else 0)
 
@@ -475,14 +541,14 @@ class ClientView:
                         present.add(member.id)
                         placed.add(member.id)
                         emitted.add(member.id)
-                        pending_moves.discard(member.id)
                     run.clear()
                     run_nodes.clear()
 
                 child: AtomNode | None = node._slot_first.get(slot_name)
                 while child is not None:
                     kind = kind_after(child.id)
-                    if kind is None:
+                    if kind is None or child.id in pending_moves:
+                        # Not held, or moved here in step 3.
                         child = child._next_sibling
                         continue
                     if child.id in placed:
@@ -501,25 +567,27 @@ class ClientView:
                 for child in descend:
                     place_children(child)
 
-        # 1. Real deletes of held nodes, top-most first: the client drops
-        # the subtree with the node.
+        # 1. Real deletes of held nodes: one per top-most node in the
+        # client's tree (the subtree goes with it), one per detached stub.
         deleted_held = [node_id for node_id in deleted if node_id in present]
         for node_id in deleted_held:
-            ancestor = deleted[node_id]._parent
             covered = False
-            while ancestor is not None:
-                if ancestor.id in deleted and ancestor.id in present:
-                    covered = True
-                    break
-                ancestor = ancestor._parent
+            if node_id in placed:
+                ancestor = deleted[node_id]._parent
+                while ancestor is not None:
+                    if ancestor.id in deleted and ancestor.id in placed:
+                        covered = True
+                        break
+                    ancestor = ancestor._parent
             if not covered:
                 ordered.append([1, node_id, 0])
         for node_id in deleted_held:
             present.discard(node_id)
             placed.discard(node_id)
 
-        # 2. Nodes that appear, enter in full, or take a place in the
-        # tree, parents before children.
+        # 2. Arrivals, parents before children: nodes that enter in full
+        # (filled in place, or inserted with their subtree), stubs that
+        # take a place in the tree, and detached stubs that appear.
         arriving: list[AtomNode] = []
         for node_id, kind in new_kinds.items():
             if kind is None:
@@ -528,14 +596,8 @@ class ClientView:
             if node is None:
                 continue
             was = old.get(node_id)
-            parent = node._parent
-            parent_held = node is doc.root or (
-                parent is not None and kind_after(parent.id) is not None
-            )
-            if (
-                was is None
-                or (was == "stub" and kind == "full")
-                or (node_id not in placed and parent_held)
+            if was is None or (was == "stub" and kind == "full") or (
+                node_id not in placed and placed_after(node)
             ):
                 arriving.append(node)
         arriving.sort(key=_order_key)
@@ -543,50 +605,35 @@ class ClientView:
             if node.id in emitted:
                 continue
             kind = kind_after(node.id)
-            if node is doc.root:
-                # The root is always placed; gaining it in full (an
-                # anchor on the root, set by a scope change) fills it.
+            if not placed_after(node):
+                # A detached stub (its chain is not held).
+                if node.id not in present:
+                    ordered.append([OP_DETACHED, node.id, node._node_type])
+                    present.add(node.id)
+                    emitted.add(node.id)
+                continue
+            if node.id in placed:
+                # In the tree already: a stub filling in place.
                 if kind == "full" and old.get(node.id) != "full":
-                    ordered.append([0, [_full_pair(node)], 0, "", 0, 0])
+                    ordered.append([OP_FILL, node.id])
                     entered_state[node.id] = node._state_to_json_plain()
                     emitted.add(node.id)
                     place_children(node)
                 continue
             parent = node._parent
-            if parent is None or parent.id not in present:
-                # Its parent arrives first and places it from there, or
-                # it is a detached stub.
-                if kind == "stub" and node.id not in present:
-                    ordered.append([OP_DETACHED, node.id, node._node_type])
-                    present.add(node.id)
-                    emitted.add(node.id)
-                continue
-            if kind == "stub" and node.id in placed:
-                continue
+            if parent is None or parent.id not in placed:
+                continue  # its parent arrives first and places it from there
             prev, nxt = neighbors(node)
             pair = _full_pair(node) if kind == "full" else _stub_pair(node)
             ordered.append([0, [pair], parent_ref(node), node._slot_name, prev, nxt])
             present.add(node.id)
             placed.add(node.id)
             emitted.add(node.id)
-            pending_moves.discard(node.id)
             if kind == "full":
                 entered_state[node.id] = node._state_to_json_plain()
                 place_children(node)
 
-        # 3. Moves of nodes the client keeps, into parents it has.
-        movers: list[AtomNode] = []
-        for node_id in moved:
-            if node_id in emitted or node_id not in placed:
-                continue
-            node = doc.get_node_by_id(node_id)
-            if node is None or kind_after(node_id) is None:
-                continue
-            parent = node._parent
-            if parent is None or parent.id not in present:
-                continue
-            movers.append(node)
-            pending_moves.add(node_id)
+        # 3. Moves of nodes the client keeps in its tree.
         movers.sort(key=_order_key)
         for node in movers:
             prev, nxt = neighbors(node)
@@ -594,7 +641,10 @@ class ClientView:
             ordered.append([2, node.id, 0, parent_ref(node), node._slot_name, prev, nxt])
             emitted.add(node.id)
 
-        # 4. Nodes that leave the view or become stubs, top-most first.
+        # 4. Nodes that leave the view, become stubs, or come out of the
+        # tree as detached stubs, top-most first. Exits and detachments
+        # are idempotent on the client, so a node under one that already
+        # left may be named again.
         leaving: list[tuple[Any, str]] = []
         for node_id, kind in new_kinds.items():
             was = old.get(node_id)
@@ -603,52 +653,42 @@ class ClientView:
             node = doc.get_node_by_id(node_id)
             if node is None:
                 continue
-            parent = node._parent
-            parent_present = node is doc.root or (parent is not None and parent.id in present)
             if (
                 kind is None
                 or (was == "full" and kind == "stub")
-                or (node_id in placed and not parent_present)
+                or (node_id in placed and not placed_after(node))
             ):
                 leaving.append((_order_key(node), node_id))
         leaving.sort()
+        # Subtrees an exit or detachment took off the client. A node
+        # under one that leaves too needs no operation of its own; one
+        # that stays held comes back detached.
         dropped: set[str] = set()
         for _, node_id in leaving:
             node = doc.get_node_by_id(node_id)
             assert node is not None
             kind = kind_after(node_id)
+            # Only a node in the client's tree went with a dropped
+            # ancestor; a detached stub is not under anything there.
             under_dropped = False
-            if node_id in placed:
-                ancestor = node._parent
-                while ancestor is not None:
-                    if ancestor.id in dropped:
-                        under_dropped = True
-                        break
-                    ancestor = ancestor._parent
-            parent = node._parent
-            parent_present = node is doc.root or (parent is not None and parent.id in present)
-            if under_dropped:
-                # Gone from the client with its ancestor; a node still
-                # referenced comes back detached.
-                placed.discard(node_id)
-                present.discard(node_id)
-                dropped.add(node_id)
-                if kind == "stub":
-                    ordered.append([OP_DETACHED, node_id, node._node_type])
-                    present.add(node_id)
-            elif kind is None:
-                ordered.append([OP_EXIT, node_id])
+            ancestor = node._parent if node_id in placed else None
+            while ancestor is not None:
+                if ancestor.id in dropped:
+                    under_dropped = True
+                    break
+                ancestor = ancestor._parent
+            if kind is None:
+                if not under_dropped:
+                    ordered.append([OP_EXIT, node_id])
                 present.discard(node_id)
                 placed.discard(node_id)
                 dropped.add(node_id)
-            elif parent_present and node_id in placed:
-                # Its state goes; children that leave get their own ops.
-                ordered.append([OP_STUB, node_id])
-            elif node_id in placed:
-                ordered.append([OP_EXIT, node_id])
+            elif node_id in placed and not placed_after(node):
                 ordered.append([OP_DETACHED, node_id, node._node_type])
                 placed.discard(node_id)
                 dropped.add(node_id)
+            elif node_id in placed:
+                ordered.append([OP_STUB, node_id])
 
         # 5. State: whole for nodes that entered, the commit's patch for
         # nodes the client already held in full.

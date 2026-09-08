@@ -137,6 +137,9 @@ class Session:
         # ``_awaiting_scope`` between the schema and its first ``scope``.
         self._views: dict[str, ClientView] = {}
         self._awaiting_scope: set[str] = set()
+        # One scope request at a time per client: a second one waits for
+        # the first's snapshot or delta to be sent.
+        self._scope_locks: dict[str, asyncio.Lock] = {}
         self._version: int = 0
         self._transport: Transport | None = None
 
@@ -392,7 +395,11 @@ class Session:
         self._connecting.pop(client_id, None)
         self._views.pop(client_id, None)
         self._awaiting_scope.discard(client_id)
+        self._scope_locks.pop(client_id, None)
         self._drop_client_undo(client_id)
+
+    def _knows(self, client_id: str) -> bool:
+        return client_id in self._clients or client_id in self._connecting
 
     async def _handle_scope(self, client: ClientConnection, msg: dict[str, Any]) -> None:
         """A client sets (or replaces) its scope. The first ``scope`` of
@@ -401,57 +408,80 @@ class Session:
         the delta from the old view to the new."""
         cid = client.client_id
         ref = msg.get("ref")
-        try:
-            anchors = parse_anchors(msg.get("anchors"))
-        except ValueError as exc:
-            await client.send({
-                "type": MSG_ERROR, "ref": ref, "code": "invalid_op", "message": str(exc),
-            })
-            return
-        # Everything committed so far goes out first: the snapshot or
-        # delta below is taken at the current version.
-        await self._flush_broadcast()
-        if cid in self._awaiting_scope:
-            entry = self._connecting.get(cid)
-            if entry is None:
-                return  # disconnected during the handshake
-            view = ClientView(self._doc, anchors)
-            view.reset()
-            self._views[cid] = view
-            self._awaiting_scope.discard(cid)
-            snapshot = self._snapshot_message(client, with_client_id=True)
-            snapshot["ref"] = ref
+        if not self._knows(cid):
+            return  # a client that already left
+        error: str | None = None
+        anchors: Any = None
+        if "types" in msg:
+            error = "Type filters are not supported: a scope is a set of anchors"
+        else:
             try:
-                await client.send(snapshot)
-            except BaseException:
-                self._forget(cid)
-                raise
-            async with self._flush_lock:
-                if self._connecting.pop(cid, None) is None:
-                    return
-                self._clients[cid] = client
-                for message in entry[1]:
-                    await self._safe_send(client, message)
-            return
-        view = self._views.get(cid)
-        if view is None:
-            # A whole-document client narrowing its view: it holds
-            # everything, and the delta is what leaves.
-            view = ClientView(self._doc, {})
-            view.hold_everything()
-            self._views[cid] = view
-        operations = view.change(anchors)
-        # Under the flush lock: a commit projected after this delta must
-        # not reach the client before it.
-        async with self._flush_lock:
+                anchors = parse_anchors(msg.get("anchors"))
+            except ValueError as exc:
+                error = str(exc)
+        if error is not None:
             await client.send({
-                "type": MSG_SCOPE_ACK,
-                "ref": ref,
-                "version": self._version,
-                "operations": operations,
-                "source_client": None,
-                "anchors": view.resolved_anchors(),
+                "type": MSG_ERROR, "ref": ref, "code": "invalid_op", "message": error,
             })
+            return
+        lock = self._scope_locks.setdefault(cid, asyncio.Lock())
+        async with lock:
+            if not self._knows(cid):
+                return
+            if cid in self._connecting and cid not in self._awaiting_scope:
+                # A whole-document client still receiving its snapshot.
+                await client.send({
+                    "type": MSG_ERROR,
+                    "ref": ref,
+                    "code": "invalid_op",
+                    "message": "A scope cannot be set before the snapshot has been received",
+                })
+                return
+            # Everything committed so far goes out first: the snapshot or
+            # delta below is taken at the current version.
+            await self._flush_broadcast()
+            if not self._knows(cid):
+                return
+            view: ClientView | None
+            if cid in self._awaiting_scope:
+                entry = self._connecting[cid]
+                view = ClientView(self._doc, anchors)
+                view.reset()
+                self._views[cid] = view
+                self._awaiting_scope.discard(cid)
+                snapshot = self._snapshot_message(client, with_client_id=True)
+                snapshot["ref"] = ref
+                try:
+                    await client.send(snapshot)
+                except BaseException:
+                    self._forget(cid)
+                    raise
+                async with self._flush_lock:
+                    if self._connecting.pop(cid, None) is None:
+                        return
+                    self._clients[cid] = client
+                    for message in entry[1]:
+                        await self._safe_send(client, message)
+                return
+            view = self._views.get(cid)
+            if view is None:
+                # A whole-document client narrowing its view: it holds
+                # everything, and the delta is what leaves.
+                view = ClientView(self._doc, {})
+                view.hold_everything()
+                self._views[cid] = view
+            operations = view.change(anchors)
+            # Under the flush lock: a commit projected after this delta
+            # must not reach the client before it.
+            async with self._flush_lock:
+                await self._safe_send(client, {
+                    "type": MSG_SCOPE_ACK,
+                    "ref": ref,
+                    "version": self._version,
+                    "operations": operations,
+                    "source_client": None,
+                    "anchors": view.resolved_anchors(),
+                })
 
     async def _handle_message(
         self, client: ClientConnection, msg: dict[str, Any]
@@ -793,5 +823,4 @@ class Session:
             logger.warning(
                 "Removing dead client %s", client.client_id
             )
-            self._clients.pop(client.client_id, None)
-            self._drop_client_undo(client.client_id)
+            self._forget(client.client_id)

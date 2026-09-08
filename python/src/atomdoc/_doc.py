@@ -1260,7 +1260,7 @@ class Doc:
 
         if self._lifecycle_stage not in ("idle", "change"):
             raise RuntimeError("Cannot serialize during an active transaction")
-        view = ClientView(self, parse_anchors(anchors) if isinstance(anchors, list) else anchors)
+        view = ClientView(self, parse_anchors(anchors))
         view.reset()
         return view.snapshot()
 

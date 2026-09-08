@@ -1,6 +1,7 @@
 """Partial replication: scoped views, partial snapshots, projected
 commits, scope changes, and out-of-scope rejections."""
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -462,7 +463,7 @@ async def test_referenced_node_leaving_scope_becomes_a_detached_stub():
         "type": MSG_OP, "ref": "f1",
         "operations": {"ordered": [[2, ids["i3"].id, 0, ids["s1"].id, "items", 0, 0]], "state": {}},
     })
-    assert ops_of(part) == [{"ordered": [[4, ids["i3"].id], [5, ids["i3"].id, "Item"]], "state": {}}]
+    assert ops_of(part) == [{"ordered": [[5, ids["i3"].id, "Item"]], "state": {}}]
     part.messages.clear()
     # Clearing the reference drops the stub.
     await transport.send(full, {
@@ -619,11 +620,12 @@ async def test_deepening_upgrades_stubs_in_place():
     ack = part.messages[0]
     assert ack["ref"] == "part:s"
     assert ack["anchors"] == [{"id": ids["s1"].id, "depth": 1}]
+    # The boundary stubs fill in place; the next level arrives as stubs.
     assert ack["operations"] == {
         "ordered": [
-            [0, [[ids["i1"].id, "Item"]], ids["s1"].id, "items", 0, ids["i2"].id],
+            [6, ids["i1"].id],
             [0, [[ids["n1"].id, "Note", None]], ids["i1"].id, "notes", 0, 0],
-            [0, [[ids["i2"].id, "Item"]], ids["s1"].id, "items", ids["i1"].id, 0],
+            [6, ids["i2"].id],
         ],
         "state": {ids["i1"].id: {"label": "A"}, ids["i2"].id: {"label": "B"}},
     }
@@ -730,6 +732,125 @@ async def test_disconnect_forgets_the_view():
         "operations": {"ordered": [], "state": {ids["i1"].id: {"label": "x"}}},
     })
     assert part.messages == []
+
+
+# --- Handshake edge cases ---
+
+
+@pytest.mark.asyncio
+async def test_scope_from_a_departed_client_leaves_no_view():
+    session, transport, full, part, ids = await scoped_session([{"id": "s1"}])
+    await transport.disconnect(part)
+    await transport.send(part, {"type": MSG_SCOPE, "ref": "late", "anchors": [{"id": ids["s1"].id}]})
+    assert part.messages == []
+    assert "part" not in session._views
+
+
+@pytest.mark.asyncio
+async def test_scope_during_a_whole_document_handshake_is_refused():
+    doc, ids = build_doc()
+    session = Session(doc)
+    transport = MockTransport()
+    await session.bind(transport)
+
+    class Slow(MockClient):
+        async def send(self, message):
+            await asyncio.sleep(0)
+            self.messages.append(message)
+
+    client = Slow("slow")
+    connect = asyncio.ensure_future(transport.connect(client))
+    await asyncio.sleep(0)  # the schema is in flight; the snapshot is not sent yet
+    await transport.send(client, {"type": MSG_SCOPE, "ref": "early", "anchors": [{"id": ids["s1"].id}]})
+    await connect
+    kinds = types_of(client)
+    assert kinds.count(MSG_SNAPSHOT) == 1
+    error = next(m for m in client.messages if m["type"] == MSG_ERROR)
+    assert error["code"] == "invalid_op"
+    assert kinds.index(MSG_ERROR) < kinds.index(MSG_SNAPSHOT) or client.messages[-1]["type"] == MSG_ERROR
+    assert "slow" not in session._views
+
+
+@pytest.mark.asyncio
+async def test_two_scopes_in_flight_are_answered_in_order():
+    doc, ids = build_doc()
+    session = Session(doc)
+    transport = MockTransport()
+    await session.bind(transport)
+
+    class Slow(MockClient):
+        async def send(self, message):
+            await asyncio.sleep(0)
+            self.messages.append(message)
+
+    part = Slow("part", partial=True)
+    await transport.connect(part)
+    await asyncio.gather(
+        transport.send(part, {"type": MSG_SCOPE, "ref": "s0", "anchors": [{"id": ids["s1"].id}]}),
+        transport.send(part, {"type": MSG_SCOPE, "ref": "s1", "anchors": [{"id": ids["s2"].id}]}),
+    )
+    assert types_of(part) == [MSG_SCHEMA, MSG_SNAPSHOT, MSG_SCOPE_ACK]
+    assert part.messages[1]["ref"] == "s0"
+    assert part.messages[2]["ref"] == "s1"
+    assert part.messages[2]["operations"]["ordered"][0][0] == 0  # s2 enters
+
+
+@pytest.mark.asyncio
+async def test_type_filters_are_refused():
+    session, transport, full, part, ids = await scoped_session([{"id": "s1"}])
+    await transport.send(part, {
+        "type": MSG_SCOPE, "ref": "t", "anchors": [{"id": ids["s1"].id}], "types": ["Item"],
+    })
+    assert part.messages[0]["code"] == "invalid_op"
+
+
+@pytest.mark.asyncio
+async def test_dead_scoped_client_is_forgotten():
+    session, transport, full, part, ids = await scoped_session([{"id": "s1"}])
+
+    async def fail(message):
+        raise ConnectionError("gone")
+
+    part.send = fail  # type: ignore[method-assign]
+    await transport.send(full, {
+        "type": MSG_OP, "ref": "f1",
+        "operations": {"ordered": [], "state": {ids["i1"].id: {"label": "x"}}},
+    })
+    assert "part" not in session.clients
+    assert "part" not in session._views
+
+
+def test_dump_scope_rejects_a_bare_anchor():
+    doc, ids = build_doc()
+    with pytest.raises(ValueError):
+        doc.dump_scope({"id": ids["s1"].id})
+
+
+@pytest.mark.asyncio
+async def test_scoped_client_op_insert_carries_state_for_its_new_node():
+    # What the thick client sends for createNode: the insert and the
+    # node's state in one request.
+    session, transport, full, part, ids = await scoped_session([{"id": "s1"}])
+    await transport.send(part, {
+        "type": MSG_OP, "ref": "part:1",
+        "operations": {
+            "ordered": [[0, [["new1", "Item"]], ids["s1"].id, "items", ids["i2"].id, 0]],
+            "state": {"new1": {"label": "D"}},
+        },
+    })
+    assert types_of(part) == [MSG_PATCH]
+    assert part.messages[0]["operations"] == {
+        "ordered": [[0, [["new1", "Item"]], ids["s1"].id, "items", ids["i2"].id, 0]],
+        "state": {"new1": {"label": "D"}},
+    }
+    # But not for a node that exists, held or not.
+    for existing in (ids["i3"].id, ids["i1"].id):
+        part.messages.clear()
+        await transport.send(part, {
+            "type": MSG_OP, "ref": "part:2",
+            "operations": {"ordered": [[0, [[existing, "Item"]], ids["s1"].id, "items", 0, 0]], "state": {}},
+        })
+        assert part.messages[0]["code"] == "out_of_scope"
 
 
 # --- WebSocket handshake flag ---

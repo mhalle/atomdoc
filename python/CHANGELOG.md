@@ -14,17 +14,23 @@ All notable changes to this project will be documented in this file.
   ancestors, the children past a depth bound, and the targets of
   references held by full nodes. Every later commit is projected onto
   what the client holds: state for full nodes only, ordered operations
-  with `prev`/`next` rewritten to the nearest held siblings, and three
-  new operations for visibility changes (`[3, id]` becomes a stub,
-  `[4, id]` leaves the view, `[5, id, type]` a detached stub appears);
-  an insert naming a node the client holds as a stub fills it in place.
-  A later `scope` message is answered with a `scope_ack` carrying the
-  delta from the old view to the new; a whole-document client may
-  narrow the same way. A request touching a node the client does not
-  hold in full is refused with `out_of_scope` and answered with a fresh
-  partial snapshot; a request before the first scope with `no_scope`.
-  `Doc.dump_scope(anchors)` returns the partial snapshot and stubs.
-  Whole-document clients are unaffected.
+  with `prev`/`next` rewritten to the nearest siblings the client has
+  in place, and four new operations for visibility changes (`[3, id]`
+  becomes a stub, `[4, id]` leaves the view with its subtree,
+  `[5, id, type]` is now a detached stub, `[6, id]` a stub in the tree
+  fills with the state that follows); an insert may name a detached
+  stub the client holds, which places it. Operations are emitted in an
+  order whose preconditions hold on the client at each step: deletes,
+  arrivals top-down, moves, exits, state. A later `scope` message is
+  answered with a `scope_ack` carrying the delta from the old view to
+  the new; a whole-document client may narrow the same way; one scope
+  request at a time per client. A request touching a node the client
+  does not hold in full, or inserting a node that exists, is refused
+  with `out_of_scope` and answered with a fresh partial snapshot; a
+  request before the first scope with `no_scope`; type filters with
+  `invalid_op`. `Doc.dump_scope(anchors)` returns the partial snapshot
+  and stubs. Whole-document clients are unaffected. Verified by a
+  randomized replica simulation (`tests/test_scope_fuzz.py`).
 
 ## [0.5.3] - 2026-09-08
 
