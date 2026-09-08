@@ -1250,6 +1250,20 @@ class Doc:
         target = node if node is not None else self._root
         return _node_to_wire(target, include_defaults=include_defaults)
 
+    def dump_scope(self, anchors: Any) -> tuple[JsonDoc, list[list[str]]]:
+        """The document as a scoped client would receive it: the tree
+        held from ``anchors`` (a list of ``{id, depth?}``) with stubs
+        (``[id, type, None]``) for ancestors, boundary children, and
+        reference targets outside the scope, plus the detached stubs as
+        ``[id, type]`` pairs. See PROTOCOL.md on partial replication."""
+        from ._scope import ClientView, parse_anchors
+
+        if self._lifecycle_stage not in ("idle", "change"):
+            raise RuntimeError("Cannot serialize during an active transaction")
+        view = ClientView(self, parse_anchors(anchors) if isinstance(anchors, list) else anchors)
+        view.reset()
+        return view.snapshot()
+
     # --- Composition ---
 
     def adopt(

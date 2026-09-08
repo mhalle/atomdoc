@@ -15,11 +15,14 @@ from ._protocol import (
     MSG_PATCH,
     MSG_REDO,
     MSG_SCHEMA,
+    MSG_SCOPE,
+    MSG_SCOPE_ACK,
     MSG_SNAPSHOT,
     MSG_UNDO,
     operations_from_wire,
     operations_to_wire,
 )
+from ._scope import ClientView, OutOfScope, parse_anchors
 from ._transport import ClientConnection, Transport
 from ._types import ChangeEvent, JsonDoc, ListenerError, Operations
 from ._undo import UndoManager
@@ -47,10 +50,13 @@ class _Rejected(Exception):
     applied itself).
     """
 
-    def __init__(self, cause: BaseException, *, resync: bool = True) -> None:
+    def __init__(
+        self, cause: BaseException, *, resync: bool = True, code: str = "rejected"
+    ) -> None:
         super().__init__(str(cause))
         self.cause = cause
         self.resync = resync
+        self.code = code
 
 
 class _Unsupported(Exception):
@@ -126,6 +132,11 @@ class Session:
         # commit that lands meanwhile is newer than their snapshot, so it
         # is held here and delivered right after the snapshot.
         self._connecting: dict[str, tuple[ClientConnection, list[dict[str, Any]]]] = {}
+        # Scoped clients (partial replication): what each one holds, and
+        # how commits are projected onto it. A partial client is
+        # ``_awaiting_scope`` between the schema and its first ``scope``.
+        self._views: dict[str, ClientView] = {}
+        self._awaiting_scope: set[str] = set()
         self._version: int = 0
         self._transport: Transport | None = None
 
@@ -216,6 +227,8 @@ class Session:
             self._transport = None
         self._clients.clear()
         self._connecting.clear()
+        self._views.clear()
+        self._awaiting_scope.clear()
         for client_id in list(self._client_undo):
             self._drop_client_undo(client_id)
         for task in list(self._flush_tasks):
@@ -242,6 +255,11 @@ class Session:
             # match their requests by ``ref`` and treat this as advisory.
             if request.ops is not None and _normalize(wire) == request.ops:
                 source = request.client_id
+        recipients = [
+            cid
+            for cid in (*self._clients, *self._connecting)
+            if cid not in self._views and cid not in self._awaiting_scope
+        ]
         self._pending_broadcasts.append((
             {
                 "type": MSG_PATCH,
@@ -250,8 +268,31 @@ class Session:
                 "source_client": source,
                 "ref": ref,
             },
-            [*self._clients, *self._connecting],
+            recipients,
         ))
+        # Scoped clients get the commit projected onto what they hold,
+        # computed now against the tree as committed. A client whose
+        # view the commit did not touch hears nothing, unless the commit
+        # answers its own request.
+        for cid, view in self._views.items():
+            if cid not in self._clients and cid not in self._connecting:
+                continue
+            projected = view.project(event)
+            mine = request is not None and request.client_id == cid
+            if projected is None:
+                if not mine:
+                    continue
+                projected = {"ordered": [], "state": {}}
+            self._pending_broadcasts.append((
+                {
+                    "type": MSG_PATCH,
+                    "version": self._version,
+                    "operations": projected,
+                    "source_client": None,
+                    "ref": ref if mine else None,
+                },
+                [cid],
+            ))
         if request is None:
             # Not inside a request handler (the host edited the document
             # directly): nothing will flush this later, so do it now.
@@ -278,6 +319,19 @@ class Session:
 
         if self._cached_schema is None:
             self._cached_schema = self._doc.atomdoc_schema()
+
+        if client.wants_partial:
+            # Partial replication: the schema now, the snapshot once the
+            # client has said what it holds (its first ``scope``).
+            self._connecting[client.client_id] = (client, [])
+            self._awaiting_scope.add(client.client_id)
+            self._make_client_undo(client.client_id)
+            try:
+                await client.send({"type": MSG_SCHEMA, "schema": self._cached_schema})
+            except BaseException:
+                self._forget(client.client_id)
+                raise
+            return
 
         # Register as connecting and take the snapshot in the same
         # synchronous step: every commit from here on is newer than the
@@ -309,8 +363,16 @@ class Session:
             "type": MSG_SNAPSHOT,
             "doc_id": self._doc.id,
             "version": self._version,
-            "data": self._doc.dump(),
         }
+        view = self._views.get(client.client_id)
+        if view is None:
+            message["data"] = self._doc.dump()
+        else:
+            data, stubs = view.snapshot()
+            message["data"] = data
+            message["partial"] = True
+            message["stubs"] = stubs
+            message["anchors"] = view.resolved_anchors()
         if with_client_id:
             message["client_id"] = client.client_id
         return message
@@ -318,7 +380,78 @@ class Session:
     async def _send_snapshot(
         self, client: ClientConnection, *, with_client_id: bool = False
     ) -> None:
+        view = self._views.get(client.client_id)
+        if view is not None:
+            # A scoped resync re-sends the client's scope, never the
+            # whole document.
+            view.reset()
         await client.send(self._snapshot_message(client, with_client_id=with_client_id))
+
+    def _forget(self, client_id: str) -> None:
+        self._clients.pop(client_id, None)
+        self._connecting.pop(client_id, None)
+        self._views.pop(client_id, None)
+        self._awaiting_scope.discard(client_id)
+        self._drop_client_undo(client_id)
+
+    async def _handle_scope(self, client: ClientConnection, msg: dict[str, Any]) -> None:
+        """A client sets (or replaces) its scope. The first ``scope`` of
+        a partial connection completes its handshake with a partial
+        snapshot; any later one is answered with a ``scope_ack`` carrying
+        the delta from the old view to the new."""
+        cid = client.client_id
+        ref = msg.get("ref")
+        try:
+            anchors = parse_anchors(msg.get("anchors"))
+        except ValueError as exc:
+            await client.send({
+                "type": MSG_ERROR, "ref": ref, "code": "invalid_op", "message": str(exc),
+            })
+            return
+        # Everything committed so far goes out first: the snapshot or
+        # delta below is taken at the current version.
+        await self._flush_broadcast()
+        if cid in self._awaiting_scope:
+            entry = self._connecting.get(cid)
+            if entry is None:
+                return  # disconnected during the handshake
+            view = ClientView(self._doc, anchors)
+            view.reset()
+            self._views[cid] = view
+            self._awaiting_scope.discard(cid)
+            snapshot = self._snapshot_message(client, with_client_id=True)
+            snapshot["ref"] = ref
+            try:
+                await client.send(snapshot)
+            except BaseException:
+                self._forget(cid)
+                raise
+            async with self._flush_lock:
+                if self._connecting.pop(cid, None) is None:
+                    return
+                self._clients[cid] = client
+                for message in entry[1]:
+                    await self._safe_send(client, message)
+            return
+        view = self._views.get(cid)
+        if view is None:
+            # A whole-document client narrowing its view: it holds
+            # everything, and the delta is what leaves.
+            view = ClientView(self._doc, {})
+            view.hold_everything()
+            self._views[cid] = view
+        operations = view.change(anchors)
+        # Under the flush lock: a commit projected after this delta must
+        # not reach the client before it.
+        async with self._flush_lock:
+            await client.send({
+                "type": MSG_SCOPE_ACK,
+                "ref": ref,
+                "version": self._version,
+                "operations": operations,
+                "source_client": None,
+                "anchors": view.resolved_anchors(),
+            })
 
     async def _handle_message(
         self, client: ClientConnection, msg: dict[str, Any]
@@ -333,6 +466,18 @@ class Session:
             return
         msg_type = msg.get("type")
         ref = msg.get("ref")
+
+        if msg_type == MSG_SCOPE:
+            await self._handle_scope(client, msg)
+            return
+        if client.client_id in self._awaiting_scope:
+            await client.send({
+                "type": MSG_ERROR,
+                "ref": ref,
+                "code": "no_scope",
+                "message": "A partial connection must send its scope before anything else",
+            })
+            return
 
         # The request context lives only for the synchronous dispatch:
         # every commit made while it is set is attributed to this request.
@@ -387,7 +532,7 @@ class Session:
             await client.send({
                 "type": MSG_ERROR,
                 "ref": ref,
-                "code": "rejected",
+                "code": rejected.code,
                 "message": str(rejected),
             })
             if rejected.resync:
@@ -409,9 +554,7 @@ class Session:
         await self._flush_broadcast()
 
     async def _handle_disconnect(self, client: ClientConnection) -> None:
-        self._clients.pop(client.client_id, None)
-        self._connecting.pop(client.client_id, None)
-        self._drop_client_undo(client.client_id)
+        self._forget(client.client_id)
 
     # --- Message handlers ---
 
@@ -425,6 +568,7 @@ class Session:
             raise ValueError("'operations' must be {'ordered': [...], 'state': {...}}")
         ops = operations_from_wire(raw)
         self._check_well_formed(ops)
+        self._check_scope(client, lambda view: view.check_operations(ops))
         # Compare against the canonical form so a minimal or reordered
         # frame still matches its own echo. The root spelled by its ID is
         # the root spelled as 0.
@@ -460,6 +604,18 @@ class Session:
                 },
                 [client.client_id],
             ))
+
+    def _check_scope(self, client: ClientConnection, check: Any) -> None:
+        """A scoped client may only touch what it holds in full; the
+        rejection is ``out_of_scope`` and, like any rejection, resyncs
+        the client (with its scope)."""
+        view = self._views.get(client.client_id)
+        if view is None:
+            return
+        try:
+            check(view)
+        except OutOfScope as exc:
+            raise _Rejected(exc, code="out_of_scope") from exc
 
     def _empty_answer(self, ref: Any) -> dict[str, Any]:
         return {
@@ -530,6 +686,7 @@ class Session:
             raise ValueError(f"Unknown position: {position!r}")
         if position in ("before", "after") and not target_id:
             raise ValueError(f"position {position!r} needs a 'target_id'")
+        self._check_scope(client, lambda view: view.check_create(parent_id, target_id))
 
         try:
             with self._doc.transaction():

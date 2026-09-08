@@ -6,6 +6,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from ._transport import ClientConnection, Transport
@@ -28,10 +29,18 @@ class WebSocketClient(ClientConnection):
     def __init__(self, ws: ServerConnection) -> None:
         self._ws = ws
         self._client_id = str(uuid4())
+        request = getattr(ws, "request", None)
+        path = getattr(request, "path", None) or ""
+        query = parse_qs(urlsplit(path).query)
+        self._partial = query.get("partial", ["0"])[0] in ("1", "true")
 
     @property
     def client_id(self) -> str:
         return self._client_id
+
+    @property
+    def wants_partial(self) -> bool:
+        return self._partial
 
     async def send(self, message: dict[str, Any]) -> None:
         await self._ws.send(json.dumps(message))

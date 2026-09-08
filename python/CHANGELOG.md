@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- Partial replication, server side. A client that connects with
+  `?partial=1` receives the schema and then sends a `scope` message
+  (`{anchors: [{id, depth?}], ref}`); it is answered with a partial
+  `snapshot` (`partial: true`, `stubs`, `anchors`) holding the subtrees
+  under its anchors, with stubs (`[id, type, null]`) for their
+  ancestors, the children past a depth bound, and the targets of
+  references held by full nodes. Every later commit is projected onto
+  what the client holds: state for full nodes only, ordered operations
+  with `prev`/`next` rewritten to the nearest held siblings, and three
+  new operations for visibility changes (`[3, id]` becomes a stub,
+  `[4, id]` leaves the view, `[5, id, type]` a detached stub appears);
+  an insert naming a node the client holds as a stub fills it in place.
+  A later `scope` message is answered with a `scope_ack` carrying the
+  delta from the old view to the new; a whole-document client may
+  narrow the same way. A request touching a node the client does not
+  hold in full is refused with `out_of_scope` and answered with a fresh
+  partial snapshot; a request before the first scope with `no_scope`.
+  `Doc.dump_scope(anchors)` returns the partial snapshot and stubs.
+  Whole-document clients are unaffected.
+
 ## [0.5.3] - 2026-09-08
 
 ### Added

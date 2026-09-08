@@ -15,6 +15,8 @@ MSG_OP = "op"
 MSG_CREATE = "create"
 MSG_UNDO = "undo"
 MSG_REDO = "redo"
+MSG_SCOPE = "scope"
+MSG_SCOPE_ACK = "scope_ack"
 
 
 def operations_to_wire(ops: Operations) -> dict[str, Any]:

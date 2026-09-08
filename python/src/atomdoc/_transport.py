@@ -14,6 +14,13 @@ class ClientConnection(ABC):
     @abstractmethod
     def client_id(self) -> str: ...
 
+    @property
+    def wants_partial(self) -> bool:
+        """True when the client asked for partial replication at connect
+        (``?partial=1`` on a WebSocket URL): the session sends the schema
+        and waits for the client's ``scope`` before any snapshot."""
+        return False
+
     @abstractmethod
     async def send(self, message: dict[str, Any]) -> None: ...
 
