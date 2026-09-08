@@ -15,6 +15,14 @@ export interface UndoManagerOptions {
   mergeInterval?: number;
   /** Clock used for the merge interval; defaults to `Date.now`. */
   clock?: () => number;
+  /**
+   * Offered every undo or redo step before it is applied. Returning true
+   * takes the step over: the caller applies it later (after a server
+   * confirms it, say) inside {@link UndoManager.commitAs}, which files the
+   * resulting commit on the opposite stack. Returning false applies the
+   * step to the document now.
+   */
+  dispatch?: (operations: WireOperations, kind: "undo" | "redo") => boolean;
 }
 
 interface UndoStackItem {
@@ -51,12 +59,14 @@ export class UndoManager {
   private txType: "update" | "undo" | "redo" = "update";
   private lastUpdate: number | undefined;
   private unsub: () => void;
+  private dispatch: UndoManagerOptions["dispatch"];
 
   constructor(doc: LocalDoc, maxSteps = 100, options: UndoManagerOptions = {}) {
     this.doc = doc;
     this.maxSteps = maxSteps;
     this.mergeInterval = options.mergeInterval ?? 0;
     this.clock = options.clock ?? Date.now;
+    this.dispatch = options.dispatch;
     this.unsub = this.isEnabled
       ? doc.onChange((event) => this._onChange(event))
       : () => {};
@@ -105,8 +115,9 @@ export class UndoManager {
     this.doc.forceCommit();
     const item = this.undoStack.pop();
     if (!item) return;
-    this.txType = "undo";
     this.lastUpdate = undefined;
+    if (this.dispatch?.(item.operations, "undo")) return;
+    this.txType = "undo";
     try {
       this.doc.applyOperations(item.operations, undefined, true);
     } catch (e) {
@@ -125,13 +136,30 @@ export class UndoManager {
     this.doc.forceCommit();
     const item = this.redoStack.pop();
     if (!item) return;
-    this.txType = "redo";
     this.lastUpdate = undefined;
+    if (this.dispatch?.(item.operations, "redo")) return;
+    this.txType = "redo";
     try {
       this.doc.applyOperations(item.operations, undefined, true);
     } catch (e) {
       if (!(e instanceof ListenerError)) this.redoStack.push(item);
       throw e;
+    } finally {
+      this.txType = "update";
+    }
+  }
+
+  /**
+   * Run `fn`, whose commits count as the `kind` step a `dispatch` took
+   * over: an undo commit is filed on the redo stack and a redo commit on
+   * the undo stack, as if the manager had applied the step itself.
+   */
+  commitAs(kind: "undo" | "redo", fn: () => void): void {
+    this.doc.forceCommit();
+    this.txType = kind;
+    this.lastUpdate = undefined;
+    try {
+      fn();
     } finally {
       this.txType = "update";
     }

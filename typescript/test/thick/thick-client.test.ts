@@ -1,11 +1,13 @@
 import { describe, it, expect, vi } from "vitest";
 import { ThickAtomDocClient } from "../../src/thick/thick-client.js";
+import { getSlotChildren } from "../../src/thick/doc-node.js";
 import type {
   AtomDocSchema,
   JsonDoc,
   SchemaMsg,
   SnapshotMsg,
   PatchMsg,
+  WireOperations,
 } from "../../src/types.js";
 
 const schema: AtomDocSchema = {
@@ -21,12 +23,46 @@ const schema: AtomDocSchema = {
     Item: {
       json_schema: {},
       field_tiers: { label: "mergeable" },
-      slots: {},
+      slots: { children: { allowed_type: "Item" } },
       field_defaults: { label: "" },
     },
   },
   value_types: {},
 };
+
+const ROOT = "01jqp00000000000000000000";
+type Sent = { ref: string; operations: WireOperations };
+
+/**
+ * A client whose socket records what it sends. `echo` answers a sent op
+ * the way the server does when it recorded the request verbatim.
+ */
+function onlineClient(
+  options: { coalesce?: boolean; mergeInterval?: number } = { coalesce: false },
+  data: JsonDoc = snapshot,
+): { client: ThickAtomDocClient; sent: Sent[]; echo: (op: Sent, ops?: WireOperations) => void } {
+  const client = new ThickAtomDocClient({ url: "ws://unused", ...options });
+  client._injectMessage({ type: "schema", schema } as SchemaMsg);
+  client._injectMessage({ type: "snapshot", doc_id: ROOT, version: 0, data, client_id: "me" } as SnapshotMsg);
+  const sent: Sent[] = [];
+  const internals = client as unknown as { online: boolean; ws: unknown };
+  internals.online = true;
+  internals.ws = { send: (text: string) => sent.push(JSON.parse(text)) };
+  let version = 0;
+  const echo = (op: Sent, ops: WireOperations = op.operations) => {
+    client._injectMessage({
+      type: "patch",
+      version: ++version,
+      ref: op.ref,
+      source_client: ops === op.operations ? "me" : null,
+      operations: ops,
+    } as PatchMsg);
+  };
+  return { client, sent, echo };
+}
+
+const items = (client: ThickAtomDocClient, parentId = ROOT, slot = "items") =>
+  getSlotChildren(client.getDoc()!.getNode(parentId)!, slot).map((n) => n.id);
 
 const snapshot: JsonDoc = [
   "01jqp00000000000000000000",
@@ -80,20 +116,36 @@ describe("ThickAtomDocClient", () => {
     expect(client.getStore().getRoot()!.state.title).toBe("Updated");
   });
 
-  it("createNode applies locally", () => {
-    const client = setupClient();
-    const rootId = client.getStore().getRootId();
-    const newId = client.createNode("Item", { label: "New" }, rootId, "items");
+  it("createNode is applied when the server confirms it", () => {
+    const { client, sent, echo } = onlineClient();
+    const newId = client.createNode("Item", { label: "New" }, ROOT, "items");
 
     expect(newId).toBeTruthy();
-    expect(client.getDoc()!.getNode(newId)).toBeDefined();
+    expect(client.getDoc()!.getNode(newId)).toBeUndefined();
+    expect(client.getStore().getNode(newId)).toBeUndefined();
+    expect(client.pendingStructure()).toBe(true);
+    expect(sent.length).toBe(1);
+    expect(sent[0].operations).toEqual({
+      ordered: [[0, [[newId, "Item"]], 0, "items", "i1", 0]],
+      state: { [newId]: { label: "New" } },
+    });
+
+    echo(sent[0]);
+    expect(client.getDoc()!.getNode(newId)!.state.label).toBe("New");
     expect(client.getStore().getNode(newId)!.state.label).toBe("New");
+    expect(items(client)).toEqual(["i1", newId]);
+    expect(client.pendingStructure()).toBe(false);
+    expect(sent.length).toBe(1); // the echo is not sent back
+    expect(client.getUndoManager()!.canUndo).toBe(true); // but it is this user's work
   });
 
-  it("deleteNode applies locally", () => {
-    const client = setupClient();
+  it("deleteNode is applied when the server confirms it", () => {
+    const { client, sent, echo } = onlineClient();
     client.deleteNode("i1");
 
+    expect(client.getDoc()!.getNode("i1")).toBeDefined();
+    expect(sent[0].operations).toEqual({ ordered: [[1, "i1", 0]], state: {} });
+    echo(sent[0]);
     expect(client.getDoc()!.getNode("i1")).toBeUndefined();
     expect(client.getStore().getNode("i1")).toBeUndefined();
   });
@@ -192,14 +244,17 @@ describe("ThickAtomDocClient store coalescing", () => {
   });
 
   it("flushStore brings the store up to date now", () => {
-    const client = setupClient({});
+    const { client, sent, echo } = onlineClient({});
     const store = client.getStore();
-    client.createNode("Item", { label: "New" }, store.getRootId(), "items");
+    client.setField(ROOT, "title", "typed");
     client.deleteNode("i1");
+    echo(sent[1]);
+    expect(store.getRoot()!.state.title).toBe("Hello");
     expect(store.getNode("i1")).toBeDefined();
     client.flushStore();
+    expect(store.getRoot()!.state.title).toBe("typed");
     expect(store.getNode("i1")).toBeUndefined();
-    expect(store.getChildren(store.getRootId(), "items").length).toBe(1);
+    expect(store.getChildren(ROOT, "items")).toEqual([]);
   });
 
   it("a resync discards queued store updates", async () => {
@@ -217,6 +272,178 @@ describe("ThickAtomDocClient store coalescing", () => {
     await new Promise((r) => setTimeout(r, 5));
     expect(store.getRoot()!.state.title).toBe("server");
     expect(store.getNode("i1")).toBeUndefined();
+  });
+});
+
+describe("ThickAtomDocClient confirmed structure", () => {
+  const three: JsonDoc = [
+    ROOT,
+    "Page",
+    { title: "Hello" },
+    { items: [["i1", "Item", {}], ["i2", "Item", {}], ["i3", "Item", {}]] },
+  ];
+
+  it("two appends in a row keep their order", () => {
+    const { client, sent, echo } = onlineClient();
+    const first = client.createNode("Item", {}, ROOT, "items");
+    const second = client.createNode("Item", {}, ROOT, "items");
+    expect(sent[0].operations.ordered[0]).toEqual([0, [[first, "Item"]], 0, "items", "i1", 0]);
+    expect(sent[1].operations.ordered[0]).toEqual([0, [[second, "Item"]], 0, "items", first, 0]);
+    echo(sent[0]);
+    echo(sent[1]);
+    expect(items(client)).toEqual(["i1", first, second]);
+  });
+
+  it("prepends anchor on the pending first node", () => {
+    const { client, sent, echo } = onlineClient();
+    const first = client.createNode("Item", {}, ROOT, "items", "prepend");
+    const second = client.createNode("Item", {}, ROOT, "items", "prepend");
+    expect(sent[0].operations.ordered[0]).toEqual([0, [[first, "Item"]], 0, "items", 0, "i1"]);
+    expect(sent[1].operations.ordered[0]).toEqual([0, [[second, "Item"]], 0, "items", 0, first]);
+    echo(sent[0]);
+    echo(sent[1]);
+    expect(items(client)).toEqual([second, first, "i1"]);
+    expect(() => client.createNode("Item", {}, ROOT, "items", "sideways")).toThrow(/position/);
+  });
+
+  it("a child can be created under a parent that is still pending", () => {
+    const { client, sent, echo } = onlineClient();
+    const parent = client.createNode("Item", { label: "p" }, ROOT, "items");
+    const child = client.createNode("Item", { label: "c" }, parent, "children");
+    expect(sent[1].operations.ordered[0]).toEqual([0, [[child, "Item"]], parent, "children", 0, 0]);
+    expect(() => client.createNode("Item", {}, parent, "nope")).toThrow(/Slot 'nope'/);
+    expect(() => client.createNode("Item", {}, "ghost", "children")).toThrow(/Parent not found/);
+    echo(sent[0]);
+    echo(sent[1]);
+    expect(items(client, parent, "children")).toEqual([child]);
+    expect(client.getDoc()!.getNode(child)!.parent!.id).toBe(parent);
+  });
+
+  it("a field written on a pending node is sent and lands with the node", () => {
+    const { client, sent, echo } = onlineClient();
+    const id = client.createNode("Item", { label: "first" }, ROOT, "items");
+    client.setField(id, "label", "second");
+    expect(sent[1].operations).toEqual({ ordered: [], state: { [id]: { label: "second" } } });
+    expect(() => client.setField(id, "nope", 1)).toThrow(/Unknown field/);
+    expect(() => client.setField("ghost", "label", 1)).toThrow(/Node not found/);
+    echo(sent[0]);
+    expect(client.getDoc()!.getNode(id)!.state.label).toBe("first");
+    echo(sent[1]);
+    expect(client.getDoc()!.getNode(id)!.state.label).toBe("second");
+  });
+
+  it("undo and redo of confirmed structure are themselves confirmed", () => {
+    const { client, sent, echo } = onlineClient();
+    const id = client.createNode("Item", { label: "New" }, ROOT, "items");
+    echo(sent[0]);
+    const undoMgr = client.getUndoManager()!;
+    expect(undoMgr.canUndo).toBe(true);
+
+    client.undo();
+    // Sent, not applied: the node is still there until the server answers.
+    expect(client.getDoc()!.getNode(id)).toBeDefined();
+    expect(sent[1].operations.ordered).toEqual([[1, id, 0]]);
+    expect(undoMgr.canUndo).toBe(false);
+    expect(undoMgr.canRedo).toBe(false); // filed when the echo commits
+    echo(sent[1]);
+    expect(client.getDoc()!.getNode(id)).toBeUndefined();
+    expect(undoMgr.canRedo).toBe(true);
+    expect(undoMgr.canUndo).toBe(false);
+
+    client.redo();
+    expect(sent[2].operations.ordered[0]).toEqual([0, [[id, "Item"]], 0, "items", "i1", 0]);
+    expect(sent[2].operations.state).toEqual({ [id]: { label: "New" } });
+    echo(sent[2]);
+    expect(items(client)).toEqual(["i1", id]);
+    expect(undoMgr.canUndo).toBe(true);
+    expect(undoMgr.canRedo).toBe(false);
+    expect(sent.length).toBe(3);
+  });
+
+  it("undo of a field write stays local", () => {
+    const { client, sent } = onlineClient();
+    client.setField(ROOT, "title", "typed");
+    client.undo();
+    expect(client.getDoc()!.root.state.title).toBe("Hello");
+    expect(sent.length).toBe(2);
+    expect(sent[1].operations).toEqual({ ordered: [], state: { [ROOT]: { title: "Hello" } } });
+    expect(client.getUndoManager()!.canRedo).toBe(true);
+  });
+
+  it("moves anchor around structure that is still pending", () => {
+    const { client, sent, echo } = onlineClient({ coalesce: false }, three);
+    client.deleteNode("i3");
+    // The last stable sibling is i2: i3 is on its way out.
+    const added = client.createNode("Item", {}, ROOT, "items");
+    expect(sent[1].operations.ordered[0]).toEqual([0, [[added, "Item"]], 0, "items", "i2", 0]);
+    expect(() => client.moveNodeRelative("i1", "i3", "after")).toThrow(/Node not found/);
+    expect(() => client.deleteNode("i3")).toThrow(/Node not found/);
+    // Append i1: after the pending append, not after i2.
+    client.moveNode("i1", ROOT, "items");
+    expect(sent[2].operations.ordered[0]).toEqual([2, "i1", 0, 0, "items", added, 0]);
+    // A move relative to a pending node anchors on that node alone.
+    client.moveNodeRelative("i2", added, "before");
+    expect(sent[3].operations.ordered[0]).toEqual([2, "i2", 0, 0, "items", 0, added]);
+    for (const op of sent) echo(op);
+    expect(items(client)).toEqual(["i2", added, "i1"]);
+  });
+
+  it("a move to where the node already is sends nothing", () => {
+    const { client, sent } = onlineClient({ coalesce: false }, three);
+    client.moveNode("i3", ROOT, "items");
+    client.moveNodeRelative("i2", "i3", "before");
+    client.moveNodeRelative("i2", "i1", "after");
+    expect(sent).toEqual([]);
+    expect(() => client.moveNodeRelative("i1", "i1", "after")).toThrow(/in the range/);
+    expect(() => client.moveNode(ROOT, ROOT, "items")).toThrow(/root/);
+  });
+
+  it("a structural edit made offline is sent after the reconnect snapshot", () => {
+    const { client, sent, echo } = onlineClient();
+    const internals = client as unknown as { online: boolean };
+    internals.online = false;
+    const id = client.createNode("Item", { label: "later" }, ROOT, "items");
+    client.setField(ROOT, "title", "offline"); // applied locally, buffered
+    expect(sent).toEqual([]);
+    expect(client.pendingStructure()).toBe(true);
+    internals.online = true;
+    client._injectMessage({ type: "snapshot", doc_id: ROOT, version: 3, data: snapshot } as SnapshotMsg);
+    // Both are sent in order; the new document shows neither until echoed.
+    expect(sent.map((s) => s.operations.ordered.length)).toEqual([1, 0]);
+    expect(client.getDoc()!.getNode(id)).toBeUndefined();
+    expect(client.getDoc()!.root.state.title).toBe("Hello");
+    echo(sent[0]);
+    echo(sent[1]);
+    expect(client.getDoc()!.getNode(id)!.state.label).toBe("later");
+    expect(client.getDoc()!.root.state.title).toBe("offline");
+  });
+
+  it("a rejected structural edit leaves the document as it was", () => {
+    const { client, sent } = onlineClient();
+    const errors = vi.fn();
+    client.onError(errors);
+    const id = client.createNode("Item", {}, ROOT, "items");
+    client._injectMessage({ type: "error", ref: sent[0].ref, code: "rejected", message: "no" });
+    expect(errors).toHaveBeenCalledTimes(1);
+    expect(client.pendingStructure()).toBe(false);
+    expect(client.getDoc()!.getNode(id)).toBeUndefined();
+    expect(items(client)).toEqual(["i1"]);
+  });
+
+  it("a remote change to structure is not undoable; an own echo is", () => {
+    const { client, sent, echo } = onlineClient();
+    client._injectMessage({
+      type: "patch",
+      version: 1,
+      operations: { ordered: [[0, [["r1", "Item"]], 0, "items", "i1", 0]], state: {} },
+      source_client: "other",
+    } as PatchMsg);
+    expect(items(client)).toEqual(["i1", "r1"]);
+    expect(client.getUndoManager()!.canUndo).toBe(false);
+    client.deleteNode("r1");
+    echo(sent[0]);
+    expect(items(client)).toEqual(["i1"]);
+    expect(client.getUndoManager()!.canUndo).toBe(true);
   });
 });
 

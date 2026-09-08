@@ -332,6 +332,11 @@ describe("second review: thick client", () => {
       boot(ws2, 5); // the snapshot still has the old value
       expect(sentOps(ws2).length).toBe(1);
       expect(sentOps(ws2)[0].operations!.state.a.name).toBe("typed");
+      expect(c.getDoc()!.getNode("a")!.state.name).toBe("a"); // until confirmed
+      ws2.deliver({
+        type: "patch", version: 6, source_client: "me", ref: sentOps(ws2)[0].ref,
+        operations: { ordered: [], state: { a: { name: "typed" } } },
+      });
       expect(c.getDoc()!.getNode("a")!.state.name).toBe("typed");
     });
   });
@@ -452,14 +457,18 @@ describe("second review: thick client", () => {
       });
 
       // Ordering: we append "u" after "d"; the device appended "x" after
-      // "d" first, so the server placed "u" between "d" and "x".
+      // "d" first, so the server placed "u" between "d" and "x". The
+      // insert waits for the server, so the local tree only ever holds
+      // the server's order.
       const uId = c.createNode("Item", { name: "u" }, c.getDoc()!.root.id, "children");
       const op2 = sentOps(ws).at(-1)!;
+      expect(op2.operations!.ordered).toEqual([[0, [[uId, "Item"]], 0, "children", "d", 0]]);
+      expect(ids(c.getDoc()!)).toEqual(["a", "b", "c", "d"]);
       ws.deliver({
         type: "patch", version: 3, source_client: null, ref: null,
         operations: { ordered: [[0, [["x", "Item"]], 0, "children", "d", 0]], state: {} },
       });
-      expect(ids(c.getDoc()!)).toEqual(["a", "b", "c", "d", "x", uId]);
+      expect(ids(c.getDoc()!)).toEqual(["a", "b", "c", "d", "x"]);
       // The server recorded the insert with a different neighbor than we
       // sent, so it is not a verbatim echo: source_client is null, but
       // the ref is ours and that is what identifies our request.
@@ -468,6 +477,7 @@ describe("second review: thick client", () => {
         operations: { ordered: [[0, [[uId, "Item"]], 0, "children", "d", "x"]], state: { [uId]: { name: "u" } } },
       });
       expect(ids(c.getDoc()!)).toEqual(["a", "b", "c", "d", uId, "x"]);
+      expect(c.getDoc()!.getNode(uId)!.state.name).toBe("u");
       expect(sentOps(ws).length).toBe(3); // mine, the undo, the insert
       expect((c as unknown as { pendingOps: unknown[] }).pendingOps).toEqual([]);
       // A node a server-side normalizer added alongside ours is inserted.
@@ -485,7 +495,7 @@ describe("second review: thick client", () => {
     });
   });
 
-  it("masks under merged undo entries and pending moves", async () => {
+  it("masks under merged undo entries; a pending move masks nothing", async () => {
     await withFakeWebSocket(async () => {
       const c = new ThickAtomDocClient({ url: "ws://x", mergeInterval: 1_000_000 });
       const p = c.connect();
@@ -494,11 +504,11 @@ describe("second review: thick client", () => {
       await p;
       boot(ws);
       // Two pending writes to the same field, merged into one undo step,
-      // plus a pending move of "d" to the front.
+      // plus a pending move of "d" to the front (not applied yet).
       c.setField("a", "name", "first");
       c.setField("a", "name", "second");
       c.moveNodeRelative("d", "a", "before");
-      expect(ids(c.getDoc()!)).toEqual(["d", "a", "b", "c"]);
+      expect(ids(c.getDoc()!)).toEqual(["a", "b", "c", "d"]);
       const [op1, op2, op3] = sentOps(ws);
       ws.deliver({
         type: "patch", version: 1, source_client: null, ref: null,
@@ -507,10 +517,11 @@ describe("second review: thick client", () => {
           state: { a: { name: "remote" } },
         },
       });
-      // Both the write and the move are masked: our pending edits win on
-      // the server, so the local document already shows the outcome.
+      // The write is masked: our pending edit wins on the server, so the
+      // local document already shows the outcome. The remote move is
+      // applied as is: the server did it before our move.
       expect(c.getDoc()!.getNode("a")!.state.name).toBe("second");
-      expect(ids(c.getDoc()!)).toEqual(["d", "a", "b", "c"]);
+      expect(ids(c.getDoc()!)).toEqual(["a", "b", "d", "c"]);
       // The echo of the older write does not overwrite the newer pending one.
       ws.deliver({
         type: "patch", version: 2, source_client: "me", ref: op1.ref,
@@ -526,14 +537,25 @@ describe("second review: thick client", () => {
         operations: { ordered: [[2, "d", 0, 0, "children", 0, "a"]], state: {} },
       });
       expect((c as unknown as { pendingOps: unknown[] }).pendingOps).toEqual([]);
+      expect(ids(c.getDoc()!)).toEqual(["d", "a", "b", "c"]);
       expect(c.getDoc()!.getNode("a")!.state.name).toBe("second");
+      // The move is the newest undo step; the merged writes are the one
+      // before. Undoing the move puts d back where it was when the move
+      // was confirmed: between b and c, where the remote had put it.
+      c.undo();
+      expect(sentOps(ws).at(-1)!.operations!.ordered).toEqual([[2, "d", 0, 0, "children", "b", "c"]]);
+      ws.deliver({
+        type: "patch", version: 5, source_client: "me", ref: sentOps(ws).at(-1)!.ref,
+        operations: sentOps(ws).at(-1)!.operations!,
+      });
+      expect(ids(c.getDoc()!)).toEqual(["a", "b", "d", "c"]);
       // The merged undo step restores the field to the remote's value.
       c.undo();
       expect(c.getDoc()!.getNode("a")!.state.name).toBe("remote");
     });
   });
 
-  it("does not resurrect a node a later pending op deleted, and keeps the echo's next hint", async () => {
+  it("a node created and deleted before either echo comes and goes", async () => {
     await withFakeWebSocket(async () => {
       const c = new ThickAtomDocClient({ url: "ws://x" });
       const p = c.connect();
@@ -546,23 +568,26 @@ describe("second review: thick client", () => {
       c.deleteNode(ghost);
       const [op1, op2] = sentOps(ws);
       ws.deliver({ type: "patch", version: 1, source_client: "me", ref: op1.ref, operations: op1.operations! });
-      expect(c.getDoc()!.getNode(ghost)).toBeUndefined();
+      expect(ids(c.getDoc()!)).toEqual(["a", "b", "c", "d", ghost]);
       ws.deliver({ type: "patch", version: 2, source_client: "me", ref: op2.ref, operations: op2.operations! });
       expect(ids(c.getDoc()!)).toEqual(["a", "b", "c", "d"]);
-      // Insert after "a", then delete "a"; the verbatim echoes must be no-ops
-      // because the echo's `next` hint places the node when `prev` is gone.
+      // An edit made on the LocalDoc directly is applied at once and its
+      // echo confirms it: the insert is not applied twice. A confirmed
+      // delete of its neighbor lands when echoed.
       const n = c.getDoc()!.createNode("Item", { name: "n1" });
       c.getDoc()!.insertIntoSlot(c.getDoc()!.root, "children", "after", [n], c.getDoc()!.getNode("a")!);
       c.deleteNode("a");
       const [, , op3, op4] = sentOps(ws);
-      expect(ids(c.getDoc()!)).toEqual([n.id, "b", "c", "d"]);
+      expect(ids(c.getDoc()!)).toEqual(["a", n.id, "b", "c", "d"]);
       ws.deliver({ type: "patch", version: 3, source_client: "me", ref: op3.ref, operations: op3.operations! });
+      expect(ids(c.getDoc()!)).toEqual(["a", n.id, "b", "c", "d"]);
       ws.deliver({ type: "patch", version: 4, source_client: "me", ref: op4.ref, operations: op4.operations! });
       expect(ids(c.getDoc()!)).toEqual([n.id, "b", "c", "d"]);
+      expect(c.getDoc()!.getNode(n.id)!.state.name).toBe("n1");
     });
   });
 
-  it("applies a no-op echo as a correction to the server's placement", async () => {
+  it("a request the server had nothing to apply for is answered and retired", async () => {
     await withFakeWebSocket(async () => {
       const c = new ThickAtomDocClient({ url: "ws://x" });
       const p = c.connect();
@@ -574,29 +599,20 @@ describe("second review: thick client", () => {
       // the server our move was already satisfied and committed nothing.
       c.moveNodeRelative("d", "a", "before");
       const [op1] = sentOps(ws);
-      expect(ids(c.getDoc()!)).toEqual(["d", "a", "b", "c"]);
+      expect(c.pendingStructure()).toBe(true);
       ws.deliver({
         type: "patch", version: 1, source_client: null, ref: "other:1",
         operations: { ordered: [[2, "a", 0, 0, "children", "d", 0]], state: {} },
       });
-      // Masked: we have a pending move of d, but not of a — a moves after d locally.
-      expect(ids(c.getDoc()!)).toEqual(["d", "a", "b", "c"]);
-      // The server answers at the same version with the slot's full order
-      // as a chain of moves: the remote move was vacuous in our frame, so
-      // more than the moved node is out of place.
+      expect(ids(c.getDoc()!)).toEqual(["b", "c", "d", "a"]);
+      // The server answers at the same version with nothing to apply.
       ws.deliver({
         type: "patch", version: 1, source_client: null, ref: op1.ref,
-        operations: {
-          ordered: [
-            [2, "b", 0, 0, "children", 0, 0],
-            [2, "c", 0, 0, "children", "b", 0],
-            [2, "d", 0, 0, "children", "c", 0],
-            [2, "a", 0, 0, "children", "d", 0],
-          ],
-          state: {},
-        },
+        operations: { ordered: [], state: {} },
       });
       expect(ids(c.getDoc()!)).toEqual(["b", "c", "d", "a"]);
+      expect(c.pendingStructure()).toBe(false);
+      expect(c.getUndoManager()!.canUndo).toBe(false);
       expect(c.getVersion()).toBe(1);
     });
   });

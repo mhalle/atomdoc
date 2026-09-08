@@ -260,6 +260,12 @@ describe("review fixes: store and client", () => {
     c._injectMessage({ type: "snapshot", doc_id: snapshot[0], version: 3, data: snapshot });
     expect(sent.length).toBe(1);
     expect(sent[0].state.n1.name).toBe("offline edit");
+    // The new document is the server's until the edit is confirmed.
+    expect(c.getDoc()!.getNode("n1")!.state.name).toBe("one");
+    c._injectMessage({
+      type: "patch", version: 4, source_client: "me", ref: "me:1",
+      operations: { ordered: [], state: { n1: { name: "offline edit" } } },
+    });
     expect(c.getDoc()!.getNode("n1")!.state.name).toBe("offline edit");
   });
 });

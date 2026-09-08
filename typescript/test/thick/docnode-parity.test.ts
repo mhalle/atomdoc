@@ -507,9 +507,23 @@ describe("ThickAtomDocClient parity", () => {
 
   it("moveNodeRelative and undo", () => {
     const client = setup();
+    const sent: Array<{ ref: string; operations: WireOperations }> = [];
+    const internals = client as unknown as { online: boolean; ws: unknown };
+    internals.online = true;
+    internals.ws = { send: (text: string) => sent.push(JSON.parse(text)) };
+    let version = 0;
+    const echo = (op: { ref: string; operations: WireOperations }) =>
+      client._injectMessage({
+        type: "patch", version: ++version, ref: op.ref, source_client: "me", operations: op.operations,
+      } as PatchMsg);
+
     client.moveNodeRelative("a", "b", "after");
+    expect(ids(client.getDoc()!)).toEqual(["a", "b", "c"]); // until the server confirms
+    echo(sent[0]);
     expect(ids(client.getDoc()!)).toEqual(["b", "a", "c"]);
     client.undo();
+    expect(ids(client.getDoc()!)).toEqual(["b", "a", "c"]);
+    echo(sent[1]);
     expect(ids(client.getDoc()!)).toEqual(["a", "b", "c"]);
   });
 
