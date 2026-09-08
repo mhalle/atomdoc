@@ -637,6 +637,47 @@ describe("ThickAtomDocClient conveniences", () => {
     ]);
     expect(client.getSchema()!.getDefaults("Item")).toEqual({ label: "", note: "" });
   });
+
+  it("onSchemaMismatch: \"disconnect\" refuses a reconnect that brings a different schema", () => {
+    const client = new ThickAtomDocClient({ url: "ws://unused", coalesce: false, onSchemaMismatch: "disconnect" });
+    client._injectMessage({ type: "schema", schema } as SchemaMsg);
+    client._injectMessage({ type: "snapshot", doc_id: ROOT, version: 0, data: snapshot, client_id: "me" } as SnapshotMsg);
+    const internals = client as unknown as { online: boolean; ws: unknown; onlinePending: boolean };
+    let closed = false;
+    internals.online = true;
+    internals.ws = { send() {}, close: () => { closed = true; } };
+    const errors: string[] = [];
+    const resyncs: unknown[] = [];
+    const offline = vi.fn();
+    client.onError((e) => errors.push(e.code));
+    client.onResync((info) => resyncs.push(info));
+    client.onOffline(offline);
+
+    // The same schema again: fine.
+    internals.onlinePending = true;
+    client._injectMessage({ type: "schema", schema } as SchemaMsg);
+    client._injectMessage({ type: "snapshot", doc_id: ROOT, version: 2, data: snapshot } as SnapshotMsg);
+    expect(errors).toEqual([]);
+    expect(resyncs.length).toBe(1);
+
+    // A different one: refused; the old schema and document stay.
+    const grown: AtomDocSchema = {
+      ...schema,
+      node_types: { ...schema.node_types, Extra: { json_schema: {}, field_tiers: {}, slots: {}, field_defaults: {} } },
+    };
+    client.setField(ROOT, "title", "kept");
+    internals.online = true;
+    internals.ws = { send() {}, close: () => { closed = true; } };
+    internals.onlinePending = true;
+    client._injectMessage({ type: "schema", schema: grown } as SchemaMsg);
+    expect(errors).toEqual(["schema_changed"]);
+    expect(closed).toBe(true);
+    expect(client.isOnline()).toBe(false);
+    expect(offline).toHaveBeenCalled();
+    expect(client.getSchema()!.getNodeType("Extra")).toBeUndefined();
+    expect(client.getDoc()!.root.state.title).toBe("kept");
+    expect(resyncs.length).toBe(1);
+  });
 });
 
 describe("ThickAtomDocClient readiness and integrity", () => {

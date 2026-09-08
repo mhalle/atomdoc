@@ -801,7 +801,11 @@ were dropped, and whether the `schema` message that preceded the
 snapshot differed from the one the client had (`schemaChanged`; the
 schema is fixed for a document's lifetime, so this means the server was
 restarted with new node types and everything built from the old schema
-is stale).
+is stale). A client may instead refuse such a reconnect — keep its
+schema and document, close the socket, and tell the application (the
+TypeScript client's `onSchemaMismatch: "disconnect"`, reported as an
+`onError` with the client-side code `schema_changed`) — when running
+old code against a new document is worse than reloading.
 
 The thick client's API is narrower than the wire format on purpose:
 `createNode` takes `"append"` or `"prepend"`, `moveNode` appends, and

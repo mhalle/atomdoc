@@ -52,6 +52,16 @@ export interface ThickClientOptions {
    * server answers with a rejection and a resync.
    */
   validate?: boolean;
+  /**
+   * What to do when a reconnect brings a schema different from the one
+   * this client has (the server was restarted with new node types).
+   * `"adopt"` (default): take the new schema and snapshot and report
+   * `schemaChanged` through `onResync`. `"disconnect"`: keep the old
+   * schema and document, close the socket, and report an `onError` with
+   * code `schema_changed`, for an application that would rather reload
+   * than run code written for the old schema against a new document.
+   */
+  onSchemaMismatch?: "adopt" | "disconnect";
 }
 
 /** What a resync (see `onResync`) replaced. */
@@ -220,6 +230,7 @@ export class ThickAtomDocClient {
   private coalesce: boolean | number;
   private webSocket: new (url: string) => WebSocket;
   private validate: boolean;
+  private onSchemaMismatch: "adopt" | "disconnect";
   private clientId: string = crypto.randomUUID();
   private readyCallbacks: Array<() => void> = [];
   private settledWaiters: Array<() => void> = [];
@@ -256,6 +267,7 @@ export class ThickAtomDocClient {
     this.coalesce = options.coalesce ?? true;
     this.webSocket = options.webSocket ?? WebSocket;
     this.validate = options.validate ?? true;
+    this.onSchemaMismatch = options.onSchemaMismatch ?? "adopt";
   }
 
   // --- Lifecycle ---
@@ -696,12 +708,27 @@ export class ThickAtomDocClient {
 
   private _handleMessage(msg: ServerMsg): void {
     switch (msg.type) {
-      case "schema":
-        this.schemaChanged =
+      case "schema": {
+        const changed =
           this.rawSchema !== null && JSON.stringify(this.rawSchema) !== JSON.stringify(msg.schema);
+        if (changed && this.onSchemaMismatch === "disconnect") {
+          // Keep the schema and document this client's code was written
+          // for; the application decides what to do (reload, usually).
+          this.disconnect();
+          const err: ErrorMsg = {
+            type: "error",
+            ref: null,
+            code: "schema_changed",
+            message: "The server's schema differs from this client's; reconnect refused",
+          };
+          for (const cb of this.errorCallbacks) cb(err);
+          break;
+        }
+        this.schemaChanged = changed;
         this.rawSchema = msg.schema;
         this.schema = new SchemaRegistry(msg.schema);
         break;
+      }
 
       case "snapshot":
         if (msg.client_id) this.clientId = msg.client_id;

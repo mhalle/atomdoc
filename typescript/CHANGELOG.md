@@ -4,6 +4,12 @@
 
 ### Added
 
+- `onSchemaMismatch: "adopt" | "disconnect"` on the thick client. The
+  default adopts the new schema and reports it; `"disconnect"` refuses
+  the reconnect, keeps the old schema and document, closes the socket,
+  and fires `onError` with the client-side code `schema_changed`, for an
+  application that would rather reload than run code written for the
+  old schema against a new document.
 - `ResyncInfo.schemaChanged`: a reconnect delivered a schema different
   from the one the client had (the server was restarted with new node
   types), so `getSchema()` and anything derived from it are stale. The

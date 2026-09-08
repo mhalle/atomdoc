@@ -344,6 +344,7 @@ const client = new ThickAtomDocClient({
   coalesce: true,             // optional, default true; store updates once per animation frame
                               // (a number is a window in ms: patches within it notify once, frames or not)
   validate: true,             // optional, default true; a field value the schema rejects throws at setField
+  onSchemaMismatch: "adopt",  // optional; "disconnect" refuses a reconnect whose schema differs
 });
 ```
 
@@ -497,7 +498,12 @@ client.onResync((info) => { ... });    // server replaced the local doc with a
                                        // info.schemaChanged says the reconnect brought a
                                        // different schema (a server restarted with new
                                        // node types), so getSchema() and anything built
-                                       // from it must be re-read.
+                                       // from it must be re-read. With
+                                       // onSchemaMismatch: "disconnect" such a reconnect
+                                       // is refused instead: the old schema and document
+                                       // stay, the socket closes, and onError fires with
+                                       // code "schema_changed" (a client-side code) so the
+                                       // app can reload.
 client.onOffline(() => { ... });       // connection lost
 client.onOnline(() => { ... });        // reconnected
 ```
