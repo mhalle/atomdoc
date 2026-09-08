@@ -41,8 +41,9 @@ def _normalize(value: Any) -> Any:
 class _Rejected(Exception):
     """A well-formed request the document refused to apply.
 
-    ``resync`` says whether the requester applied the request
-    optimistically and must be sent a fresh snapshot.
+    ``resync`` says whether the requester must be sent a fresh snapshot
+    (an ``op`` or ``create`` it may have applied locally) or kept its
+    document (an undo step, which it never applied itself).
     """
 
     def __init__(self, cause: BaseException, *, resync: bool = True) -> None:
@@ -359,8 +360,8 @@ class Session:
             # A valid message that is invalid against the current document
             # (referential integrity, validation, a node that is gone). The
             # document rolled it back and nothing was broadcast. A thick
-            # client applied it optimistically, so send it the truth: a
-            # fresh snapshot replaces its local document. Whatever was
+            # client may hold a field write it applied locally, so send it
+            # the truth: a fresh snapshot replaces its local document. Whatever was
             # committed before this request goes out first, so the
             # snapshot is the newest thing the client receives.
             logger.info(
@@ -410,73 +411,37 @@ class Session:
         try:
             # Strict: a missing target is a failure, and any failure is
             # rolled back and raised here as a rejection. The server must
-            # never silently drop what a client applied optimistically.
+            # never silently drop what a client is waiting to see confirmed.
             self._doc.apply_operations(ops, strict=True)
         except ListenerError:
             raise  # applied and committed; an observer failed afterwards
         except Exception as exc:
             raise _Rejected(exc) from exc
         committed = len(self._pending_broadcasts) > queued_before
-        moved = any(op[0] == 2 for op in ops[0])
-        if not committed or moved:
-            # The requester applied this optimistically in its own frame,
-            # and that frame may not match the server's for the slots it
-            # touched: a remote move anchored at a node it had a pending
-            # move for was vacuous locally and real here, or the request
-            # changed nothing here (a move to where the node already is,
-            # a write of the value already held) and so produced no echo
-            # at all. Either way, answer it alone with a patch at the
-            # current version giving the server's order of every slot it
-            # moved into and the values it holds. Queued like any
-            # broadcast, it is delivered in order: after this request's
-            # own echo, before any later commit.
+        if not committed:
+            # The request changed nothing here (a move to where the node
+            # already is, a write of the value already held) and so
+            # produced no echo. Answer it anyway, alone, with a patch at
+            # the current version carrying nothing to apply beyond the
+            # stored values of the fields it wrote, so the requester can
+            # retire it. Queued like any broadcast, it is delivered in
+            # order: before any later commit.
             self._pending_broadcasts.append((
                 {
                     "type": MSG_PATCH,
                     "version": self._version,
-                    "operations": self._positions_of(ops, moves_only=committed),
+                    "operations": {"ordered": [], "state": self._stored_values(ops)},
                     "source_client": None,
                     "ref": request.ref,
                 },
                 [client.client_id],
             ))
 
-    def _positions_of(self, ops: Operations, *, moves_only: bool = False) -> dict[str, Any]:
-        """The server's current state for what ``ops`` touch.
-
-        For every slot a move (or, unless ``moves_only``, an insert) of
-        ``ops`` landed in, the full order of that slot as a chain of
-        moves: append the first node, then each node after its
-        predecessor. Applying the chain is a no-op for every node already
-        in place and a correction for the rest; a replica that matches
-        the server is left untouched. With ``moves_only`` the state part
-        is empty (the echo already carried it); otherwise state entries
-        carry the values as stored.
-        """
+    def _stored_values(self, ops: Operations) -> dict[str, dict[str, Any]]:
+        """The values the document holds for the fields ``ops`` write."""
         doc = self._doc
-        ordered: list[Any] = []
-        slots_done: set[tuple[str, str]] = set()
-        for op in ops[0]:
-            if op[0] == 0 and not moves_only:
-                start_id = op[1][0][0]
-            elif op[0] == 2:
-                start_id = op[1]
-            else:
-                continue
-            start = doc.get_node_by_id(str(start_id))
-            if start is None or start._parent is None or start._slot_name is None:
-                continue
-            parent, slot = start._parent, start._slot_name
-            if (parent.id, slot) in slots_done:
-                continue
-            slots_done.add((parent.id, slot))
-            parent_ref: str | int = 0 if parent is doc.root else parent.id
-            prev_id: str | int = 0
-            for node in getattr(parent, slot):
-                ordered.append([2, node.id, 0, parent_ref, slot, prev_id, 0])
-                prev_id = node.id
         state: dict[str, dict[str, Any]] = {}
-        for node_id, patch in ([] if moves_only else ops[1].items()):
+        for node_id, patch in ops[1].items():
             node = doc.get_node_by_id(node_id)
             if node is None:
                 continue
@@ -485,7 +450,7 @@ class Session:
                 for key in patch
                 if key in node._field_adapters
             }
-        return {"ordered": ordered, "state": state}
+        return state
 
     def _handle_create(self, client: ClientConnection, msg: dict[str, Any]) -> None:
         node_type = msg["node_type"]
@@ -554,8 +519,8 @@ class Session:
                 listener_errors.extend(exc.errors)
             except Exception as exc:
                 # The step no longer applies (someone else edited what it
-                # would revert). It is kept for a retry; nothing was
-                # applied optimistically, so no resync.
+                # would revert). It is kept for a retry; the client applied
+                # nothing itself, so no resync.
                 raise _Rejected(exc, resync=False) from exc
         if listener_errors:
             raise ListenerError(listener_errors)

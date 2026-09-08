@@ -884,7 +884,9 @@ async def test_handshake_drain_keeps_versions_in_order():
 
 
 @pytest.mark.asyncio
-async def test_noop_op_is_answered_with_the_servers_placement():
+async def test_noop_op_is_answered_with_an_empty_patch():
+    """A request that commits nothing still gets a patch carrying its ref,
+    at the current version, so the requester can retire it."""
     session, transport, a, b, t, v = await setup_scene_session()
     doc = session.doc
     with doc.transaction():
@@ -904,15 +906,13 @@ async def test_noop_op_is_answered_with_the_servers_placement():
     echo = a.messages[0]
     assert echo["type"] == MSG_PATCH and echo["ref"] == "noop"
     assert echo["version"] == session.version
-    order = [op[1] for op in echo["operations"]["ordered"]]
-    assert order == [n.id for n in doc.root.transforms]
-    assert [op[5] for op in echo["operations"]["ordered"]] == [0, *order[:-1]]
-    # A write of the value already held is answered the same way.
+    assert echo["operations"] == {"ordered": [], "state": {}}
+    # A write of the value already held is answered with the stored value.
     a.messages.clear()
     await transport.send_message(a, _set_name("same", t.id, "t"))
-    assert a.messages[0]["operations"]["state"] == {t.id: {"name": "t"}}
-    # A move that does commit is followed, for the requester only, by the
-    # slot's full order at the same version.
+    assert a.messages[0]["operations"] == {"ordered": [], "state": {t.id: {"name": "t"}}}
+    # A move that does commit is echoed once, to everyone, and nothing more
+    # follows for the requester: it applies the echo as the server's order.
     a.messages.clear()
     b.messages.clear()
     await transport.send_message(a, {
@@ -921,11 +921,8 @@ async def test_noop_op_is_answered_with_the_servers_placement():
     })
     assert [m["type"] for m in b.messages] == [MSG_PATCH]
     assert [(m["type"], m["version"], m["ref"]) for m in a.messages] == [
-        (MSG_PATCH, session.version, "mv"), (MSG_PATCH, session.version, "mv"),
+        (MSG_PATCH, session.version, "mv"),
     ]
-    chain = a.messages[1]["operations"]
-    assert [op[1] for op in chain["ordered"]] == [n.id for n in doc.root.transforms]
-    assert chain["state"] == {}
 
 
 @pytest.mark.asyncio

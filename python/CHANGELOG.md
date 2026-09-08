@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+Confirmed structure. The thick client (atomdoc-ts 0.5.0) no longer
+applies structural edits before the server confirms them, and the
+session no longer corrects a client's slot order after moves. Wire
+format unchanged.
+
+### Changed
+
+- **A request that commits nothing is answered with an empty patch.**
+  The session used to answer a no-op `op` (and follow every move) with
+  the full order of the slots it touched as a chain of moves, so an
+  optimistic client could correct its frame. The answer is now a
+  `patch` at the current version carrying the request's `ref`, no
+  ordered operations, and the stored values of the fields the request
+  wrote. Moves that commit are echoed once, like any change.
+
 ## [0.4.7] - 2026-09-07
 
 Validator ergonomics. No wire or schema changes; atomdoc-ts 0.4.7 is

@@ -1,6 +1,6 @@
 # AtomDoc
 
-> **This is a conceptual prototype for a collaborative document system
+> **This is a conceptual prototype for a synchronized document system
 > based on Pydantic models. It is both conceptually and directly based on
 > [DocuKit](https://github.com/docukit/docukit). This project is fully
 > unsupported and intended for exploration only.**

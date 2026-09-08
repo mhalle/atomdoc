@@ -9,7 +9,7 @@ An AtomDoc client connects to a Python server over WebSocket. The server is auth
 There are two client architectures:
 
 - **Thin client** — sends operations to the server, waits for patches. Simple, ~500 lines.
-- **Thick client** — applies operations locally first, syncs with server. Supports offline and local undo. ~1500 lines.
+- **Thick client** — keeps a local copy of the document. Field writes apply locally at once; structural edits apply when the server confirms them. Local undo. ~1500 lines.
 
 Both expose the same reactive store to the UI layer.
 
@@ -213,10 +213,11 @@ Sent to one client when its request could not be applied. Nothing is broadcast.
   referenced, a validation failure, a target that another client deleted
   first, or an undo step that no longer applies. The server rolled the
   request back and no `patch` was sent. For an `op` or `create` a
-  `snapshot` follows immediately, for this client only, so an optimistic
-  (thick) client can replace its local document with the server's state;
-  thin clients simply reload the store. For an `undo`/`redo` nothing
-  follows: the client applied nothing optimistically and the step is kept.
+  `snapshot` follows immediately, for this client only, so a thick client
+  (which may hold a field write it applied locally) can replace its local
+  document with the server's state; thin clients simply reload the store.
+  For an `undo`/`redo` nothing follows: the client applied nothing itself
+  and the step is kept.
 
 ### Client → Server
 
@@ -267,7 +268,7 @@ What these revert depends on the session's undo policy. By default
 untouched, and the client's redo survives them. A step that no longer
 applies because someone else edited what it would revert is answered with
 an `error` of code `rejected` and kept for a retry; no snapshot follows,
-since the client applied nothing optimistically. A client with nothing to
+since the client applied nothing itself. A client with nothing to
 undo gets no reply. Under the `global` policy an `undo` reverts the
 document's last commit, whoever made it. Under `none` the request is
 answered with code `unsupported`. The history is dropped when the client
@@ -476,7 +477,14 @@ redo(steps):
 
 ## Building a Thick Client
 
-A thick client adds a local document model between the UI and the network. Operations apply instantly to the local doc, which feeds the store.
+A thick client adds a local document model between the UI and the network.
+The local document is a replica of the server's: field writes apply to it
+at once (and are confirmed by their echo), structural edits are sent and
+applied when the server echoes them, so the tree only ever holds the
+server's order. It is not a peer in a collaborative session — there is no
+reconciliation of concurrent structural edits — and it is not meant for
+offline use: edits made while disconnected are sent, in order, once the
+reconnect snapshot is in, and appear as the server confirms them.
 
 ### Additional Components
 
@@ -638,55 +646,56 @@ value for one created during the session. Read defaults through
 
 #### 12. Self-Echo Handling
 
-The server broadcasts patches to ALL clients, including the source. The thick client must not re-apply its own changes:
+The server broadcasts patches to ALL clients, including the source. A
+patch carrying one of the client's own `ref`s answers that request:
 
 ```
 on patch message:
   update version
-  if msg.ref names one of my pending ops:
-    forget that op and every pending op before it (the server answers in order)
-    reconcile(msg.operations)   # see below
-    return
-  doc.applyOperations(msg.operations, skipUndo)  # apply as a remote change
+  entry = pending op msg.ref names, if any
+    (forget it and every pending op before it: the server answers in order)
+  if entry was applied locally (a field write):
+    apply the state part, masked by later pending writes, with skipUndo
+    (plus any node the server inserted alongside — a normalizer's)
+  elif entry was built and sent unapplied (create / delete / move,
+      an undo or redo step containing one):
+    apply msg.operations as this client's own commit: it enters undo
+    history (as the undo or redo step it was sent as, if it was one)
+    but is not sent again
+  else:
+    doc.applyOperations(msg.operations, skipUndo)  # a remote change
 ```
 
 Ownership is the `ref`: only a ref this client minted can match. Do not
 require `source_client` as well — the server sets it only when it recorded
-the request verbatim, and it is `null` precisely when the server placed an
-insert elsewhere or a normalizer changed something, which is when
-reconciliation matters. Matching by `ref` rather than by count matters when
-one request produces several patches and after a resync, when the pending
-list was dropped and a late echo must be applied as a remote change. An
-`error` carrying a pending `ref` forgets that op too. The `client_id` comes
-from the `snapshot` message.
+the request verbatim, and it is `null` when a normalizer changed something
+or the request committed nothing. Matching by `ref` rather than by count
+matters when one request produces several patches and after a resync,
+when the pending list was dropped and a late echo must be applied as a
+remote change. An `error` carrying a pending `ref` forgets that op too.
+The `client_id` comes from the `snapshot` message.
 
-**Reconciling an echo.** The local document applied the operation before
-the server did. If another change landed on the server in between, the
-server's order is "theirs, then ours", and simply skipping the echo leaves
-the client at "ours, then theirs" — the two diverge for good when both
-touched the same field or slot. The echo describes the server's result,
-so the client replays it as corrections, with `skipUndo` and without
-sending anything back:
+**Confirmed structure.** Create, delete, and move are built from the
+local tree — parent, slot, and the neighbors the node should sit between
+— sent, and applied when their echo arrives, exactly as the server
+recorded them. The local tree therefore never holds an order the server
+did not: a device appending into the same slot moments earlier lands
+first on both sides. Consecutive edits compose before any echo returns:
+the client anchors each new edit against a model of the structure still
+pending (two appends in a row follow each other; a child can be created
+under a parent that is itself pending; a field written on a pending node
+is sent and lands with it). `createNode` returns the ID at once; the node
+appears on echo, and `pendingStructure()` says whether anything is still
+waiting.
 
-- each state field is set to the value in the echo (idempotent when
-  nothing intervened; a later pending edit of ours on the same field is
-  restored by its own echo);
-- each node the echo inserts is *moved* to the neighbors the echo
-  names (`prev`, else `next`, else the end of the slot), which is where
-  the server placed it; re-inserting would fail on the duplicate ID. A
-  node the client does not have (a server-side normalizer added it) is
-  inserted there instead;
-- each move in the echo replays as it is; deletes need nothing.
-
-**Masking remote writes under pending edits.** The mirror image: a
-remote patch that arrives while one of our ops is pending was committed
-before that op, so for a field both wrote the server's final value is
-ours, and the remote value is only an intermediate the server passed
-through. Applying it would show the wrong value until our echo arrived.
-So before applying a remote patch, drop every state entry whose node and
-field a pending op also writes, and every move of a node a pending op
-also moves. If the server rejects our op instead, the resync snapshot
-brings the remote value in.
+**Masking remote writes under pending field writes.** A remote patch that
+arrives while one of our field writes is pending was committed before
+that write, so for that field the server's final value is ours, and the
+remote value is only an intermediate the server passed through. Applying
+it would show the wrong value until our echo arrived. So before applying
+a remote patch, drop every state entry whose node and field a pending
+applied write also sets. If the server rejects our write instead, the
+resync snapshot brings the remote value in.
 
 A masked write still matters to undo: undoing our edit should leave the
 field at what others last wrote, not at what we saw before editing. The
@@ -694,37 +703,26 @@ client refreshes the recorded original of the oldest pending edit of
 that field to the masked value, in the undo entry that edit landed in
 (merged entries included).
 
-**Slot-order corrections.** Neighbor-relative moves are the one place
-where a client's optimistic frame can silently disagree with the
-server's: a remote move anchored at a node the client has a pending move
-for is vacuous in the client's frame (the anchor already sits where the
-move would put it) while it is real on the server. Masking cannot help,
-because the remote move must be applied for its own node. So after the
-echo of every `op` that contains a move, the server sends the requester
-alone a second `patch` at the *same* version carrying the request's `ref`
-and `source_client: null`: for every slot the request moved into, the
-slot's full order as a chain of moves (append the first node, then each
-node after its predecessor). Applying the chain is a no-op for nodes
-already in place and a correction for the rest; nodes with a later
-pending move of the client's own are masked and corrected by their own
-echo. The same message answers a request that changed nothing on the
-server (a move to where the node already is, a write of the value already
-held, which commit nothing and so produce no echo), then also carrying
-the stored values of the state entries. A client must accept a patch
-whose version equals its current one; the correction reaches it with its
-pending entry already retired by the echo, so it applies as a remote
-change.
+**Requests that commit nothing.** A move to where the node already is,
+or a write of the value already held, commits nothing and so produces no
+echo. The server answers the requester alone with a `patch` at the
+*current* version carrying the request's `ref`, `source_client: null`,
+no ordered operations, and the stored values of the fields the request
+wrote. A client must accept a patch whose version equals its current one.
 
-Reconciliation never re-inserts a node that a still-pending op of the
-client's own deleted (create then delete before the create's echo): the
-node stays gone, and the delete's echo needs nothing.
+**Undo.** A step that only writes fields applies locally like any edit. A
+step that contains structure is sent unapplied like any structural edit
+and commits, as that step, when its echo arrives (the inverse it produces
+then goes on the opposite stack). If the socket drops before an echo,
+pending ops are kept ahead of anything buffered since and sent again
+after the reconnect snapshot; the snapshot rebuilds the document and
+drops the undo history.
 
-Together, reconciliation and masking converge every interleaving of one
-client with host-side changes (a device writing into the session's
-document) and of several clients under the server's total order, with
-no transient state the server did not itself pass through. The
-`test/integration/two-clients.test.ts` harness checks this with two
-thick clients editing the same fields and slots.
+Together these keep one client converged with host-side changes (a
+device writing into the session's document) and with other clients under
+the server's total order. `test/integration/convergence.test.ts` and
+`test/integration/two-clients.test.ts` check this with a device and with
+two thick clients editing the same fields and slots.
 
 #### 13. Remote Echo Guard
 

@@ -2,8 +2,30 @@
 
 ## Unreleased
 
+Released in step with atomdoc 0.5.0.
+
 ### Changed
 
+- **Structural edits are no longer optimistic.** `createNode`,
+  `deleteNode`, `moveNode`, and `moveNodeRelative` build the operation
+  from the local tree, send it, and apply it when the server echoes it,
+  so the local tree only ever holds the server's order. Field writes
+  still apply at once and are confirmed by their echo. Consecutive
+  structural edits compose before any echo returns (two appends keep
+  their order; a child can be created under a pending parent; a field
+  written on a pending node lands with it). `createNode` still returns
+  the ID synchronously; `pendingStructure()` says whether anything is
+  awaiting confirmation. The wire format is unchanged.
+- **Undo of a step containing structure is confirmed too:** it is sent
+  like any structural edit and commits as that step on echo.
+  `UndoManager` gains a `dispatch` option and `commitAs()` for this.
+- **Not a collaborative editor.** Echo reconciliation of inserts and
+  moves, move masking, the resurrection guard, and the server's
+  slot-order corrections are gone. State masking under pending field
+  writes stays. Edits made while disconnected are no longer replayed
+  onto the reconnect snapshot; they are sent from it, in order, and
+  appear as the server confirms them. `LocalDoc` structural mutators
+  called directly are still sent, but their echo is not reconciled.
 - The thick client updates its `NodeStore` once per animation frame
   (`setTimeout(0)` outside a browser, with a 100 ms fallback for hidden
   tabs) instead of after every document change. The local document is

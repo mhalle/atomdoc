@@ -7,7 +7,7 @@ TypeScript client for the [AtomDoc](https://github.com/mhalle/atomdoc) document 
 Two client modes:
 
 - **Thin client** — every operation goes to the server. Simple, no local state beyond the reactive store.
-- **Thick client** — operations apply locally first for instant UI. Local undo/redo. Works offline, syncs on reconnect.
+- **Thick client** — keeps a local copy of the document. Field writes apply locally at once; structural edits apply when the server confirms them. Local undo/redo. Store updates coalesce per animation frame.
 
 Both use the same `NodeStore` for reactivity. UI code (React hooks, Solid signals, Vue composables) works identically with either.
 
@@ -60,16 +60,21 @@ client.onConnected(() => {
 
 await client.connect();
 
-// Operations apply instantly — no round-trip
+// Field writes apply at once — no round-trip
 client.setField(rootId, "title", "Updated");
-console.log(client.getStore().getRoot().state.title); // "Updated" immediately
+console.log(client.getDoc().root.state.title); // "Updated" immediately
+
+// Structural edits apply when the server confirms them
+const id = client.createNode("Annotation", { label: "New" }, rootId, "annotations");
+client.onPatch(() => {
+  if (!client.pendingStructure()) console.log("confirmed:", client.getDoc().getNode(id));
+});
 
 // Local undo
 client.undo();
 
-// Works offline — ops buffer until reconnect
-client.onOffline(() => console.log("Offline — edits still work"));
-client.onOnline(() => console.log("Back online — syncing"));
+client.onOffline(() => console.log("Offline — edits wait for the reconnect"));
+client.onOnline(() => console.log("Back online"));
 ```
 
 ## Architecture
@@ -81,7 +86,7 @@ TypeScript Client
   |-- NodeStore        — reactive flat map of nodes, subscriptions
   |-- SchemaRegistry   — Zod validators from server schema
   |-- [thin] direct send/receive
-  +-- [thick] LocalDoc — local tree, undo, offline buffer
+  +-- [thick] LocalDoc — local replica, undo
        +-- bridge -> NodeStore (same reactive API)
 ```
 
@@ -347,28 +352,43 @@ client.getUndoManager();  // UndoManager
 client.isOnline();        // connection status
 ```
 
-#### Mutations -- Local First
+#### Mutations
 
-All mutations apply instantly to the local document and NodeStore. The forward operations are sent to the server in the background.
+Field writes apply at once to the local document and are sent; the
+server's echo confirms them. Structural edits (create, delete, move) are
+built from the local tree, sent, and applied when the server echoes them,
+so the local tree only ever holds the server's order. Consecutive edits
+compose before any echo returns: two appends in a row keep their order, a
+child can be created under a parent that is itself still pending, and a
+field written on a pending node lands with it.
 
 ```ts
 // Instant — no round-trip needed
 client.setField(nodeId, "title", "Updated");
 
-// Returns the locally-generated node ID
+// Returns the locally-generated node ID at once; the node appears when confirmed
 const newId = client.createNode("Annotation", { label: "New" }, parentId, "annotations");
-console.log("Created:", newId); // available immediately
+client.setField(newId, "label", "Renamed");   // sent; lands with the node
 
 client.deleteNode(nodeId);
 client.moveNode(nodeId, newParentId, "children");          // append to a slot
 client.moveNodeRelative(nodeId, siblingId, "after");        // position next to a sibling
+
+client.pendingStructure();   // true while a structural edit awaits confirmation
+client.onPatch(() => { ... }); // fires after every applied patch, echoes included
 ```
+
+A structural edit the server rejects (its parent was deleted first, say)
+comes back as an `error` followed by a resync: the local document is
+rebuilt from the server's snapshot.
 
 #### Local Undo/Redo
 
-Undo and redo work entirely on the client. No server round-trip. Patches
-received from other clients are applied with `skipUndo`, so undo only ever
-reverts this client's own edits.
+Undo and redo are the client's own. Patches received from other clients
+are applied with `skipUndo`, so undo only ever reverts this client's own
+edits, echoes of its structural edits included. A step that only writes
+fields applies at once; a step that contains structure is sent like any
+structural edit and takes effect when the server confirms it.
 
 ```ts
 client.undo();
@@ -411,20 +431,28 @@ client.onOffline(() => { ... });       // connection lost
 client.onOnline(() => { ... });        // reconnected
 ```
 
-#### Offline Behavior
+#### Disconnection
 
-When the connection drops, all operations continue to work locally. The UI stays responsive. Operations are buffered — including any that were sent but not yet acknowledged when the socket dropped — and replayed in order once the reconnect snapshot has landed; `onOnline` fires after that replay, so it sees the resynced document. An edit the server then rejects comes back as a resync (`onResync`).
+The thick client is not an offline editor. When the connection drops,
+field writes still apply locally and every edit is buffered — including
+any that were sent but not yet acknowledged when the socket dropped. On
+reconnect the server's snapshot replaces the local document (and drops
+the undo history), the buffered edits are sent in order, and each
+appears as the server confirms it; one the server rejects comes back as a
+resync. `onOnline` fires after the snapshot has landed.
 
 ```ts
-client.onOffline(() => {
-  // Everything still works — setField, createNode, undo, etc.
-  // The NodeStore updates immediately. The UI doesn't know the difference.
-});
+client.onOffline(() => { /* show a banner; edits queue until reconnect */ });
+client.onOnline(() => { /* the document is the server's again */ });
 ```
 
 ### LocalDoc (Advanced)
 
-The thick client's local document model is accessible for advanced use cases.
+The thick client's local document model is accessible for advanced use
+cases. Read it freely. Structural edits made on it directly (its
+`insertIntoSlot`, `deleteRange`, `moveRange`) are applied at once and
+sent, but their echo is not reconciled against concurrent changes; use
+the client's `createNode`/`deleteNode`/`moveNode` for structure.
 
 ```ts
 const doc = client.getDoc();
@@ -707,12 +735,12 @@ The `0` sentinel represents null (root parent, no positioning).
 
 | | Thin | Thick |
 |---|---|---|
-| **Latency** | Round-trip per operation | Instant (local-first) |
+| **Latency** | Round-trip per operation | Field writes instant; structure on confirmation |
 | **Undo** | Server-side (shared stack) | Client-side (per-client) |
-| **Offline** | No | Yes (buffer + rebase) |
+| **Offline** | No | Edits queue until reconnect |
 | **Complexity** | ~500 lines | ~1500 lines |
 | **Memory** | Flat store only | Full tree model |
-| **Use case** | Dashboards, simple views | Editors, collaborative tools |
+| **Use case** | Dashboards, simple views | Editors, device-driven scenes |
 
 For read-heavy UIs with occasional edits, thin is simpler. For interactive editors where responsiveness matters, thick.
 
