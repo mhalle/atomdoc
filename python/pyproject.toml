@@ -1,6 +1,6 @@
 [project]
 name = "atomdoc"
-version = "0.5.1"
+version = "0.5.2"
 description = "Local-first document models with semantic atomicity"
 readme = "README.md"
 authors = [

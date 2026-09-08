@@ -426,7 +426,9 @@ def on_apply_operations(doc: Doc, operations: Operations, *, strict: bool = Fals
         if node_id not in doc._diff.inserted:
             doc._diff.updated.add(node_id)
         inserted_same_tx = node_id in doc._diff.inserted
-        for key, json_val in patches.items():
+        # A rollback applies the transaction's own inverse patch, which is
+        # the dict the same-value check below prunes: iterate a copy.
+        for key, json_val in list(patches.items()):
             if key not in node._field_adapters:
                 raise ValueError(
                     f"{type(node).__name__} has no field {key!r}"

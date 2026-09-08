@@ -349,8 +349,10 @@ Both clients take that option.
 
 The local document is always current. The store, which the UI
 subscribes to, is updated once per animation frame (a macrotask outside a
-browser), so a burst of patches from a device or a transaction touching
-many nodes notifies each subscriber once. `client.flushStore()` applies
+browser), so a burst of patches that arrive within one frame, or a
+transaction touching many nodes, notifies each subscriber once. Patches
+spaced further apart than a frame (a device at 50 Hz in Node, where a
+frame is one macrotask) each notify. `client.flushStore()` applies
 queued changes now, for code that reads the store right after an edit;
 `coalesce: false` restores synchronous store updates.
 
@@ -399,15 +401,21 @@ client.pendingStructure();   // true while a structural edit awaits confirmation
 client.onPatch(() => { ... }); // fires after every applied patch, echoes included
 ```
 
-Every mutator throws synchronously for what it can see is wrong: an
-unknown or already-deleted node (including one another client deleted a
-moment ago), a node pending deletion, an unknown field or slot, and, for
-`deleteNode`, a node that another node still references
-(`RefIntegrityError`, the same check the server runs). In an editor
-where other parties edit too, wrap mutations in `try`/`catch`. A
-structural edit the server nevertheless rejects (its parent was deleted
-on the server first, say) comes back as an `error` followed by a resync:
-the local document is rebuilt from the server's snapshot.
+What goes wrong is caught at one of three points, and an editor needs
+different handling for each:
+
+| Caught | Cases | What happens |
+|---|---|---|
+| Locally, synchronous throw | unknown or already-deleted node (including one another client deleted a moment ago), node pending deletion, unknown field or slot, unsupported `createNode` position, `deleteNode` of a node another node still references, `setField` of a ref to a node that does not exist (`RefIntegrityError`, the checks the server also runs) | nothing sent, nothing changed |
+| Locally applied, then rejected by the server | a field value that violates a schema constraint or type (the local document shows it until the answer comes back), a node type the slot does not accept | `onError` with code `rejected`, then a resync: the local document is rebuilt from the server's snapshot and **this view's undo history is dropped** |
+| Rejected by the server only | a structural edit whose target was deleted on the server first | same `error` + resync |
+
+Wrap mutations in `try`/`catch` where other parties edit too, and
+validate values before writing them: `schema.validate(type, state)`
+applies the exported constraints (`ge`, `le`, enums, required fields)
+and throws a `ZodError`, so the invalid value never reaches the local
+document. `createNode` takes `"append"` or `"prepend"` only; place a
+node next to a sibling with `moveNodeRelative` afterwards.
 
 #### Local Undo/Redo
 
@@ -429,7 +437,10 @@ client.getUndoManager()!.canRedo;
 
 Steps enter history in the order the user acted, not the order the
 server's echoes arrive: a structural edit holds its place from the
-moment it is sent. The `UndoManager` API behind this (`reserve`,
+moment it is sent. While any step awaits the server (a structural edit,
+or an undo or redo step containing one), `canUndo` and `canRedo` are
+both false. A resync (a rejected edit, or a reconnect) rebuilds the
+document and drops this client's undo history. The `UndoManager` API behind this (`reserve`,
 `commitInto`, `cancel`, the `dispatch` option and `commitAs`) is
 described in [PROTOCOL.md](../PROTOCOL.md) §10 and §12; `clear()` drops
 the history and `dispose()` detaches the manager from the document.
@@ -466,7 +477,8 @@ client.onPatch((version) => { ... });  // remote change applied
 client.onError((err) => { ... });      // server error
 client.onResync(() => { ... });        // server replaced the local doc with a
                                        // fresh snapshot: after rejecting an op,
-                                       // and on every reconnect
+                                       // and on every reconnect. The undo history
+                                       // is dropped and getUndoManager() is new.
 client.onOffline(() => { ... });       // connection lost
 client.onOnline(() => { ... });        // reconnected
 ```
@@ -513,17 +525,22 @@ doc.onChange((event) => {
                                       // Map of deleted nodes: not JSON-serializable as is
 });
 
-// Mutate (each call is its own transaction; several ops in one go: applyOperations)
+// Mutate (each call is its own transaction; several ops in one go: applyOperations).
+// insertIntoSlot takes DocNode objects (from doc.getNode / doc.createNode);
+// the range methods take ids.
 doc.setNodeState(id, "title", "x");
+const parent = doc.getNode(parentId)!;
 doc.insertIntoSlot(parent, "items", "append", [doc.createNode("Item", { label: "n" })]);
-doc.insertIntoSlot(parent, "items", "before", [node], target);   // or "after"
+doc.insertIntoSlot(parent, "items", "before", [doc.createNode("Item")], doc.getNode(targetId)!);   // or "after"
 doc.deleteRange(startId, endId?);
 doc.moveRange(startId, endId, parentId, slot);                   // to the end of the slot
 doc.moveRangeRelative(startId, endId, targetId, "before" | "after");
 doc.applyOperations({ ordered: [[1, id, 0]], state: { [rootId]: { featured: null } } });
 
 // Serialize
-const snapshot = doc.toSnapshot();  // wire format [id, type, state, slots]
+const snapshot = doc.toSnapshot();  // wire format [id, type, state, slots]: byte-identical to
+                                    // Python doc.dump() of the same document (defaulted fields
+                                    // omitted, fields in schema order), so the two compare directly
 ```
 
 Reference fields (tier `"ref"`) are resolved through the node map, and the
@@ -695,6 +712,16 @@ function ColorEditor({ store, nodeId, client }) {
 ```
 
 The color is edited locally with draft state. One `setField` call on apply -- one operation, one undo step, atomically replacing the entire frozen `Color` value.
+
+A draft that spans several fields is applied the same way, as one
+operation and one undo step, through the local document (the thick
+client has no multi-step transaction API of its own; a state-only
+`applyOperations` is safe, since field writes are optimistic and masked
+exactly like `setField`):
+
+```ts
+client.getDoc()!.applyOperations({ ordered: [], state: { [nodeId]: { name, color } } });
+```
 
 ## Python Server Setup
 

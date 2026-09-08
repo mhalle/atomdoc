@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.2] - 2026-09-08
+
+### Fixed
+
+- **A rolled-back delete lost the node's remaining fields** (regression
+  in 0.5.1): the rollback iterated the transaction's own inverse patch
+  while the same-value check pruned it, so only the first field was
+  restored and the failure was swallowed. Observable as a node that lost
+  its color after a delete the server refused for referential integrity.
+  Rollback now applies a copy.
+
+### Changed
+
+- Documentation: `to_json()` emits a `Ref` as a document path (the
+  Serialize section said the target's ID); the `global` undo policy only
+  affects clients that send `undo` on the wire, so a desktop app with
+  thick views gets one user-level undo from the host's `doc.undo_manager`;
+  how a host process writes into a bound session and stops it.
+
 ## [0.5.1] - 2026-09-08
 
 Fixes from a review of 0.5.0. No wire or schema changes.

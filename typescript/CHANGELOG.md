@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.2
+
+Released in step with atomdoc 0.5.2.
+
+### Changed
+
+- `canUndo` and `canRedo` are both false while a dispatched undo or
+  redo step awaits the server, as they already were while the newest
+  step was a reservation; a toolbar keyed on them now behaves the same
+  in both cases.
+- `ErrorMsg.ref` is always present (`string | null`).
+- Documentation: what is caught locally, what is applied then rejected,
+  and what a resync costs (the undo history); a multi-field draft;
+  coalescing in Node; `toSnapshot()` equals Python `dump()`;
+  `insertIntoSlot` takes `DocNode`s.
+
 ## 0.5.1
 
 Released in step with atomdoc 0.5.1. Fixes from a review of 0.5.0.

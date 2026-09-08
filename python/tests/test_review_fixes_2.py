@@ -426,3 +426,44 @@ def test_base_exception_in_listener_does_not_wedge_the_document():
     assert doc.root.items[0].count == 5
     doc.root.items[0].count = 6  # usable again
     assert doc.root.items[0].count == 6
+
+
+def test_rolled_back_delete_restores_every_field():
+    """A delete refused at commit (the node is still referenced) rolls back
+    with the node's state intact, atomic fields included."""
+    from pydantic import BaseModel
+
+    from atomdoc import Array, Doc, Ref, RefIntegrityError, node, operations_from_wire
+
+    class Color(BaseModel, frozen=True):
+        r: int = 0
+        g: int = 0
+        b: int = 0
+
+    @node
+    class Item(BaseModel):
+        name: str = ""
+        color: Color = Color()
+        ref: Ref["Item"] | None = None
+
+    @node
+    class Root(BaseModel):
+        items: Array[Item] = []
+
+    doc = Doc(Root())
+    with doc.transaction():
+        a = doc.create_node(Item, name="A", color=Color(r=10, g=20, b=30))
+        b = doc.create_node(Item, name="B")
+        doc.root.items.append(a)
+        doc.root.items.append(b)
+    with doc.transaction():
+        b.ref = a
+    before = doc.to_json()
+    with pytest.raises(RefIntegrityError):
+        with doc.transaction():
+            a.delete()
+    assert doc.to_json() == before
+    assert a.color == Color(r=10, g=20, b=30)
+    with pytest.raises(RefIntegrityError):
+        doc.apply_operations(operations_from_wire({"ordered": [[1, a.id, 0]], "state": {}}), strict=True)
+    assert doc.to_json() == before

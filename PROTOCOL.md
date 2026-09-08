@@ -303,7 +303,7 @@ and send every change as an `op` with client-minted node IDs, because a
 thick client needs an ID before the echo to anchor its next edit. Under the `global` policy an `undo` reverts the
 document's last commit, whoever made it. Under `none` the request is
 answered with code `unsupported`. The history is dropped when the client
-disconnects. Thick clients undo locally and never send these messages.
+disconnects.
 
 **Note:** `ref` is optional on all client messages. If provided, it is echoed back in the `error` reply and in every `patch` the request produces. Refs must be unique across clients — prefix them with the server-assigned `client_id` (the thick client sends `<client_id>:<n>`) — because the server does not check ownership: a client must only treat a `ref` it minted itself as an acknowledgment of its own pending work.
 
@@ -387,8 +387,8 @@ NodeStore:
   nodes: Map<string, StoreNode>
   rootId: string
 
-  getNode(id) → StoreNode | null
-  getRoot() → StoreNode | null
+  getNode(id) → StoreNode | undefined
+  getRoot() → StoreNode | undefined
   getChildren(nodeId, slotName) → string[]
 
   subscribe(nodeId, callback) → unsubscribe

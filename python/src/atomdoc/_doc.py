@@ -1093,7 +1093,7 @@ class Doc:
         # Inverse ops are recorded in forward order; roll back in reverse.
         inverse: Operations = (
             list(reversed(self._inverse_operations[0])),
-            dict(self._inverse_operations[1]),
+            {node_id: dict(patch) for node_id, patch in self._inverse_operations[1].items()},
         )
         try:
             ops.on_apply_operations(self, inverse)

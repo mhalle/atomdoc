@@ -292,14 +292,19 @@ export class UndoManager {
     return false;
   }
 
-  /** True when there is a step to undo and it is not still awaiting confirmation. */
+  /**
+   * True when there is a step to undo and nothing is awaiting the
+   * server: neither the newest step (a reservation) nor a dispatched
+   * undo or redo step.
+   */
   get canUndo(): boolean {
     const top = this.undoStack[this.undoStack.length - 1];
-    return top !== undefined && !top.pending;
+    return top !== undefined && !top.pending && this.inFlight.size === 0;
   }
 
+  /** True when there is a step to redo and no dispatched step is awaiting the server. */
   get canRedo(): boolean {
-    return this.redoStack.length > 0;
+    return this.redoStack.length > 0 && this.inFlight.size === 0;
   }
 
   /** Drop all undo and redo history. */

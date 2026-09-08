@@ -72,7 +72,9 @@ class Color(BaseModel, frozen=True):
     g: int = 0
     b: int = 0
 
-# Node types — @node turns a class into a document node
+# Node types — @node turns a class into a document node. A plain class
+# like this one skips validation; derive from BaseModel to validate
+# (see "Plain classes skip validation").
 @node
 class Annotation:
     label: str = ""
@@ -380,9 +382,10 @@ doc.root.sections[0].pages[0].annotations[0].label  # "note"
 ### Serialize
 
 Two formats — clean JSON for reading, wire format for persistence. The
-clean form nests children and omits node IDs, except that a `Ref` field
-is emitted as the target's ID, since that is its value; use `dump()`
-when the output must round-trip:
+clean form nests children and omits node IDs; a `Ref` field is emitted
+as the target's document path (a JSON Pointer such as `"/items/0"`,
+`null` if unresolved). Use `dump()`, which keeps IDs and emits a `Ref`
+as the target's ID, when the output must round-trip:
 
 ```python
 # Clean JSON — no internal IDs, just data
@@ -554,11 +557,26 @@ step whose targets are gone (someone else deleted what it would revert)
 applies as far as it can and is consumed, and a step that fails
 validation or referential integrity is rejected and kept for a retry.
 Global is right when one user looks at the document through several
-views; under `global`, if `doc.undo_manager` is enabled the session uses
-it, so host and clients share one history (`Session(doc,
+*thin* views; under `global`, if `doc.undo_manager` is enabled the
+session uses it, so host and clients share one history (`Session(doc,
 undo_manager=...)` selects that `UndoManager` instance explicitly).
 Otherwise the host's own `doc.undo_manager` is separate from the clients'
 histories. `undo_steps=` sizes the per-client histories.
+
+The policy only affects clients that send `undo`/`redo` on the wire.
+Thick clients never do: each keeps its own local history, so two thick
+views of one document have two undo stacks, and the policy is inert for
+them. A desktop app that wants one user-level undo across thick views
+gets it from the host: enable `doc.undo_manager` and call
+`doc.undo_manager.undo()` there (it reverts the last commit whoever made
+it, and the result reaches every view as an ordinary patch).
+
+A host process writes into a bound session like any other code: mutate
+inside `doc.transaction()` and the session broadcasts the commit (with
+`ref: null`, `source_client: null`) as it happens. Host commits enter
+`doc.undo_manager` unless made with `skip_undo`; they never enter a
+client's per-client history. Stop a session with `await session.unbind()`
+(which stops the transport it was bound to).
 
 ### Wire protocol
 
