@@ -221,7 +221,17 @@ def _make_node_from_class(source_cls: type, node_type_name: str) -> type[AtomNod
     # machinery and validators (which feed the validator model instead)
     # are left out. A name that would shadow the node API is an error
     # rather than a silent override.
-    reserved = set(vars(AtomNode))
+    reserved = {
+        name
+        for name in (*dir(AtomNode), *getattr(AtomNode, "__annotations__", {}))
+        if not name.startswith("_")
+    }
+    for name in (*annotations, *defaults):
+        if name in reserved:
+            raise TypeError(
+                f"{source_cls.__qualname__}.{name} would shadow AtomNode.{name}; "
+                "choose another field name"
+            )
     for name, value in vars(source_cls).items():
         if name in annotations or name in defaults:
             continue

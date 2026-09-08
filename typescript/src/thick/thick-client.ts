@@ -59,131 +59,121 @@ interface PendingOp {
    */
   inverse?: WireOperations;
   /** An undo or redo step sent for confirmation: its echo commits as that step. */
-  history?: "undo" | "redo";
-  /** What a built op does to the tree, for edits made before its echo. */
-  structure?: PendingStructure;
-}
-
-/** The structural intent of one built op. */
-interface PendingStructure {
-  inserted: Array<{ id: string; type: string; key?: string }>;
-  deleted: string[];
-  moved: string[];
-  /** Nodes appended to a slot, in order. */
-  tail?: { key: string; ids: string[] };
-  /** Nodes prepended to a slot, in order (first is the slot's first). */
-  head?: { key: string; ids: string[] };
+  history?: { kind: "undo" | "redo"; token: number };
+  /** The undo history place held for a built op until its echo fills it. */
+  reservation?: number;
 }
 
 /**
  * What the pending built ops, together, will have done to the tree once
- * the server confirms them. A new structural edit is anchored against
- * this rather than against the local tree alone, so that two appends in
- * a row keep their order and a child can be created under a parent that
- * is itself still pending.
+ * the server confirms them, projected from the ops themselves. A new
+ * structural edit is anchored against this rather than against the
+ * local tree alone, so that consecutive edits compose before any echo
+ * returns: two appends keep their order, a node moved to the end is the
+ * end, a child can be created under a parent that is itself pending.
  */
 class PendingModel {
-  inserted = new Map<string, { type: string; key?: string }>();
+  /** Nodes only a pending op has created, by id: their type. */
+  inserted = new Map<string, string>();
+  /** Nodes a pending op deletes. */
   deleted = new Set<string>();
-  moved = new Set<string>();
-  private chains = new Map<string, { head: string[]; tail: string[] }>();
+  /** Nodes a pending op places (inserts or moves): the slot key they end in. */
+  private placed = new Map<string, string>();
+  private ops: OrderedOp[] = [];
 
-  constructor(entries: Iterable<PendingStructure | undefined>) {
-    for (const s of entries) {
-      if (!s) continue;
-      for (const { id, type, key } of s.inserted) {
-        this.inserted.set(id, { type, key });
-        this.deleted.delete(id);
-      }
-      for (const id of s.deleted) {
-        this.deleted.add(id);
-        this.inserted.delete(id);
-        this._unchain(id);
-      }
-      for (const id of s.moved) {
-        this.moved.add(id);
-        this._unchain(id);
-      }
-      if (s.tail) this._chain(s.tail.key).tail.push(...s.tail.ids);
-      if (s.head) this._chain(s.head.key).head.unshift(...s.head.ids);
-    }
-  }
-
-  private _chain(key: string): { head: string[]; tail: string[] } {
-    let c = this.chains.get(key);
-    if (!c) {
-      c = { head: [], tail: [] };
-      this.chains.set(key, c);
-    }
-    return c;
-  }
-
-  private _unchain(id: string): void {
-    for (const c of this.chains.values()) {
-      for (const list of [c.head, c.tail]) {
-        const i = list.indexOf(id);
-        if (i >= 0) list.splice(i, 1);
+  constructor(private doc: LocalDoc, entries: Iterable<WireOperations>) {
+    for (const wire of entries) {
+      for (const op of wire.ordered) {
+        this.ops.push(op);
+        if (op[0] === 0) {
+          for (const [id, type] of op[1]) {
+            this.inserted.set(id, type);
+            this.deleted.delete(id);
+            this.placed.set(id, this.key(op[2], op[3]));
+          }
+        } else if (op[0] === 1) {
+          this.deleted.add(op[1]);
+          this.inserted.delete(op[1]);
+          this.placed.delete(op[1]);
+        } else {
+          this.placed.set(op[1], this.key(op[3], op[4]));
+        }
       }
     }
   }
 
-  /** True if `id` is gone or about to leave its place in the tree. */
-  private _unstable(id: string): boolean {
-    return this.deleted.has(id) || this.moved.has(id);
+  /** The slot key of a wire parent reference (`0` is the root). */
+  key(parentRef: string | 0, slot: string): string {
+    return `${parentRef === 0 ? this.doc.root.id : parentRef} ${slot}`;
   }
 
-  /** The node a new last child of the slot should follow. */
-  lastOf(parent: DocNode | undefined, slot: string, key: string): string | 0 {
-    const c = this.chains.get(key);
-    const tail = c?.tail[c.tail.length - 1];
-    if (tail) return tail;
-    for (let n = parent?.slotLast.get(slot) ?? null; n; n = n.prevSibling) {
-      if (!this._unstable(n.id)) return n.id;
+  /** True if the node, or an ancestor of it, is pending deletion. */
+  gone(id: string): boolean {
+    if (this.deleted.has(id)) return true;
+    for (let n = this.doc.getNode(id)?.parent; n; n = n.parent) {
+      if (this.deleted.has(n.id)) return true;
     }
-    const head = c?.head[c.head.length - 1];
-    return head ?? 0;
+    return false;
   }
 
-  /** The node a new first child of the slot should precede. */
-  firstOf(parent: DocNode | undefined, slot: string, key: string): string | 0 {
-    const c = this.chains.get(key);
-    if (c?.head[0]) return c.head[0];
-    for (let n = parent?.slotFirst.get(slot) ?? null; n; n = n.nextSibling) {
-      if (!this._unstable(n.id)) return n.id;
-    }
-    return c?.tail[0] ?? 0;
+  /** The slot a node will be in: its pending placement, else its live slot. */
+  keyOf(id: string): string | undefined {
+    const pending = this.placed.get(id);
+    if (pending) return pending;
+    const node = this.doc.getNode(id);
+    return node?.parent && node.slotName ? `${node.parent.id} ${node.slotName}` : undefined;
   }
 
-  /** The nearest stable sibling before `node`, if any. */
-  prevOf(node: DocNode): string | 0 {
-    for (let n = node.prevSibling; n; n = n.prevSibling) {
-      if (!this._unstable(n.id)) return n.id;
+  /** The order a slot will have once every pending op is confirmed. */
+  order(key: string): string[] {
+    const sep = key.indexOf(" ");
+    const parent = this.doc.getNode(key.slice(0, sep));
+    const slot = key.slice(sep + 1);
+    let list: string[] = [];
+    if (parent) {
+      for (let n = parent.slotFirst.get(slot) ?? null; n; n = n.nextSibling) list.push(n.id);
     }
-    return 0;
-  }
-
-  /** The nearest stable sibling after `node`, if any. */
-  nextOf(node: DocNode): string | 0 {
-    for (let n = node.nextSibling; n; n = n.nextSibling) {
-      if (!this._unstable(n.id)) return n.id;
+    // Nodes a pending op deletes or places leave their live place; the
+    // replay below puts the placed ones where they will end up.
+    list = list.filter((id) => !this.deleted.has(id) && !this.placed.has(id));
+    for (const op of this.ops) {
+      if (op[0] === 0) {
+        if (this.key(op[2], op[3]) === key) {
+          place(list, op[1].map(([id]) => id), op[4], op[5]);
+        }
+      } else if (op[0] === 1) {
+        remove(list, op[1]);
+      } else {
+        remove(list, op[1]);
+        if (this.key(op[3], op[4]) === key) place(list, [op[1]], op[5], op[6]);
+      }
     }
-    return 0;
+    return list;
   }
 }
 
-/** Ids of the nodes an op inserts, deletes, and moves. */
-function structureOf(ops: WireOperations): PendingStructure | undefined {
-  const s: PendingStructure = { inserted: [], deleted: [], moved: [] };
-  for (const op of ops.ordered) {
-    if (op[0] === 0) {
-      for (const [id, type] of op[1]) s.inserted.push({ id, type });
-    } else if (op[0] === 1) {
-      s.deleted.push(op[1]);
-    } else {
-      s.moved.push(op[1]);
+/** After `prev` if present, else before `next` if present, else at the end. */
+function place(list: string[], ids: string[], prev: string | 0, next: string | 0): void {
+  if (prev) {
+    const idx = list.indexOf(prev);
+    if (idx >= 0) {
+      list.splice(idx + 1, 0, ...ids);
+      return;
     }
   }
-  return s.inserted.length + s.deleted.length + s.moved.length > 0 ? s : undefined;
+  if (next) {
+    const idx = list.indexOf(next);
+    if (idx >= 0) {
+      list.splice(idx, 0, ...ids);
+      return;
+    }
+  }
+  list.push(...ids);
+}
+
+function remove(list: string[], id: string): void {
+  const idx = list.indexOf(id);
+  if (idx >= 0) list.splice(idx, 1);
 }
 
 export class ThickAtomDocClient {
@@ -208,7 +198,7 @@ export class ThickAtomDocClient {
    * Waiting for the connection: sent, in order, once the (re)connect
    * snapshot is in. Every one is applied when its echo arrives.
    */
-  private bufferedOps: Array<{ ops: WireOperations; structure?: PendingStructure }> = [];
+  private bufferedOps: WireOperations[] = [];
   private applyingRemote = false;
   private nextRef = 1;
   /** Online again, but the reconnect snapshot has not arrived yet. */
@@ -302,10 +292,7 @@ export class ThickAtomDocClient {
     // to this document, the reconnect snapshot replaces it and their
     // echoes apply them afresh.
     if (this.pendingOps.length > 0) {
-      this.bufferedOps = [
-        ...this.pendingOps.map((p) => ({ ops: p.ops, structure: p.structure })),
-        ...this.bufferedOps,
-      ];
+      this.bufferedOps = [...this.pendingOps.map((p) => p.ops), ...this.bufferedOps];
       this.pendingOps = [];
     }
     if (wasOnline) {
@@ -356,7 +343,7 @@ export class ThickAtomDocClient {
   pendingStructure(): boolean {
     return (
       this.pendingOps.some((p) => !p.applied && p.ops.ordered.length > 0) ||
-      this.bufferedOps.some((b) => b.ops.ordered.length > 0)
+      this.bufferedOps.some((ops) => ops.ordered.length > 0)
     );
   }
 
@@ -365,17 +352,20 @@ export class ThickAtomDocClient {
   /**
    * Write a field. Applied locally at once and sent; the echo confirms
    * it. A node that is still pending creation accepts writes too: they
-   * are sent and show up with the node.
+   * are sent and show up with the node. A node pending deletion does
+   * not.
    */
   setField(nodeId: string, field: string, value: unknown): void {
     const doc = this._doc();
+    const model = this._pendingModel();
+    if (model.gone(nodeId)) throw new Error(`Node not found: ${nodeId}`);
     if (doc.getNode(nodeId)) {
       doc.setNodeState(nodeId, field, value);
       return;
     }
-    const pending = this._pendingModel().inserted.get(nodeId);
-    if (!pending) throw new Error(`Node not found: ${nodeId}`);
-    this._checkField(pending.type, field);
+    const type = model.inserted.get(nodeId);
+    if (!type) throw new Error(`Node not found: ${nodeId}`);
+    this._checkField(type, field);
     this._sendBuilt({ ordered: [], state: { [nodeId]: { [field]: value } } });
   }
 
@@ -395,28 +385,21 @@ export class ThickAtomDocClient {
     const doc = this._doc();
     const node = doc.createNode(type, state); // validates type and fields
     const model = this._pendingModel();
-    const { parent, parentRef, key } = this._parentFor(model, parentId, slot);
+    const { parentRef, key } = this._parentFor(model, parentId, slot);
+    const order = model.order(key);
     let prev: string | 0 = 0;
     let next: string | 0 = 0;
-    const structure: PendingStructure = {
-      inserted: [{ id: node.id, type, key }],
-      deleted: [],
-      moved: [],
-    };
     if (position === "append") {
-      prev = model.lastOf(parent, slot, key);
-      structure.tail = { key, ids: [node.id] };
+      prev = order[order.length - 1] ?? 0;
     } else if (position === "prepend") {
-      next = model.firstOf(parent, slot, key);
-      structure.head = { key, ids: [node.id] };
+      next = order[0] ?? 0;
     } else {
       throw new Error(`Unsupported position: ${position}`);
     }
-    const ops: WireOperations = {
+    this._sendBuilt({
       ordered: [[0, [[node.id, type]], parentRef, slot, prev, next]],
       state: Object.keys(node.state).length > 0 ? { [node.id]: { ...node.state } } : {},
-    };
-    this._sendBuilt(ops, structure);
+    });
     return node.id;
   }
 
@@ -426,13 +409,10 @@ export class ThickAtomDocClient {
     const model = this._pendingModel();
     const node = doc.getNode(nodeId);
     if (node === doc.root) throw new Error("Root node cannot be deleted");
-    if ((!node && !model.inserted.has(nodeId)) || model.deleted.has(nodeId)) {
+    if ((!node && !model.inserted.has(nodeId)) || model.gone(nodeId)) {
       throw new Error(`Node not found: ${nodeId}`);
     }
-    this._sendBuilt(
-      { ordered: [[1, nodeId, 0]], state: {} },
-      { inserted: [], deleted: [nodeId], moved: [] },
-    );
+    this._sendBuilt({ ordered: [[1, nodeId, 0]], state: {} });
   }
 
   /** Move a node to the end of `slot` on `parentId` (`""` or `"0"` = root). */
@@ -446,12 +426,11 @@ export class ThickAtomDocClient {
         if (anc === node) throw new Error("Target is in the range");
       }
     }
-    const prev = model.lastOf(parent, slot, key);
-    if (prev === nodeId) return; // already there
-    this._sendBuilt(
-      { ordered: [[2, nodeId, 0, parentRef, slot, prev, 0]], state: {} },
-      { inserted: [], deleted: [], moved: [nodeId], tail: { key, ids: [nodeId] } },
-    );
+    const order = model.order(key);
+    if (order[order.length - 1] === nodeId) return; // already there
+    remove(order, nodeId);
+    const prev = order[order.length - 1] ?? 0;
+    this._sendBuilt({ ordered: [[2, nodeId, 0, parentRef, slot, prev, 0]], state: {} });
   }
 
   /** Move a node so it sits immediately before or after sibling `targetId`. */
@@ -465,46 +444,29 @@ export class ThickAtomDocClient {
     const node = this._movable(doc, model, nodeId);
     if (targetId === nodeId) throw new Error("Target is in the range");
     const target = doc.getNode(targetId);
-    let parentRef: string | 0;
-    let slot: string;
-    let prev: string | 0;
-    let next: string | 0;
-    if (target) {
-      if (model.deleted.has(targetId)) throw new Error(`Node not found: ${targetId}`);
-      if (!target.parent || !target.slotName) {
-        throw new Error("Cannot move before or after the root");
-      }
-      if (node) {
-        for (let anc: DocNode | null = target.parent; anc; anc = anc.parent) {
-          if (anc === node) throw new Error("Target is descendant of the range");
-        }
-      }
-      parentRef = target.parent === doc.root ? 0 : target.parent.id;
-      slot = target.slotName;
-      if (position === "before") {
-        if (model.prevOf(target) === nodeId) return;
-        prev = model.prevOf(target);
-        next = targetId;
-      } else {
-        if (model.nextOf(target) === nodeId) return;
-        prev = targetId;
-        next = model.nextOf(target);
-      }
-    } else {
-      // A pending sibling: anchor on it alone; the server resolves it.
-      const pending = model.inserted.get(targetId);
-      if (!pending?.key) throw new Error(`Node not found: ${targetId}`);
-      const sep = pending.key.indexOf(" ");
-      const parentId = pending.key.slice(0, sep);
-      parentRef = parentId === doc.root.id ? 0 : parentId;
-      slot = pending.key.slice(sep + 1);
-      prev = position === "before" ? 0 : targetId;
-      next = position === "before" ? targetId : 0;
+    if ((!target && !model.inserted.has(targetId)) || model.gone(targetId)) {
+      throw new Error(`Node not found: ${targetId}`);
     }
-    this._sendBuilt(
-      { ordered: [[2, nodeId, 0, parentRef, slot, prev, next]], state: {} },
-      { inserted: [], deleted: [], moved: [nodeId] },
-    );
+    const key = model.keyOf(targetId);
+    if (!key) throw new Error("Cannot move before or after the root");
+    const parentId = key.slice(0, key.indexOf(" "));
+    const slot = key.slice(key.indexOf(" ") + 1);
+    const parent = doc.getNode(parentId);
+    if (node && parent) {
+      for (let anc: DocNode | null = parent; anc; anc = anc.parent) {
+        if (anc === node) throw new Error("Target is descendant of the range");
+      }
+    }
+    const order = model.order(key);
+    const at = order.indexOf(targetId);
+    if (at < 0) throw new Error(`Node not found: ${targetId}`);
+    if (order[position === "before" ? at - 1 : at + 1] === nodeId) return; // already there
+    remove(order, nodeId);
+    const idx = order.indexOf(targetId);
+    const prev: string | 0 = position === "before" ? (order[idx - 1] ?? 0) : targetId;
+    const next: string | 0 = position === "before" ? targetId : (order[idx + 1] ?? 0);
+    const parentRef = parentId === doc.root.id ? 0 : parentId;
+    this._sendBuilt({ ordered: [[2, nodeId, 0, parentRef, slot, prev, next]], state: {} });
   }
 
   undo(steps = 1): void {
@@ -580,9 +542,9 @@ export class ThickAtomDocClient {
   }
 
   private _pendingModel(): PendingModel {
-    return new PendingModel([
-      ...this.pendingOps.map((p) => (p.applied ? undefined : p.structure)),
-      ...this.bufferedOps.map((b) => b.structure),
+    return new PendingModel(this._doc(), [
+      ...this.pendingOps.filter((p) => !p.applied).map((p) => p.ops),
+      ...this.bufferedOps,
     ]);
   }
 
@@ -597,12 +559,12 @@ export class ThickAtomDocClient {
     const parent = isRoot ? doc.root : doc.getNode(parentId);
     let parentType: string;
     if (parent) {
-      if (model.deleted.has(parent.id)) throw new Error(`Node not found: ${parentId}`);
+      if (model.gone(parent.id)) throw new Error(`Node not found: ${parentId}`);
       parentType = parent.type;
     } else {
       const pending = model.inserted.get(parentId);
       if (!pending) throw new Error(`Parent not found: ${parentId}`);
-      parentType = pending.type;
+      parentType = pending;
     }
     if (!(slot in (this.rawSchema?.node_types[parentType]?.slots ?? {}))) {
       throw new Error(`Slot '${slot}' does not exist on ${parentType}`);
@@ -615,7 +577,7 @@ export class ThickAtomDocClient {
   private _movable(doc: LocalDoc, model: PendingModel, nodeId: string): DocNode | undefined {
     const node = doc.getNode(nodeId);
     if (node === doc.root) throw new Error("Cannot move the root");
-    if ((!node && !model.inserted.has(nodeId)) || model.deleted.has(nodeId)) {
+    if ((!node && !model.inserted.has(nodeId)) || model.gone(nodeId)) {
       throw new Error(`Node not found: ${nodeId}`);
     }
     return node;
@@ -637,10 +599,12 @@ export class ThickAtomDocClient {
         this._handlePatch(msg);
         break;
 
-      case "error":
-        if (msg.ref) this._takePending(msg.ref);
+      case "error": {
+        const entry = typeof msg.ref === "string" ? this._takePending(msg.ref) : null;
+        if (entry?.reservation !== undefined) this.undoMgr?.cancel(entry.reservation);
         for (const cb of this.errorCallbacks) cb(msg);
         break;
+      }
     }
   }
 
@@ -676,7 +640,7 @@ export class ThickAtomDocClient {
     this.doc = new LocalDoc(this.rawSchema, snapshot);
     this.undoMgr = new UndoManager(this.doc, this.maxUndoSteps, {
       mergeInterval: this.mergeInterval,
-      dispatch: (ops, kind) => this._dispatchHistory(ops, kind),
+      dispatch: (ops, kind, token) => this._dispatchHistory(ops, kind, token),
     });
     this.bridge = bridgeDocToStore(this.doc, this.store, { coalesce: this.coalesce });
 
@@ -694,8 +658,8 @@ export class ThickAtomDocClient {
     this.onlinePending = false;
     const replay = this.bufferedOps;
     this.bufferedOps = [];
-    for (const { ops, structure } of replay) {
-      this._sendBuilt(ops, structure);
+    for (const ops of replay) {
+      this._sendBuilt(ops);
     }
 
     for (const cb of this.connectedCallbacks) cb();
@@ -712,9 +676,9 @@ export class ThickAtomDocClient {
    * like any edit. One that touches structure is sent like any
    * structural edit and commits, as that step, when its echo arrives.
    */
-  private _dispatchHistory(ops: WireOperations, kind: "undo" | "redo"): boolean {
+  private _dispatchHistory(ops: WireOperations, kind: "undo" | "redo", token: number): boolean {
     if (ops.ordered.length === 0) return false;
-    this._sendBuilt(ops, structureOf(ops), kind);
+    this._sendBuilt(ops, { kind, token });
     return true;
   }
 
@@ -741,19 +705,21 @@ export class ThickAtomDocClient {
         }
       } else {
         // A built edit, as the server recorded it: apply it now. It is
-        // this client's own work, so it enters undo history (as the undo
-        // or redo step it was sent as, if it was one), but it is not
-        // sent again.
-        // Only a write the local document already holds can mask one of
-        // its fields: a later pending write to a node that is itself
-        // still pending has nothing local to protect.
+        // this client's own work, so it enters undo history — in the
+        // place reserved for it when the user acted, or as the undo or
+        // redo step it was sent as — but it is not sent again. Only a
+        // write the local document already holds can mask one of its
+        // fields: a later pending write to a node that is itself still
+        // pending has nothing local to protect.
         const ops: WireOperations = {
           ordered: msg.operations.ordered,
           state: this._maskState(msg.operations.state, false, true),
         };
         const commit = () => this._applyRemote(ops, {});
         if (entry.history && this.undoMgr) {
-          this.undoMgr.commitAs(entry.history, commit);
+          this.undoMgr.commitAs(entry.history.token, commit);
+        } else if (entry.reservation !== undefined && this.undoMgr) {
+          this.undoMgr.commitInto(entry.reservation, commit);
         } else {
           this.doc.forceCommit();
           commit();
@@ -861,13 +827,17 @@ export class ThickAtomDocClient {
     this._queue({ ops, inverse, applied: true });
   }
 
-  /** Send an edit built from the tree; its echo applies it. */
-  private _sendBuilt(
-    ops: WireOperations,
-    structure?: PendingStructure,
-    history?: "undo" | "redo",
-  ): void {
-    this._queue({ ops, applied: false, structure, history });
+  /**
+   * Send an edit built from the tree; its echo applies it. A user's own
+   * edit (not an undo or redo step) takes its place in undo history now,
+   * so that steps stay in the order the user made them.
+   */
+  private _sendBuilt(ops: WireOperations, history?: PendingOp["history"]): void {
+    const reservation =
+      !history && this.online && this.ws && !this.onlinePending
+        ? this.undoMgr?.reserve()
+        : undefined;
+    this._queue({ ops, applied: false, history, reservation });
   }
 
   private _queue(entry: Omit<PendingOp, "ref">): void {
@@ -881,7 +851,7 @@ export class ThickAtomDocClient {
       // Until the connection (and its snapshot) is in, every edit waits
       // its turn: it is sent from the snapshot, whether or not this
       // document applied it, and its echo applies it to the new one.
-      this.bufferedOps.push({ ops: entry.ops, structure: entry.structure });
+      this.bufferedOps.push(entry.ops);
     }
   }
 

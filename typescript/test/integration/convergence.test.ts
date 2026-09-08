@@ -4,8 +4,8 @@
  * local document must equal the server's.
  *
  * "disjoint" is the recommended deployment rule (device-owned and
- * user-owned fields never overlap). "overlap" makes them interfere, which
- * the echo re-apply must still converge.
+ * user-owned fields never overlap). "overlap" makes them interfere: field
+ * echoes and masking, and structure applied on echo, must still converge.
  */
 
 import { describe, it, expect, afterEach } from "vitest";

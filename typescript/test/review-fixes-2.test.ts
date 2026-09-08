@@ -539,19 +539,19 @@ describe("second review: thick client", () => {
       expect((c as unknown as { pendingOps: unknown[] }).pendingOps).toEqual([]);
       expect(ids(c.getDoc()!)).toEqual(["d", "a", "b", "c"]);
       expect(c.getDoc()!.getNode("a")!.state.name).toBe("second");
-      // The move is the newest undo step; the merged writes are the one
-      // before. Undoing the move puts d back where it was when the move
-      // was confirmed: between b and c, where the remote had put it.
+      // The move was made within the merge window of the writes, so the
+      // three are one step. Undoing it puts d back where it was when the
+      // move was confirmed (between b and c, where the remote had put it)
+      // and restores the field to the remote's value, not to what we saw
+      // before editing.
       c.undo();
-      expect(sentOps(ws).at(-1)!.operations!.ordered).toEqual([[2, "d", 0, 0, "children", "b", "c"]]);
-      ws.deliver({
-        type: "patch", version: 5, source_client: "me", ref: sentOps(ws).at(-1)!.ref,
-        operations: sentOps(ws).at(-1)!.operations!,
-      });
+      const step = sentOps(ws).at(-1)!;
+      expect(step.operations!.ordered).toEqual([[2, "d", 0, 0, "children", "b", "c"]]);
+      expect(step.operations!.state).toEqual({ a: { name: "remote" } });
+      ws.deliver({ type: "patch", version: 5, source_client: "me", ref: step.ref, operations: step.operations! });
       expect(ids(c.getDoc()!)).toEqual(["a", "b", "d", "c"]);
-      // The merged undo step restores the field to the remote's value.
-      c.undo();
       expect(c.getDoc()!.getNode("a")!.state.name).toBe("remote");
+      expect(c.getUndoManager()!.canUndo).toBe(false);
     });
   });
 

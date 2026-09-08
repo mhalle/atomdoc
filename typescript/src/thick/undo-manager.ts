@@ -4,6 +4,12 @@
  * Supports a merge interval (consecutive transactions collapse into one
  * step), `skipUndo` transaction flags, and history export/import so undo
  * state survives replacing the document with a newer snapshot.
+ *
+ * Two hooks serve the thick client, whose structural edits commit only
+ * when the server confirms them: `reserve()` holds a step's place in
+ * history from the moment the user acts until its commit arrives
+ * (`commitInto`), and `dispatch` lets the client take an undo or redo
+ * step over and commit it later (`commitAs`).
  */
 
 import type { OrderedOp, WireOperations } from "../types.js";
@@ -17,12 +23,13 @@ export interface UndoManagerOptions {
   clock?: () => number;
   /**
    * Offered every undo or redo step before it is applied. Returning true
-   * takes the step over: the caller applies it later (after a server
-   * confirms it, say) inside {@link UndoManager.commitAs}, which files the
-   * resulting commit on the opposite stack. Returning false applies the
-   * step to the document now.
+   * takes the step over: it is off both stacks until the caller commits
+   * it inside {@link UndoManager.commitAs} with the given `token`, which
+   * files the resulting commit on the opposite stack. A step the caller
+   * never commits (the server had nothing to apply, or refused it) is
+   * consumed. Returning false applies the step to the document now.
    */
-  dispatch?: (operations: WireOperations, kind: "undo" | "redo") => boolean;
+  dispatch?: (operations: WireOperations, kind: "undo" | "redo", token: number) => boolean;
 }
 
 interface UndoStackItem {
@@ -34,6 +41,10 @@ interface UndoStackItem {
    * that holds an event's inverse find the item it landed in.
    */
   sources?: WireOperations[];
+  /** A reservation (see `reserve`) whose commit has not arrived yet. */
+  pending?: number;
+  /** A reservation made within the merge window of the step before it. */
+  merge?: boolean;
 }
 
 export interface UndoHistoryItem {
@@ -56,10 +67,17 @@ export class UndoManager {
   private clock: () => number;
   private undoStack: UndoStackItem[] = [];
   private redoStack: UndoStackItem[] = [];
-  private txType: "update" | "undo" | "redo" = "update";
+  private txType: "update" | "undo" | "redo" | "discard" = "update";
   private lastUpdate: number | undefined;
   private unsub: () => void;
   private dispatch: UndoManagerOptions["dispatch"];
+  private reservations = 0;
+  private fillTarget: number | null = null;
+  private tokens = 0;
+  /** Dispatched steps awaiting `commitAs`, with the history epoch they left. */
+  private inFlight = new Map<number, { kind: "undo" | "redo"; epoch: number }>();
+  /** Bumped by every new local step; a dispatched undo older than the newest step is stale. */
+  private epoch = 0;
 
   constructor(doc: LocalDoc, maxSteps = 100, options: UndoManagerOptions = {}) {
     this.doc = doc;
@@ -83,11 +101,16 @@ export class UndoManager {
       meta: {},
       sources: [event.inverseOperations],
     };
+    if (this.fillTarget !== null) {
+      this._fill(this.fillTarget, item);
+      return;
+    }
     if (this.txType === "update") {
       const now = this.clock();
       const last = this.undoStack[this.undoStack.length - 1];
       if (
         last !== undefined &&
+        !last.pending &&
         this.lastUpdate !== undefined &&
         now - this.lastUpdate < this.mergeInterval
       ) {
@@ -95,13 +118,11 @@ export class UndoManager {
         last.operations = mergeOperations(item.operations, last.operations);
         (last.sources ??= []).push(item.operations);
       } else {
-        if (this.undoStack.length >= this.maxSteps) {
-          this.undoStack.shift();
-        }
-        this.undoStack.push(item);
+        this._push(item);
       }
       this.redoStack.length = 0;
       this.lastUpdate = now;
+      this.epoch++;
     } else if (this.txType === "undo") {
       this.redoStack.push(item);
       this.txType = "update";
@@ -109,14 +130,91 @@ export class UndoManager {
       this.undoStack.push(item);
       this.txType = "update";
     }
+    // "discard": a dispatched step whose commit no longer belongs in
+    // history (see commitAs). Nothing is filed.
+  }
+
+  private _push(item: UndoStackItem): void {
+    if (this.undoStack.length >= this.maxSteps) {
+      this.undoStack.shift();
+    }
+    this.undoStack.push(item);
+  }
+
+  /**
+   * Hold a place in history for a local step whose commit arrives later
+   * (a structural edit the server has yet to confirm). The step is
+   * ordered by when the user acted, not by when its commit lands, and
+   * the merge window is measured from now. Redo is cleared as for any
+   * new step. Until the commit fills it, the placeholder blocks undo:
+   * `canUndo` is false while the newest step is one.
+   *
+   * @returns An id for {@link commitInto} or {@link cancel}.
+   */
+  reserve(): number {
+    const id = ++this.reservations;
+    const now = this.clock();
+    const merge =
+      this.undoStack.length > 0 &&
+      this.lastUpdate !== undefined &&
+      now - this.lastUpdate < this.mergeInterval;
+    this._push({ operations: { ordered: [], state: {} }, meta: {}, pending: id, merge });
+    this.redoStack.length = 0;
+    this.lastUpdate = now;
+    this.epoch++;
+    return id;
+  }
+
+  /**
+   * Run `fn`, whose commit fills the reservation `id`. If `fn` commits
+   * nothing, or the reservation is gone, the placeholder is removed.
+   */
+  commitInto(id: number, fn: () => void): void {
+    this.doc.forceCommit();
+    this.fillTarget = id;
+    try {
+      fn();
+    } finally {
+      this.fillTarget = null;
+      this.cancel(id);
+    }
+  }
+
+  /** Drop the reservation `id` if its commit never arrived. */
+  cancel(id: number): void {
+    const idx = this.undoStack.findIndex((item) => item.pending === id);
+    if (idx >= 0) this.undoStack.splice(idx, 1);
+  }
+
+  private _fill(id: number, item: UndoStackItem): void {
+    const idx = this.undoStack.findIndex((entry) => entry.pending === id);
+    if (idx < 0) return; // cancelled, or pushed out by maxSteps: too old to keep
+    const placeholder = this.undoStack[idx];
+    const previous = idx > 0 ? this.undoStack[idx - 1] : undefined;
+    if (placeholder.merge && previous && !previous.pending) {
+      previous.operations = mergeOperations(item.operations, previous.operations);
+      (previous.sources ??= []).push(item.operations);
+      this.undoStack.splice(idx, 1);
+      return;
+    }
+    placeholder.operations = item.operations;
+    placeholder.sources = item.sources;
+    delete placeholder.pending;
+    delete placeholder.merge;
   }
 
   undo(): void {
     this.doc.forceCommit();
-    const item = this.undoStack.pop();
-    if (!item) return;
+    const top = this.undoStack[this.undoStack.length - 1];
+    if (!top || top.pending) return;
+    const item = this.undoStack.pop()!;
     this.lastUpdate = undefined;
-    if (this.dispatch?.(item.operations, "undo")) return;
+    if (this.dispatch) {
+      const token = ++this.tokens;
+      this.inFlight.set(token, { kind: "undo", epoch: this.epoch });
+      if (this.dispatch(item.operations, "undo", token)) return;
+      this.inFlight.delete(token);
+    }
     this.txType = "undo";
     try {
       this.doc.applyOperations(item.operations, undefined, true);
@@ -137,7 +235,12 @@ export class UndoManager {
     const item = this.redoStack.pop();
     if (!item) return;
     this.lastUpdate = undefined;
-    if (this.dispatch?.(item.operations, "redo")) return;
+    if (this.dispatch) {
+      const token = ++this.tokens;
+      this.inFlight.set(token, { kind: "redo", epoch: this.epoch });
+      if (this.dispatch(item.operations, "redo", token)) return;
+      this.inFlight.delete(token);
+    }
     this.txType = "redo";
     try {
       this.doc.applyOperations(item.operations, undefined, true);
@@ -150,13 +253,18 @@ export class UndoManager {
   }
 
   /**
-   * Run `fn`, whose commits count as the `kind` step a `dispatch` took
-   * over: an undo commit is filed on the redo stack and a redo commit on
-   * the undo stack, as if the manager had applied the step itself.
+   * Run `fn`, whose commit is the dispatched step `token`: an undo commit
+   * is filed on the redo stack and a redo commit on the undo stack, as
+   * if the manager had applied the step itself. An undo step overtaken
+   * by a newer local step is applied but not filed: the edit made since
+   * already invalidated its redo.
    */
-  commitAs(kind: "undo" | "redo", fn: () => void): void {
+  commitAs(token: number, fn: () => void): void {
+    const flight = this.inFlight.get(token);
+    this.inFlight.delete(token);
     this.doc.forceCommit();
-    this.txType = kind;
+    this.txType =
+      !flight || (flight.kind === "undo" && flight.epoch !== this.epoch) ? "discard" : flight.kind;
     this.lastUpdate = undefined;
     try {
       fn();
@@ -184,8 +292,10 @@ export class UndoManager {
     return false;
   }
 
+  /** True when there is a step to undo and it is not still awaiting confirmation. */
   get canUndo(): boolean {
-    return this.undoStack.length > 0;
+    const top = this.undoStack[this.undoStack.length - 1];
+    return top !== undefined && !top.pending;
   }
 
   get canRedo(): boolean {
@@ -208,13 +318,14 @@ export class UndoManager {
   /**
    * Export undo and redo state for transfer to a matching document.
    * Pending edits are committed first so they are part of the history.
+   * Steps still awaiting confirmation are left out.
    */
   exportHistory(): UndoHistory {
     this.doc.forceCommit();
     const history: UndoHistory = {
       docId: this.doc.id,
       docType: this.doc.root.type,
-      undoStack: this.undoStack.map(exportItem),
+      undoStack: this.undoStack.filter((item) => !item.pending).map(exportItem),
       redoStack: this.redoStack.map(exportItem),
     };
     if (this.lastUpdate !== undefined) history.lastUpdate = this.lastUpdate;

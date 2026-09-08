@@ -1,6 +1,6 @@
 # atomdoc-ts
 
-TypeScript client for the [AtomDoc](https://github.com/mhalle/atomdoc) document protocol. Connect to a Python AtomDoc server, render documents reactively, and send operations back.
+TypeScript client for the [AtomDoc](../README.md) document protocol. Connect to a Python AtomDoc server (the [`python/`](../python/README.md) package in this repository), render documents reactively, and send operations back. The wire protocol both sides speak is [PROTOCOL.md](../PROTOCOL.md).
 
 > **Note:** This package was previously called `atomdoc-client`. It has been renamed to `atomdoc-ts`.
 
@@ -55,19 +55,20 @@ const client = new ThickAtomDocClient({ url: "ws://localhost:8765" });
 
 client.onConnected(() => {
   const store = client.getStore();
-  console.log("Document loaded:", store.getRoot().state.title);
+  console.log("Document loaded:", store.getRoot()!.state.title);
 });
 
 await client.connect();
 
 // Field writes apply at once — no round-trip
+const rootId = client.getStore().getRootId();
 client.setField(rootId, "title", "Updated");
-console.log(client.getDoc().root.state.title); // "Updated" immediately
+console.log(client.getDoc()!.root.state.title); // "Updated" immediately
 
 // Structural edits apply when the server confirms them
 const id = client.createNode("Annotation", { label: "New" }, rootId, "annotations");
 client.onPatch(() => {
-  if (!client.pendingStructure()) console.log("confirmed:", client.getDoc().getNode(id));
+  if (!client.pendingStructure()) console.log("confirmed:", client.getDoc()!.getNode(id));
 });
 
 // Local undo
@@ -146,7 +147,8 @@ const schema = client.getSchema();
 schema.nodeTypeNames();                         // ["Page", "Annotation"]
 schema.valueTypeNames();                        // ["Color"]
 schema.getFieldTier("Annotation", "color");     // "atomic"
-schema.getSlots("Page");                        // { annotations: { allowed_type: "Annotation" } }
+schema.getSlots("Page");                        // { annotations: { allowed_type: "Annotation", allowed_types: ["Annotation"] } }
+schema.getNodeType("Page"); schema.getValueType("Color"); schema.getRef("Volume", "transform"); schema.getHandles("Volume");
 schema.getRefs("Volume");                       // { transform: { target_type: "Transform", many: false, policy: "restrict" } }
 schema.getDefaults("Annotation");               // { label: "", color: { r: 0, g: 0, b: 0 } }
 
@@ -162,7 +164,7 @@ const zodSchema = schema.getZodSchema("Color");
 Define document schemas directly in TypeScript using `defineNode()`, `defineValue()`, and `buildSchema()`. The generated schema uses the same wire format as the Python `@node` decorator and `doc.atomdoc_schema()`, so schemas defined in TypeScript are fully compatible with the Python server.
 
 ```ts
-import { defineNode, defineValue, buildSchema } from "atomdoc-ts";
+import { defineNode, defineValue, defineHandle, buildSchema } from "atomdoc-ts";
 
 const Color = defineValue("Color", {
   r: { type: "integer", default: 0 },
@@ -190,10 +192,12 @@ const schema = buildSchema("Page", [Page, Annotation], [Color]);
 ```
 
 Handles name things outside the document. `defineHandle(name, strength)`
-builds a frozen `uri` / `media_type` / `digest` value type; put it on a
-field with `tier: "atomic"` and the node type exports a `handles` block.
+builds a frozen `uri` / `media_type` / `digest` value type; an `object`
+field whose `schema` is such a value type makes the node type export a
+`handles` block for it.
 `doc.handles("strong")` on a `LocalDoc` is the dependency list a consumer
-checks before opening a document.
+checks before opening a document: objects `{ node, field, handle, strength }`
+(the Python `doc.handles()` yields `(node, field, handle)` tuples).
 
 A `ref` field is the TypeScript spelling of Python's `Ref[T]` (`many: true`
 for `list[Ref[T]]`). Slots are ownership; references are association and
@@ -202,8 +206,9 @@ never control a node's lifetime. `LocalDoc` keeps a reverse index
 transaction commits: a reference must resolve to a node of the declared
 type, and a node that is still referenced cannot be deleted. A violation
 throws `RefIntegrityError` and rolls the transaction back, so re-point the
-referrers and delete the old target in one transaction. Moving a node is
-not a delete.
+referrers and delete the old target together: on a `LocalDoc`, in one
+`applyOperations` call carrying both (the thick client has no multi-step
+transaction API of its own). Moving a node is not a delete.
 
 This is useful for:
 
@@ -347,9 +352,11 @@ client.getVersion();     // server version
 #### Additional State
 
 ```ts
-client.getDoc();          // LocalDoc — the local document model
-client.getUndoManager();  // UndoManager
+client.getDoc();          // LocalDoc | null — the local document model (null until the snapshot)
+client.getUndoManager();  // UndoManager | null
 client.isOnline();        // connection status
+client.pendingStructure(); // a structural edit is awaiting confirmation
+client.disconnect();      // close the socket; edits queue until connect() again
 ```
 
 #### Mutations
@@ -396,9 +403,16 @@ client.redo();
 client.undo(3);  // undo 3 steps at once
 
 // Check availability
-client.getUndoManager().canUndo;
-client.getUndoManager().canRedo;
+client.getUndoManager()!.canUndo;   // false while the newest step awaits confirmation
+client.getUndoManager()!.canRedo;
 ```
+
+Steps enter history in the order the user acted, not the order the
+server's echoes arrive: a structural edit holds its place from the
+moment it is sent. The `UndoManager` API behind this (`reserve`,
+`commitInto`, `cancel`, the `dispatch` option and `commitAs`) is
+described in [PROTOCOL.md](../PROTOCOL.md) §10 and §12; `clear()` drops
+the history and `dispose()` detaches the manager from the document.
 
 Undo history can be carried over when a document is rebuilt from a newer
 snapshot, as long as the ID and root type match:
@@ -426,7 +440,8 @@ client.onConnected(() => { ... });     // initial load complete
 client.onPatch((version) => { ... });  // remote change applied
 client.onError((err) => { ... });      // server error
 client.onResync(() => { ... });        // server replaced the local doc with a
-                                       // fresh snapshot after rejecting an op
+                                       // fresh snapshot: after rejecting an op,
+                                       // and on every reconnect
 client.onOffline(() => { ... });       // connection lost
 client.onOnline(() => { ... });        // reconnected
 ```
@@ -505,6 +520,8 @@ function useNode(store: NodeStore, nodeId: string): StoreNode | undefined {
 }
 
 function useChildren(store: NodeStore, nodeId: string, slot: string): string[] {
+  // getChildren returns the stored array (or one shared empty array), so
+  // the snapshot is reference-stable between changes, as React requires.
   return useSyncExternalStore(
     (cb) => store.subscribe(nodeId, cb),
     () => store.getChildren(nodeId, slot),
@@ -645,14 +662,12 @@ The color is edited locally with draft state. One `setField` call on apply -- on
 
 ## Python Server Setup
 
-The client connects to an [AtomDoc](https://github.com/mhalle/atomdoc) Python server:
+The client connects to an AtomDoc Python server (the [`python/`](../python/README.md) package):
 
 ```python
 import asyncio
 from pydantic import BaseModel
-from atomdoc import Array, Doc, node
-from atomdoc._session import Session
-from atomdoc._ws_transport import WebSocketTransport
+from atomdoc import Array, Doc, Session, WebSocketTransport, node
 
 
 class Color(BaseModel, frozen=True):
@@ -701,9 +716,9 @@ See [PROTOCOL.md](../PROTOCOL.md) for the full wire protocol specification.
 | Message | Fields | When |
 |---------|--------|------|
 | `schema` | `schema: AtomDocSchema` | On connect |
-| `snapshot` | `doc_id`, `version`, `data: JsonDoc` | On connect, after schema |
-| `patch` | `version`, `operations: WireOperations`, `source_client` (set only for the verbatim echo of that client's `op`), `ref` (the request's `ref`) | After each commit |
-| `error` | `ref?`, `code`, `message` | On invalid operation |
+| `snapshot` | `doc_id`, `version`, `data: JsonDoc`, `client_id` (this connection's id; thick clients prefix their refs with it) | On connect, after schema; on reconnect; after a rejected `op` |
+| `patch` | `version`, `operations: WireOperations`, `source_client` (set only for the verbatim echo of that client's `op`), `ref` (the request's `ref`) | After each commit; also, to the requester alone at the current version, for an `op` that changed nothing |
+| `error` | `ref` (or `null`), `code`, `message` | On invalid operation |
 
 ### Client -> Server
 
@@ -724,7 +739,7 @@ See [PROTOCOL.md](../PROTOCOL.md) for the full wire protocol specification.
     [2, startId, endId|0, parentId|0, slotName, prevId|0, nextId|0],       // move
   ],
   state: {
-    "nodeId": { "field": "\"json-stringified-value\"" }
+    "nodeId": { "field": value }   // native JSON, never a stringified string
   }
 }
 ```
@@ -738,7 +753,7 @@ The `0` sentinel represents null (root parent, no positioning).
 | **Latency** | Round-trip per operation | Field writes instant; structure on confirmation |
 | **Undo** | Server-side (shared stack) | Client-side (per-client) |
 | **Offline** | No | Edits queue until reconnect |
-| **Complexity** | ~500 lines | ~1500 lines |
+| **Complexity** | Store and senders | Tree model, transactions, undo, pending structure |
 | **Memory** | Flat store only | Full tree model |
 | **Use case** | Dashboards, simple views | Editors, device-driven scenes |
 
@@ -746,7 +761,8 @@ For read-heavy UIs with occasional edits, thin is simpler. For interactive edito
 
 ## Related
 
-- [atomdoc](https://github.com/mhalle/atomdoc) -- Python server and document model
+- [`../python`](../python/README.md) -- Python server and document model
+- [`../PROTOCOL.md`](../PROTOCOL.md) -- the wire protocol and a guide to building clients
 
 ## License
 

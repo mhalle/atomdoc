@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-09-08
+
+Fixes from a review of 0.5.0. No wire or schema changes.
+
+### Fixed
+
+- **A `create` with an unknown position, or `before`/`after` without a
+  `target_id`, produced nothing at all** — no patch, no error — and a
+  client waiting on its `ref` waited forever. It is now an `invalid_op`
+  error.
+- **A write of the value a field already held committed and was
+  broadcast** (with a version bump). `apply_operations` now drops a
+  write that leaves the field at the value the transaction started
+  from, as attribute assignment already did, so such an `op` is answered
+  with the documented empty patch carrying the stored value.
+- **`id` was not a guarded name on `@node` classes**: a method or field
+  called `id` (or any other AtomNode attribute) silently overrode the
+  node API. Members and fields are both checked now.
+- `WebSocketTransport` is exported from `atomdoc`.
+
+### Changed
+
+- Documentation: an undo step whose targets are gone is skipped and
+  consumed (it was documented as rejected and kept, which is true only
+  of a step that fails validation or referential integrity); the
+  steps of a multi-step undo before a failing one stand and are
+  broadcast. `source_client` is `null` for a commit that differs from
+  the request in any way, not only when a normalizer ran.
+
 ## [0.5.0] - 2026-09-08
 
 Confirmed structure. The thick client (atomdoc-ts 0.5.0) no longer

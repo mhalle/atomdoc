@@ -8,8 +8,9 @@
 AtomDoc explores local-first document models for Python with type-safe
 schemas, semantic atomicity, and operation tracking.
 
-A companion TypeScript client package is available at
-[atomdoc-ts](https://github.com/mhalle/atomdoc-ts).
+The companion TypeScript client package lives beside this one, in
+[`../typescript`](../typescript/README.md); the wire protocol both speak
+is [`../PROTOCOL.md`](../PROTOCOL.md).
 
 ## What makes this distinct
 
@@ -45,7 +46,7 @@ separately.
 - **References**: `Ref[T]` fields point at other nodes in the same document, with a reverse index and referential integrity checked at commit
 - **Validation**: full Pydantic validation at transaction commit time
 - **Extensions**: bundle node types and normalization hooks
-- **Full test suite**: 285 tests
+- **Full test suite** (`uv run pytest`)
 
 ## Requirements
 
@@ -243,7 +244,6 @@ doc.handles(strength="strong")    # [(vol, "data", VoxelData(...))]: the hard
 
 `Handle` has `uri`, and optional `media_type` and `digest`; subclasses may
 add fields. Declare `strength` as a plain class attribute, not an
-annotated field. Declare `strength` as a plain class attribute, not an
 annotated field. Strength is exported per field (`handles` in the schema), so a
 service can answer "can I open this?" from the schema and a dump alone.
 
@@ -374,7 +374,7 @@ when the output must round-trip:
 ```python
 # Clean JSON — no internal IDs, just data
 doc.to_json()
-# {"title": "Hello", "annotations": [{"label": "Important", "color": {"r": 255, "g": 0, "b": 0}}]}
+# {"title": "Hello", "annotations": [{"label": "Important", "color": {"r": 255, "g": 0, "b": 0}}, {"label": "Draft"}]}
 
 # Wire format — includes IDs, for dump/restore and operation replay
 wire = doc.dump()
@@ -510,8 +510,7 @@ shared document over WebSocket (or any custom transport).
 
 ```python
 import asyncio
-from atomdoc import Doc, Session
-from atomdoc._ws_transport import WebSocketTransport
+from atomdoc import Doc, Session, WebSocketTransport
 
 doc = Doc(Page(title="Shared"))
 session = Session(doc)
@@ -536,10 +535,15 @@ Session(doc, undo="none")       # undo/redo requests are refused
 
 Per-client is the default because it is what a thick client does locally,
 so both client kinds agree, and because it is safe with several users: a
-step that no longer applies (someone else edited what it would revert) is
-rejected and kept for a retry. Global is right when one user looks at the
-document through several views. The host's own `doc.undo_manager` is
-separate from all of this.
+step whose targets are gone (someone else deleted what it would revert)
+applies as far as it can and is consumed, and a step that fails
+validation or referential integrity is rejected and kept for a retry.
+Global is right when one user looks at the document through several
+views; under `global`, if `doc.undo_manager` is enabled the session uses
+it, so host and clients share one history (`Session(doc,
+undo_manager=...)` selects that manager explicitly). Otherwise the host's
+own `doc.undo_manager` is separate from the clients' histories.
+`undo_steps=` sizes the per-client histories.
 
 ### Wire protocol
 
@@ -549,8 +553,8 @@ Messages from server to client:
 |---------|-------------|
 | `schema` | JSON Schema with `x-atomdoc` extensions (sent on connect) |
 | `snapshot` | Full document state (sent on connect) |
-| `patch` | Incremental operations (broadcast after each change). `ref` is the `ref` of the client request that produced it (`null` for a host-side change). `source_client` is set only when the patch is the verbatim echo of that client's `op`; a `create`, `undo` or `redo` result, or an `op` a normalizer changed, has `source_client: null` because the requester never applied those operations locally. |
-| `error` | Error response. `code` is `unknown_type` or `invalid_op` for a malformed request, `unsupported` for a request kind the session refuses (undo under `undo="none"`), or `rejected` when a well-formed request is invalid against the current document (a dangling reference, a validation failure, a node that is gone, an undo step that no longer applies). A rejected request is rolled back and not broadcast; the sender of a rejected `op` or `create` then receives a fresh `snapshot` to replace its local copy (an undo step applied nothing optimistically, so no snapshot follows). |
+| `patch` | Incremental operations (broadcast after each change). `ref` is the `ref` of the client request that produced it (`null` for a host-side change). `source_client` is set only when the patch is the verbatim echo of that client's `op`; a `create`, `undo` or `redo` result, or an `op` the server recorded differently in any way (a normalizer, a coerced value, a different anchor), has `source_client: null`. An `op` that changes nothing (a move to where the node already is, a write of the value held) is answered with a `patch` to the requester alone at the current version: its `ref`, no ordered operations, and the stored values of the fields it wrote. |
+| `error` | Error response. `code` is `unknown_type` or `invalid_op` for a malformed request, `unsupported` for a request kind the session refuses (undo under `undo="none"`), or `rejected` when a well-formed request is invalid against the current document (a dangling reference, a validation failure, a node that is gone, an unknown `create` position, an undo step that fails validation or referential integrity — one whose targets are merely gone is skipped and consumed). A rejected request is rolled back and not broadcast; the sender of a rejected `op` or `create` then receives a fresh `snapshot` to replace its local copy (an undo step applied nothing on the client, so no snapshot follows; the steps of a multi-step undo before the failing one stand). |
 
 Messages from client to server:
 
@@ -708,9 +712,9 @@ class MyNode:
 
 The node type name defaults to the class name. Methods, properties (with
 setters that write through to fields), classmethods, staticmethods and
-class constants declared on the class are kept on the node type; a name
-that would shadow the node API (`delete`, `move`, `id`, ...) raises a
-`TypeError` at class creation.
+class constants declared on the class are kept on the node type; a member
+or field whose name would shadow the node API (`id`, `delete`, `move`,
+`to`, ...) raises a `TypeError` at class creation.
 
 Node classes inherit. A `@node` class whose base is another `@node`
 class (or the class that one was made from) becomes a real subclass of
@@ -876,6 +880,5 @@ Things to know when a document gets large:
 ```bash
 uv sync
 uv run pytest
-uv run mypy src/atomdoc
-uv run ruff check src/atomdoc tests
+uv run ruff check src tests benchmarks
 ```

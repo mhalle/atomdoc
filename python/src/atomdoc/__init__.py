@@ -12,6 +12,7 @@ from ._protocol import operations_from_wire, operations_to_wire
 from ._ref import Ref, RefIntegrityError
 from ._session import Session
 from ._transport import ClientConnection, Transport
+from ._ws_transport import WebSocketTransport
 from ._types import ChangeEvent, Diff, ListenerError, Operations, TransactionFlags
 from ._undo import UndoHistory, UndoManager, UndoManagerConfig
 
@@ -37,6 +38,7 @@ __all__ = [
     "Session",
     "TransactionFlags",
     "Transport",
+    "WebSocketTransport",
     "default_node_id_generator",
     "merge_operations",
     "node",

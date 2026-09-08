@@ -448,9 +448,22 @@ def on_apply_operations(doc: Doc, operations: Operations, *, strict: bool = Fals
             # The forward patch carries the value as stored, after
             # coercion ("7" sent to an int field is broadcast as 7), so
             # every replica ends up with what the server holds.
-            node_patch[key] = node._state_key_to_json(key)
+            stored = node._state_key_to_json(key)
+            inv_node = current_inv_patch.get(node_id, {})
+            if not inserted_same_tx and key in inv_node and inv_node[key] == stored:
+                # Back at the value the transaction started from (or
+                # never left it): nothing to record, nothing to commit.
+                node_patch.pop(key, None)
+                inv_node.pop(key, None)
+            else:
+                node_patch[key] = stored
             if key in node._ref_defs:
                 doc._refs_update(node, key, old_value, new_value)
+        if not node_patch and not inserted_same_tx:
+            current_patch.pop(node_id, None)
+            doc._diff.updated.discard(node_id)
+            if not current_inv_patch.get(node_id):
+                current_inv_patch.pop(node_id, None)
 
 
 # --- Trigger listeners ---

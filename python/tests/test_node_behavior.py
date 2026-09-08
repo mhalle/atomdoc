@@ -149,3 +149,23 @@ def test_validator_on_derived_class_uses_classvars_and_helpers():
         w.fields = ["f"]
         w.kind = "deformable"
     assert w.kind == "deformable"
+
+
+def test_reserved_names_are_refused_for_members_and_fields():
+    with pytest.raises(TypeError, match="shadow AtomNode.id"):
+        @node
+        class HijacksId:
+            name: str = ""
+
+            def id(self) -> str:  # type: ignore[override]
+                return "hijacked"
+
+    with pytest.raises(TypeError, match="shadow AtomNode.move"):
+        @node
+        class MoveField:
+            move: str = ""
+
+    with pytest.raises(TypeError, match="shadow AtomNode.id"):
+        @node
+        class IdField:
+            id: str = ""

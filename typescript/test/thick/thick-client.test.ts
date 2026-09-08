@@ -381,11 +381,14 @@ describe("ThickAtomDocClient confirmed structure", () => {
     // Append i1: after the pending append, not after i2.
     client.moveNode("i1", ROOT, "items");
     expect(sent[2].operations.ordered[0]).toEqual([2, "i1", 0, 0, "items", added, 0]);
-    // A move relative to a pending node anchors on that node alone.
+    // A move relative to a pending node anchors on the projected order:
+    // i2 already precedes the new node, so that is not a move at all.
     client.moveNodeRelative("i2", added, "before");
-    expect(sent[3].operations.ordered[0]).toEqual([2, "i2", 0, 0, "items", 0, added]);
+    expect(sent.length).toBe(3);
+    client.moveNodeRelative("i2", added, "after");
+    expect(sent[3].operations.ordered[0]).toEqual([2, "i2", 0, 0, "items", added, "i1"]);
     for (const op of sent) echo(op);
-    expect(items(client)).toEqual(["i2", added, "i1"]);
+    expect(items(client)).toEqual([added, "i2", "i1"]);
   });
 
   it("a move to where the node already is sends nothing", () => {
@@ -418,16 +421,99 @@ describe("ThickAtomDocClient confirmed structure", () => {
     expect(client.getDoc()!.root.state.title).toBe("offline");
   });
 
-  it("a rejected structural edit leaves the document as it was", () => {
+  it("a rejected structural edit leaves the document, and undo history, as they were", () => {
     const { client, sent } = onlineClient();
     const errors = vi.fn();
     client.onError(errors);
     const id = client.createNode("Item", {}, ROOT, "items");
+    expect(client.getUndoManager()!.canUndo).toBe(false); // its place is held, not usable yet
     client._injectMessage({ type: "error", ref: sent[0].ref, code: "rejected", message: "no" });
     expect(errors).toHaveBeenCalledTimes(1);
     expect(client.pendingStructure()).toBe(false);
     expect(client.getDoc()!.getNode(id)).toBeUndefined();
     expect(items(client)).toEqual(["i1"]);
+    expect(client.getUndoManager()!.canUndo).toBe(false);
+    client.setField(ROOT, "title", "x");
+    expect(client.getUndoManager()!.canUndo).toBe(true);
+  });
+
+  it("an append after a relative move follows the moved node", () => {
+    const { client, sent, echo } = onlineClient({ coalesce: false }, three);
+    client.moveNodeRelative("i1", "i3", "after"); // -> i2, i3, i1
+    const added = client.createNode("Item", {}, ROOT, "items"); // after i1, the new last
+    expect(sent[1].operations.ordered[0]).toEqual([0, [[added, "Item"]], 0, "items", "i1", 0]);
+    // A move relative to a node that is itself pending a move anchors on
+    // the projected order, and is not mistaken for "already there".
+    client.moveNodeRelative("i2", "i1", "after"); // -> i3, i1, i2, added
+    expect(sent[2].operations.ordered[0]).toEqual([2, "i2", 0, 0, "items", "i1", added]);
+    client.moveNodeRelative("i2", "i1", "after"); // now it is already there
+    expect(sent.length).toBe(3);
+    for (const op of sent) echo(op);
+    expect(items(client)).toEqual(["i3", "i1", "i2", added]);
+  });
+
+  it("a field cannot be written on a node pending deletion", () => {
+    const { client, sent } = onlineClient({ coalesce: false }, three);
+    client.deleteNode("i2");
+    expect(() => client.setField("i2", "label", "late")).toThrow(/Node not found/);
+    expect(sent.length).toBe(1);
+  });
+
+  it("undo history keeps the order the user acted in", () => {
+    const { client, sent, echo } = onlineClient();
+    const undoMgr = client.getUndoManager()!;
+    const id = client.createNode("Item", { label: "new" }, ROOT, "items"); // place held
+    client.setField("i1", "label", "edited"); // applied at once, on top
+    expect(undoMgr.canUndo).toBe(true);
+    client.undo(); // the newest action: the field write
+    expect(client.getDoc()!.getNode("i1")!.state.label).toBe("First");
+    // The create is next, but it is not confirmed yet.
+    expect(undoMgr.canUndo).toBe(false);
+    echo(sent[0]);
+    expect(client.getDoc()!.getNode(id)).toBeDefined();
+    expect(undoMgr.canUndo).toBe(true);
+    client.undo();
+    expect(sent.at(-1)!.operations.ordered).toEqual([[1, id, 0]]);
+  });
+
+  it("the merge window is measured from the user's action, not the echo", () => {
+    const { client, sent, echo } = onlineClient({ coalesce: false, mergeInterval: 60_000 });
+    client.setField("i1", "label", "typed");
+    const id = client.createNode("Item", { label: "added" }, ROOT, "items");
+    echo(sent[1]);
+    // One step: the write and the create were made together.
+    client.undo();
+    const step = sent[2].operations;
+    expect(step.ordered).toEqual([[1, id, 0]]);
+    expect(step.state).toEqual({ i1: { label: "First" } });
+    echo(sent[2]);
+    expect(client.getDoc()!.getNode(id)).toBeUndefined();
+    expect(client.getDoc()!.getNode("i1")!.state.label).toBe("First");
+    expect(client.getUndoManager()!.canUndo).toBe(false);
+    expect(client.getUndoManager()!.canRedo).toBe(true);
+  });
+
+  it("an edit made while an undo is in flight invalidates redo", () => {
+    const { client, sent, echo } = onlineClient();
+    const id = client.createNode("Item", {}, ROOT, "items");
+    echo(sent[0]);
+    client.undo(); // sent
+    client.setField("i1", "label", "later"); // a new step
+    echo(sent[1]); // the undo lands
+    expect(client.getDoc()!.getNode(id)).toBeUndefined();
+    expect(client.getUndoManager()!.canRedo).toBe(false);
+    expect(client.getUndoManager()!.canUndo).toBe(true);
+  });
+
+  it("an undo step the server had nothing to apply for is consumed", () => {
+    const { client, sent, echo } = onlineClient();
+    client.createNode("Item", {}, ROOT, "items");
+    echo(sent[0]);
+    client.undo();
+    echo(sent[1], { ordered: [], state: {} });
+    expect(client.getUndoManager()!.canUndo).toBe(false);
+    expect(client.getUndoManager()!.canRedo).toBe(false);
+    expect(client.pendingStructure()).toBe(false);
   });
 
   it("a remote change to structure is not undoable; an own echo is", () => {

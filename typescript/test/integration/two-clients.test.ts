@@ -4,10 +4,12 @@
  * seeded interleavings, against the real Python session. At quiescence
  * both clients must equal the server's snapshot.
  *
- * Moves are the interesting part: a move that the server finds already
- * satisfied commits nothing, and the server must still answer the
- * requester with the slot's real order (../PROTOCOL.md, "Slot-order corrections", formerly "A request that
- * changes nothing").
+ * Collaboration is out of scope for the thick client, but this is the
+ * convergence proof: with structural edits applied only when the server
+ * echoes them, every interleaving must leave both clients at the server's
+ * order. A move the server finds already satisfied commits nothing and is
+ * answered with an empty patch (../PROTOCOL.md, "Requests that commit
+ * nothing").
  */
 
 import { describe, it, expect, afterEach } from "vitest";

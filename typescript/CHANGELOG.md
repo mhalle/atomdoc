@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.1
+
+Released in step with atomdoc 0.5.1. Fixes from a review of 0.5.0.
+
+### Fixed
+
+- **A relative move was invisible to the pending-structure model**, so
+  an append that followed it was anchored before the moved node, and a
+  second relative move against that node could be dropped as "already
+  there". The model now projects every pending op onto the slot's
+  order; all structural edits anchor on that projection.
+- **`setField` on a node pending deletion** was sent and forced a full
+  resync; it now throws like the other mutators.
+- **Undo history followed echo order, not user order.** A structural
+  edit now reserves its place in history when sent
+  (`UndoManager.reserve`/`commitInto`/`cancel`); the merge window is
+  measured from the user's action; `canUndo` is false while the newest
+  step awaits confirmation. A new edit made while a dispatched undo is
+  in flight now invalidates its redo (`dispatch` receives a token,
+  `commitAs` takes it).
+- **The thin store placed inserts and moves next-first**, unlike every
+  other applier (server, `LocalDoc`); it is prev-first now.
+- `NodeStore.getChildren` returns a shared empty array for an absent
+  slot, so `useSyncExternalStore` readers see a stable snapshot.
+- `ErrorMsg.ref` is typed `string | null` (the server sends `null` when
+  the request had no ref); `ListenerError` is exported from the package
+  root.
+
 ## 0.5.0
 
 Released in step with atomdoc 0.5.0.

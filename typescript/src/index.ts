@@ -51,6 +51,7 @@ export {
   ThickAtomDocClient,
   LocalDoc,
   RefIntegrityError,
+  ListenerError,
   UndoManager,
   bridgeDocToStore,
   createNodeIdFactory,

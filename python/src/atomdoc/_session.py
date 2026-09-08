@@ -42,8 +42,9 @@ class _Rejected(Exception):
     """A well-formed request the document refused to apply.
 
     ``resync`` says whether the requester must be sent a fresh snapshot
-    (an ``op`` or ``create`` it may have applied locally) or kept its
-    document (an undo step, which it never applied itself).
+    (an ``op`` or ``create``: a thick client may hold a field write it
+    applied locally) or kept its document (an undo step, which it never
+    applied itself).
     """
 
     def __init__(self, cause: BaseException, *, resync: bool = True) -> None:
@@ -220,11 +221,12 @@ class Session:
         ref: Any = None
         if request is not None:
             ref = request.ref
-            # Only an ``op`` request whose operations the commit carries
-            # verbatim is the sender's own echo. A commit that differs (a
-            # normalizer ran), or one produced by create/undo/redo (ops
-            # the client never applied itself), is not: a thick client
-            # skipping its echoes must apply it.
+            # ``source_client`` names the sender only when the commit
+            # carries an ``op`` request's operations verbatim. A commit
+            # that differs in any way (a normalizer ran, a value was
+            # coerced, an insert was anchored differently), or one
+            # produced by create/undo/redo, is not marked; thick clients
+            # match their requests by ``ref`` and treat this as advisory.
             if request.ops is not None and _normalize(wire) == request.ops:
                 source = request.client_id
         self._pending_broadcasts.append((
@@ -383,7 +385,7 @@ class Session:
 
         # Broadcast the patch to ALL clients (including the source).
         # Thin clients need the echo to update their store.
-        # Thick clients skip self-echoes via the source_client field.
+        # Thick clients match their own requests by ``ref`` (see PROTOCOL.md).
         await self._flush_broadcast()
 
     async def _handle_disconnect(self, client: ClientConnection) -> None:
@@ -465,6 +467,10 @@ class Session:
             raise ValueError(f"Unknown node type: {node_type!r}")
         if not isinstance(state, dict):
             raise ValueError("'state' must be an object")
+        if position not in ("append", "prepend", "before", "after"):
+            raise ValueError(f"Unknown position: {position!r}")
+        if position in ("before", "after") and not target_id:
+            raise ValueError(f"position {position!r} needs a 'target_id'")
 
         try:
             with self._doc.transaction():

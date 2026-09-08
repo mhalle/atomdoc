@@ -907,9 +907,14 @@ async def test_noop_op_is_answered_with_an_empty_patch():
     assert echo["type"] == MSG_PATCH and echo["ref"] == "noop"
     assert echo["version"] == session.version
     assert echo["operations"] == {"ordered": [], "state": {}}
-    # A write of the value already held is answered with the stored value.
+    # A write of the value already held commits nothing either (no version
+    # bump, nothing broadcast) and is answered with the stored value.
     a.messages.clear()
+    before = session.version
     await transport.send_message(a, _set_name("same", t.id, "t"))
+    assert session.version == before
+    assert b.messages == []
+    assert [(m["type"], m["version"], m["ref"]) for m in a.messages] == [(MSG_PATCH, before, "same")]
     assert a.messages[0]["operations"] == {"ordered": [], "state": {t.id: {"name": "t"}}}
     # A move that does commit is echoed once, to everyone, and nothing more
     # follows for the requester: it applies the echo as the server's order.
@@ -972,3 +977,26 @@ async def test_unbind_cancels_scheduled_flushes():
     await session.unbind()
     assert not session._flush_tasks
     assert session._pending_broadcasts == []
+
+
+@pytest.mark.asyncio
+async def test_create_with_a_bad_position_is_answered():
+    """A ``create`` whose position cannot be honored is an error, never
+    a request that silently produces nothing."""
+    session, transport, a, b, t, v = await setup_scene_session()
+    a.messages.clear()
+    for ref, extra in (
+        ("p1", {"position": "middle"}),
+        ("p2", {"position": "before"}),
+        ("p3", {"position": "after", "target_id": None}),
+    ):
+        await transport.send_message(a, {
+            "type": MSG_CREATE, "ref": ref, "node_type": "Transform",
+            "slot": "transforms", "state": {"name": "n"}, **extra,
+        })
+    assert [(m["type"], m["ref"], m["code"]) for m in a.messages] == [
+        (MSG_ERROR, "p1", "invalid_op"),
+        (MSG_ERROR, "p2", "invalid_op"),
+        (MSG_ERROR, "p3", "invalid_op"),
+    ]
+    assert b.messages == []

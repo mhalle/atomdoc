@@ -4,6 +4,8 @@
 
 import type { JsonDoc, StoreNode } from "./types.js";
 
+const EMPTY: string[] = Object.freeze([]) as unknown as string[];
+
 export class NodeStore {
   private nodes = new Map<string, StoreNode>();
   private rootId = "";
@@ -27,10 +29,15 @@ export class NodeStore {
     return this.nodes.get(this.rootId);
   }
 
+  /**
+   * Ordered child IDs of a slot. The array is the stored one (or a shared
+   * empty one), so two reads without a change in between return the same
+   * reference; do not mutate it.
+   */
   getChildren(nodeId: string, slotName: string): string[] {
     const node = this.nodes.get(nodeId);
-    if (!node) return [];
-    return node.slots[slotName] ?? [];
+    if (!node) return EMPTY;
+    return node.slots[slotName] ?? EMPTY;
   }
 
   getAllNodeIds(): string[] {

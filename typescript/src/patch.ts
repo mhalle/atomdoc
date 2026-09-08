@@ -120,27 +120,33 @@ function applyInsert(
   // to the store once per patch.
   const children = slots.get(parentId, slotName);
 
-  if (nextId) {
-    const idx = children.indexOf(nextId);
+  placeAfter(children, newIds, prevId, nextId);
+}
+
+/**
+ * Put `ids` after `prevId` if it is in the list, else before `nextId` if
+ * it is, else at the end: the same rule the document models apply.
+ */
+function placeAfter(list: string[], ids: string[], prevId: string | null, nextId: string | null): void {
+  if (prevId) {
+    if (list[list.length - 1] === prevId) {
+      list.push(...ids);
+      return;
+    }
+    const idx = list.indexOf(prevId);
     if (idx >= 0) {
-      children.splice(idx, 0, ...newIds);
-    } else {
-      children.push(...newIds);
+      list.splice(idx + 1, 0, ...ids);
+      return;
     }
-  } else if (prevId) {
-    if (children[children.length - 1] === prevId) {
-      children.push(...newIds);
-    } else {
-      const idx = children.indexOf(prevId);
-      if (idx >= 0) {
-        children.splice(idx + 1, 0, ...newIds);
-      } else {
-        children.push(...newIds);
-      }
-    }
-  } else {
-    children.push(...newIds);
   }
+  if (nextId) {
+    const idx = list.indexOf(nextId);
+    if (idx >= 0) {
+      list.splice(idx, 0, ...ids);
+      return;
+    }
+  }
+  list.push(...ids);
 }
 
 function applyDelete(
@@ -236,21 +242,5 @@ function applyMove(
 
   // Insert into new parent
   const newChildren = slots.get(newParentId, slotName);
-  if (nextId) {
-    const idx = newChildren.indexOf(nextId);
-    if (idx >= 0) {
-      newChildren.splice(idx, 0, ...movedIds);
-    } else {
-      newChildren.push(...movedIds);
-    }
-  } else if (prevId) {
-    const idx = newChildren.indexOf(prevId);
-    if (idx >= 0) {
-      newChildren.splice(idx + 1, 0, ...movedIds);
-    } else {
-      newChildren.push(...movedIds);
-    }
-  } else {
-    newChildren.push(...movedIds);
-  }
+  placeAfter(newChildren, movedIds, prevId, nextId);
 }

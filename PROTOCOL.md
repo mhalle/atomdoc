@@ -8,8 +8,8 @@ An AtomDoc client connects to a Python server over WebSocket. The server is auth
 
 There are two client architectures:
 
-- **Thin client** — sends operations to the server, waits for patches. Simple, ~500 lines.
-- **Thick client** — keeps a local copy of the document. Field writes apply locally at once; structural edits apply when the server confirms them. Local undo. ~1500 lines.
+- **Thin client** — sends operations to the server, waits for patches. Simple: a store, a patch applier, and senders.
+- **Thick client** — keeps a local copy of the document. Field writes apply locally at once; structural edits apply when the server confirms them. Local undo.
 
 Both expose the same reactive store to the UI layer.
 
@@ -24,7 +24,7 @@ Both expose the same reactive store to the UI layer.
 5. On user edit: client sends op/create message
 6. Server broadcasts: patch message to ALL clients
 7. Thin client: applies patch to store → UI updates
-   Thick client: skips self-echo, applies remote patches → UI updates
+   Thick client: applies every patch; one carrying its own `ref` confirms a request → UI updates
 
 8. On disconnect: thick client buffers ops locally
 9. On reconnect: server sends fresh schema + snapshot
@@ -155,7 +155,9 @@ Sent once on connect, after schema. Contains the full document state.
 
 The root node's `id` is also the document ID.
 
-`client_id` is the server-assigned identifier for this connection. Used by thick clients to identify self-echoed patches.
+`client_id` is the server-assigned identifier for this connection. Thick
+clients prefix their request `ref`s with it (`<client_id>:<n>`), which is
+how a patch is recognized as the answer to one of their own requests.
 
 #### `patch`
 
@@ -181,16 +183,24 @@ Sent after every committed transaction.
 `ref` is the `ref` of the client request that produced the patch (`null`
 for a change the host made directly). A request that commits more than
 once (a multi-step `undo`, an `op` a server-side normalizer split) produces
-one `patch` per commit, all carrying the same `ref`.
+one `patch` per commit, all carrying the same `ref`. Requests from one
+client are answered strictly in the order they were sent, and every
+request is answered: by its patches, by an `error`, or — for an `op` that
+changed nothing (a move to where the node already is, a write of the value
+already held) — by a `patch` to the requester alone at the *current*
+version, carrying the `ref`, `source_client: null`, no ordered operations,
+and the stored values of the fields the request wrote. A client must
+accept a patch whose version equals its current one.
 
 `source_client` is set only when the patch is the verbatim echo of that
-client's `op` — the operations it already applied locally. It is `null`
-for a `create`, `undo` or `redo` result (the requester never applied those
-operations itself), for a commit that carries more than the client sent (a
-normalizer ran), and for a host-side change; in every such case the
-requester applies the patch like any remote change. A client that connects
-during a commit receives the change either in its snapshot or as a patch
-after it, never both.
+client's `op`: the commit carries exactly the operations sent. It is
+`null` whenever the commit differs in any way — a `create`, `undo` or
+`redo` result, a value the server coerced (`"7"` sent to an integer
+field), an insert or move the server anchored between different neighbors
+than the request named, a normalizer's additions — and for a host-side
+change. Clients match their requests by `ref`, not by this field. A
+client that connects during a commit receives the change either in its
+snapshot or as a patch after it, never both.
 
 `version` is a monotonically increasing integer.
 
@@ -211,13 +221,21 @@ Sent to one client when its request could not be applied. Nothing is broadcast.
 - `rejected` — a well-formed request that is invalid against the current
   document: a reference that does not resolve, a node that is still
   referenced, a validation failure, a target that another client deleted
-  first, or an undo step that no longer applies. The server rolled the
-  request back and no `patch` was sent. For an `op` or `create` a
-  `snapshot` follows immediately, for this client only, so a thick client
-  (which may hold a field write it applied locally) can replace its local
-  document with the server's state; thin clients simply reload the store.
-  For an `undo`/`redo` nothing follows: the client applied nothing itself
-  and the step is kept.
+  first, or an undo step that fails validation or referential integrity.
+  The server rolled the failing request back and sent no `patch` for it.
+  For an `op` or `create` a `snapshot` follows immediately, for this
+  client only, so a thick client (which may hold a field write it applied
+  locally) can replace its local document with the server's state; thin
+  clients simply reload the store. For an `undo`/`redo` nothing follows:
+  the client applied nothing itself and the failing step is kept. A
+  multi-step `undo` applies (and broadcasts) the steps before the failing
+  one; only that one is rolled back.
+
+`ref` is the request's `ref`, or `null` when it sent none.
+
+A request that a host-side change listener fails on after the commit
+(the document's `ListenerError`) is applied and broadcast normally; the
+failure is logged on the server and no error reaches the client.
 
 ### Client → Server
 
@@ -265,11 +283,15 @@ The server assigns the node ID. The client learns it from the resulting patch.
 What these revert depends on the session's undo policy. By default
 (`per-client`) the server keeps a history per connected client and an
 `undo` reverts only that client's own commits; another client's edits are
-untouched, and the client's redo survives them. A step that no longer
-applies because someone else edited what it would revert is answered with
-an `error` of code `rejected` and kept for a retry; no snapshot follows,
-since the client applied nothing itself. A client with nothing to
-undo gets no reply. Under the `global` policy an `undo` reverts the
+untouched, and the client's redo survives them. A step whose targets are
+gone (someone else deleted what it would revert) applies as far as it
+can and is consumed: there is nothing left to retry. A step that fails
+validation or referential integrity is answered with an `error` of code
+`rejected` and kept for a retry; no snapshot follows, since the client
+applied nothing itself. A client with nothing to undo gets no reply.
+Thick clients never send these messages (nor `create`): they undo locally
+and send every change as an `op` with client-minted node IDs, because a
+thick client needs an ID before the echo to anchor its next edit. Under the `global` policy an `undo` reverts the
 document's last commit, whoever made it. Under `none` the request is
 answered with code `unsupported`. The history is dropped when the client
 disconnects. Thick clients undo locally and never send these messages.
@@ -418,8 +440,8 @@ function applyPatch(store, operations):
         create new StoreNodes for each [id, type] pair
         find parent node
         insert child IDs into parent's slot at the right position:
-          if next_id: insert before next_id
-          elif prev_id: insert after prev_id
+          if prev_id is in the slot: insert after prev_id
+          elif next_id is in the slot: insert before next_id
           else: append
 
       if op[0] == 1:  # Delete
@@ -432,9 +454,9 @@ function applyPatch(store, operations):
         update parentId/slotName on moved nodes
         insert into new parent's slot at position
 
-    for each state patch { nodeId: { field: jsonStr } }:
+    for each state patch { nodeId: { field: value } }:   # native JSON
       node = store.get(nodeId)
-      node.state[field] = JSON.parse(jsonStr)
+      node.state[field] = value
       replace node in store (new object)
 
   flush notifications
@@ -510,7 +532,9 @@ This is a doubly-linked sibling list per slot, with parent pointers.
 
 #### 7. Local ID Generation
 
-For creating nodes offline. Port of the Lamport timestamp system.
+Every node a thick client creates gets its ID here, before the server
+has seen it, so the next edit can refer to it. Port of the Lamport
+timestamp system.
 
 Format: `{sessionId}.{clock}`
 
@@ -574,12 +598,15 @@ withTransaction(doc, fn):
 #### 10. UndoManager
 
 Every change event carries the flags of the committed transaction
-(`flags.skipUndo`). Operations received from the server are applied with
-`skipUndo` so they never enter this client's undo history; a `skipUndo`
-transaction is isolated (an open transaction is committed first).
+(`flags.skipUndo`). Another client's changes are applied with `skipUndo`
+so they never enter this client's undo history; a `skipUndo` transaction
+is isolated (an open transaction is committed first). The echo of this
+client's own structural edit is applied *without* it: see §12 for how
+such a commit takes the place reserved for it, and how an undo step
+containing structure is dispatched and committed later.
 
 ```
-UndoManager(doc, maxSteps = 100, { mergeInterval = 0, clock = Date.now }):
+UndoManager(doc, maxSteps = 100, { mergeInterval = 0, clock = Date.now, dispatch? }):
   undoStack: list of { operations: WireOperations, meta }
   redoStack: list of { operations: WireOperations, meta }
   txType: "update" | "undo" | "redo"
@@ -608,6 +635,18 @@ UndoManager(doc, maxSteps = 100, { mergeInterval = 0, clock = Date.now }):
 
   exportHistory() -> { docId, docType, undoStack, redoStack, lastUpdate? }
   importHistory(history):   # docId and docType must match; truncated to maxSteps
+
+  # For commits that arrive later than the user's action (§12):
+  reserve() -> id           # hold the next place in history; clears redo;
+                            # canUndo is false while the newest step is a placeholder
+  commitInto(id, fn)        # fn's commit fills the placeholder (or merges it into
+                            # the step before, if reserved within mergeInterval);
+                            # an empty commit removes it
+  cancel(id)                # the request was refused: drop the placeholder
+  dispatch(ops, kind, token) -> bool   # option: take an undo/redo step over
+  commitAs(token, fn)       # fn's commit is that step: filed on the opposite stack,
+                            # or discarded if a newer local step made an undo's redo stale
+  refreshOriginal(source, nodeId, key, value)  # see "Masking" in §12
 ```
 
 Replaying a move operation must honor its `prev_id` / `next_id` (after
@@ -688,14 +727,21 @@ is sent and lands with it). `createNode` returns the ID at once; the node
 appears on echo, and `pendingStructure()` says whether anything is still
 waiting.
 
+The confirmation of an *applied* op replays only what the client lacks:
+inserts of nodes it does not have (a normalizer's additions, each
+re-anchored after the node before it in the echo), plus the echo's moves
+and deletes, which change nothing against a document that already
+applied them. An `op` made on the `LocalDoc` directly is such an applied
+op: it is sent, but never reconciled against concurrent structure.
+
 **Masking remote writes under pending field writes.** A remote patch that
 arrives while one of our field writes is pending was committed before
 that write, so for that field the server's final value is ours, and the
 remote value is only an intermediate the server passed through. Applying
 it would show the wrong value until our echo arrived. So before applying
 a remote patch, drop every state entry whose node and field a pending
-applied write also sets. If the server rejects our write instead, the
-resync snapshot brings the remote value in.
+write also sets. If the server rejects our write instead, the resync
+snapshot brings the remote value in.
 
 A masked write still matters to undo: undoing our edit should leave the
 field at what others last wrote, not at what we saw before editing. The
@@ -709,14 +755,31 @@ echo. The server answers the requester alone with a `patch` at the
 *current* version carrying the request's `ref`, `source_client: null`,
 no ordered operations, and the stored values of the fields the request
 wrote. A client must accept a patch whose version equals its current one.
+Such an answer retires the request; a built op it answers applies
+nothing.
 
-**Undo.** A step that only writes fields applies locally like any edit. A
-step that contains structure is sent unapplied like any structural edit
-and commits, as that step, when its echo arrives (the inverse it produces
-then goes on the opposite stack). If the socket drops before an echo,
-pending ops are kept ahead of anything buffered since and sent again
-after the reconnect snapshot; the snapshot rebuilds the document and
-drops the undo history.
+**Undo.** Structural edits enter history in the order the user made
+them, not the order their echoes arrive: when a built op is sent, the
+undo manager reserves the next place (`reserve`), which its echo fills
+(`commitInto`); a reservation made within the merge window joins the
+step before it; a refused request cancels its reservation. `canUndo` is
+false while the newest step is still a reservation. A step that only
+writes fields applies locally like any edit. A step that contains
+structure is dispatched: sent unapplied like any structural edit and
+committed, as that step, when its echo arrives (the inverse it produces
+then goes on the opposite stack). A dispatched undo overtaken by a newer
+local step is applied but files no redo, since the newer step already
+invalidated it; a dispatched step the server had nothing to apply for,
+or refused, is consumed. If the socket drops before an echo, pending ops
+are kept ahead of anything buffered since and sent again after the
+reconnect snapshot; the snapshot rebuilds the document and drops the undo
+history.
+
+The thick client's API is narrower than the wire format on purpose:
+`createNode` takes `"append"` or `"prepend"`, `moveNode` appends, and
+`moveNodeRelative` places a node before or after a sibling. All of them
+anchor on the projected order, so a relative move against a node whose
+own move is still pending is placed where both will end up.
 
 Together these keep one client converged with host-side changes (a
 device writing into the session's document) and with other clients under
@@ -928,7 +991,7 @@ Languages with existing WebSocket + JSON support (effectively all modern languag
 | C# | `ClientWebSocket` | `INotifyPropertyChanged`, WPF bindings |
 | Go | `gorilla/websocket` | Channels |
 
-The thin client is ~500 lines in any of these. The thick client adds ~1000 lines for the tree model, transactions, and undo.
+The thin client is small in any of these. The thick client adds the tree model, transactions, undo, and the pending-structure bookkeeping of §12.
 
 ## Troubleshooting
 
@@ -940,7 +1003,7 @@ The thin client is ~500 lines in any of these. The thick client adds ~1000 lines
 
 ### Infinite loops / stack overflow
 
-- Check for remote echo: thick clients must skip patches whose `ref` names a pending op *and* whose `source_client` matches their own `client_id`
+- Check echo handling: a thick client must retire the pending op a patch's `ref` names and apply the patch as §12 describes (never as a fresh local edit); do not key on `source_client`
 - Check for re-send: `doc.onChange` listener must NOT send operations that came from remote patches (use `applyingRemote` flag)
 - Check that subscription callbacks don't trigger store writes that trigger more callbacks
 

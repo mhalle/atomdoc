@@ -93,7 +93,8 @@ export interface PatchMsg {
 
 export interface ErrorMsg {
   type: "error";
-  ref?: string;
+  /** The `ref` of the request that failed; `null` when it sent none. */
+  ref?: string | null;
   code: string;
   message: string;
 }

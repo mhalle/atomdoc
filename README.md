@@ -17,8 +17,8 @@ joined are kept as `vX.Y.Z` (Python) and `ts-vX.Y.Z` (TypeScript).
 ## Development
 
 ```bash
-cd python && uv run pytest -q && uv run ruff check src tests benchmarks
-cd typescript && npm ci && npx tsc --noEmit && npx vitest run
+(cd python && uv run pytest -q && uv run ruff check src tests benchmarks)
+(cd typescript && npm ci && npx tsc --noEmit && npx vitest run)
 ```
 
 The TypeScript suite includes end-to-end tests that start the Python
