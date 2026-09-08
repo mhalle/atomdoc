@@ -919,9 +919,10 @@ export class ThickAtomDocClient {
       }
       const [, pairs, parentRef, slot, prevRef, nextRef] = op;
       let prev: string | 0 = prevRef;
-      pairs.forEach(([id, type], i) => {
+      pairs.forEach((pair, i) => {
+        const id = pair[0];
         if (!doc.getNode(id)) {
-          out.push([0, [[id, type]], parentRef, slot, prev, i === pairs.length - 1 ? nextRef : 0]);
+          out.push([0, [pair], parentRef, slot, prev, i === pairs.length - 1 ? nextRef : 0]);
         }
         prev = id;
       });
@@ -932,7 +933,21 @@ export class ThickAtomDocClient {
   private _applyRemote(ops: WireOperations, flags: { skipUndo?: boolean }): void {
     this.applyingRemote = true;
     try {
-      this.doc!.applyOperations(ops, flags);
+      this.doc!.applyOperations(ops, flags, true);
+    } catch (e) {
+      if (!(e instanceof OutOfScopeError)) return; // best effort, as before
+      // The server sent state for a node this client holds as a stub.
+      // The patch was rolled back, so the local document has diverged:
+      // report it and drop the connection; a reconnect brings a fresh
+      // snapshot.
+      this.disconnect();
+      const err: ErrorMsg = {
+        type: "error",
+        ref: null,
+        code: "protocol_error",
+        message: `Patch rejected: ${e.message}`,
+      };
+      for (const cb of this.errorCallbacks) cb(err);
     } finally {
       this.applyingRemote = false;
     }

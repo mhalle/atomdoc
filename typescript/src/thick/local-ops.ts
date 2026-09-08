@@ -4,7 +4,7 @@
  * All functions are stateless: they take accumulators and diff as arguments.
  */
 
-import type { OrderedOp, WireOperations } from "../types.js";
+import type { InsertPair, OrderedOp, WireOperations } from "../types.js";
 import type { DocNode } from "./doc-node.js";
 import { getSlotChildren } from "./doc-node.js";
 import {
@@ -41,6 +41,11 @@ export function createDiff(): Diff {
     moved: new Set(),
     updated: new Set(),
   };
+}
+
+/** The insert pair for a node: a stub is marked with a trailing null. */
+export function pairOf(node: DocNode): InsertPair {
+  return node.stub ? [node.id, node.type, null] : [node.id, node.type];
 }
 
 // ---------------------------------------------------------------------------
@@ -144,7 +149,7 @@ export function onInsertRange(
 
   forwardOps.ordered.push([
     0,
-    nodes.map((n) => [n.id, n.type]),
+    nodes.map(pairOf),
     parent === root ? 0 : parent.id,
     slotName,
     newPrev ? newPrev.id : 0,
@@ -171,7 +176,7 @@ export function onInsertRange(
         const children = getSlotChildren(desc.parent, desc.slotName);
         forwardOps.ordered.push([
           0,
-          children.map((c) => [c.id, c.type]),
+          children.map(pairOf),
           desc.parent.id,
           desc.slotName,
           0,
@@ -203,7 +208,7 @@ export function onInsertRangeBefore(
 
   forwardOps.ordered.push([
     0,
-    nodes.map((n) => [n.id, n.type]),
+    nodes.map(pairOf),
     parent === root ? 0 : parent.id,
     slotName,
     target.prevSibling ? target.prevSibling.id : 0,
@@ -230,7 +235,7 @@ export function onInsertRangeBefore(
         const children = getSlotChildren(desc.parent, desc.slotName);
         forwardOps.ordered.push([
           0,
-          children.map((c) => [c.id, c.type]),
+          children.map(pairOf),
           desc.parent.id,
           desc.slotName,
           0,
@@ -292,9 +297,9 @@ export function onDeleteRange(
     endNode !== startNode ? endNode.id : 0,
   ]);
 
-  const nodePairs: [string, string][] = [];
+  const nodePairs: InsertPair[] = [];
   for (const node of iterRange(startNode, endNode)) {
-    nodePairs.push([node.id, node.type]);
+    nodePairs.push(pairOf(node));
     copyDeletedToDiff(diff, inverseOps, node);
   }
 
@@ -322,11 +327,11 @@ export function onDeleteRange(
       diff.updated.delete(desc.id);
       for (const descSlot of desc.slotOrder) {
         if (desc.slotFirst.get(descSlot) !== null) {
-          const childPairs: [string, string][] = [];
+          const childPairs: InsertPair[] = [];
           let child = desc.slotFirst.get(descSlot) ?? null;
           while (child !== null) {
             copyDeletedToDiff(diff, inverseOps, child);
-            childPairs.push([child.id, child.type]);
+            childPairs.push(pairOf(child));
             child = child.nextSibling;
           }
           if (shouldAddInverse) {
@@ -411,7 +416,7 @@ export function applyOperations(
   for (const op of ops.ordered) {
     if (op[0] === 0) {
       // Insert
-      const nodePairs = op[1] as [string, string][];
+      const nodePairs = op[1] as InsertPair[];
       const parentId = op[2];
       const slotName = op[3] as string;
       const prevId = op[4];

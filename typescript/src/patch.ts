@@ -3,7 +3,8 @@
  */
 
 import type { NodeStore } from "./store.js";
-import type { WireOperations } from "./types.js";
+import type { StoreNode } from "./types.js";
+import type { InsertPair, WireOperations } from "./types.js";
 
 /**
  * Child lists touched by the ordered operations of one patch, written to
@@ -89,7 +90,7 @@ function resolveId(id: string | 0): string | null {
 function applyInsert(
   store: NodeStore,
   slots: SlotEdits,
-  op: [0, [string, string][], string | 0, string, string | 0, string | 0],
+  op: [0, InsertPair[], string | 0, string, string | 0, string | 0],
 ): void {
   const [, nodePairs, parentIdRaw, slotName, prevIdRaw, nextIdRaw] = op;
   const parentId = resolveId(parentIdRaw) ?? store.getRootId();
@@ -101,16 +102,12 @@ function applyInsert(
 
   // Create new nodes
   const newIds: string[] = [];
-  for (const [id, type] of nodePairs) {
+  for (const pair of nodePairs) {
+    const [id, type] = pair;
     if (!store.getNode(id)) {
-      store._setNode(id, {
-        id,
-        type,
-        state: {},
-        slots: {},
-        parentId,
-        slotName,
-      });
+      const node: StoreNode = { id, type, state: {}, slots: {}, parentId, slotName };
+      if (pair.length === 3) node.stub = true;
+      store._setNode(id, node);
     }
     newIds.push(id);
   }
@@ -158,7 +155,13 @@ function applyDelete(
   const endId = resolveId(endIdRaw) ?? startId;
 
   const startNode = store.getNode(startId);
-  if (!startNode || !startNode.parentId || !startNode.slotName) return;
+  if (!startNode) return;
+  if (!startNode.parentId || !startNode.slotName) {
+    // A detached stub (a reference target outside every held chain) has
+    // no slot to leave.
+    if (startNode.stub && startNode.id !== store.getRootId()) store._removeNode(startId);
+    return;
+  }
 
   const parentId = startNode.parentId;
   const slotName = startNode.slotName;

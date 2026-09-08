@@ -5,13 +5,23 @@
  * stubs; the store carries the flag and `getState` returns undefined.
  */
 import { describe, it, expect, vi } from "vitest";
+import { inspect } from "node:util";
 import { LocalDoc, OutOfScopeError, RefIntegrityError } from "../../src/thick/local-doc.js";
 import { createDocNode, getSlotChildren } from "../../src/thick/doc-node.js";
 import { NodeStore } from "../../src/store.js";
+import { applyPatch } from "../../src/patch.js";
 import { AtomDocClient } from "../../src/client.js";
 import { bridgeDocToStore } from "../../src/thick/store-bridge.js";
 import { ThickAtomDocClient } from "../../src/thick/thick-client.js";
-import type { AtomDocSchema, JsonDoc, SchemaMsg, SnapshotMsg, WireOperations } from "../../src/types.js";
+import type {
+  AtomDocSchema,
+  ErrorMsg,
+  JsonDoc,
+  PatchMsg,
+  SchemaMsg,
+  SnapshotMsg,
+  WireOperations,
+} from "../../src/types.js";
 
 const schema: AtomDocSchema = {
   version: 1,
@@ -86,6 +96,12 @@ describe("DocNode stubs", () => {
     expect(() => Object.keys(node.state)).toThrow(OutOfScopeError);
     expect(() => "label" in node.state).toThrow(OutOfScopeError);
     expect(() => JSON.stringify(node.state)).toThrow(OutOfScopeError);
+  });
+
+  it("a stub's state can be inspected without throwing", () => {
+    const node = createDocNode("x", "Item", [], true);
+    expect(inspect(node.state)).toContain("stub");
+    expect(String(node.state)).toMatch(/stub x/);
   });
 
   it("a full node is not a stub", () => {
@@ -245,14 +261,84 @@ describe("LocalDoc with stubs", () => {
     expect(getSlotChildren(doc.getNode("s1")!, "items").map((n) => n.id)).toEqual(["i1", "i2", "i3"]);
   });
 
-  it("deleting a held node records no state for its stub children", () => {
+  it("deleting a held node records no state for its stub children, and marks them", () => {
     const doc = makeDoc();
     let inverse: WireOperations | null = null;
     doc.onChange((e) => (inverse = e.inverseOperations));
     doc.deleteRange("s1");
     expect(inverse!.state.s1).toEqual({ heading: "One", related: "s9" });
     expect(inverse!.state.i3).toBeUndefined();
-    expect(inverse!.ordered).toContainEqual([0, [["i1", "Item"], ["i2", "Item"], ["i3", "Item"]], "s1", "items", 0, 0]);
+    expect(inverse!.ordered).toContainEqual([
+      0,
+      [["i1", "Item"], ["i2", "Item"], ["i3", "Item", null]],
+      "s1",
+      "items",
+      0,
+      0,
+    ]);
+  });
+
+  it("an insert pair marked null creates a stub, even with no handle to revive", () => {
+    const doc = new LocalDoc(schema, [ROOT, "Page", { title: "T" }, { sections: [] }]);
+    doc.applyOperations(
+      { ordered: [[0, [["s5", "Section", null], ["s6", "Section"]], 0, "sections", 0, 0]], state: {} },
+      undefined,
+      true,
+    );
+    expect(doc.getNode("s5")!.stub).toBe(true);
+    expect(() => doc.getNode("s5")!.state.heading).toThrow(OutOfScopeError);
+    expect(doc.getNode("s6")!.stub).toBe(false);
+    expect(doc.getNode("s6")!.state.heading).toBe("");
+    expect(doc.partial).toBe(true);
+  });
+
+  it("a revived node takes the kind the insert pair says", () => {
+    const doc = makeDoc();
+    const stub = doc.getNode("i3")!;
+    const full = doc.getNode("i2")!;
+    doc.applyOperations({ ordered: [[1, "i2", "i3"]], state: {} }, undefined, true);
+    // The server restores i3 with state (it entered scope) and i2 as a stub.
+    doc.applyOperations(
+      {
+        ordered: [[0, [["i2", "Item", null], ["i3", "Item"]], "s1", "items", "i1", 0]],
+        state: { i3: { label: "C" } },
+      },
+      undefined,
+      true,
+    );
+    expect(doc.getNode("i3")).toBe(stub);
+    expect(stub.stub).toBe(false);
+    expect(stub.state.label).toBe("C");
+    expect(doc.getNode("i2")).toBe(full);
+    expect(full.stub).toBe(true);
+    expect(() => full.state.label).toThrow(OutOfScopeError);
+  });
+
+  it("a remote delete of a detached stub drops it", () => {
+    const doc = makeDoc();
+    const events: WireOperations[] = [];
+    doc.onChange((e) => events.push(e.operations));
+    doc.setNodeState("s1", "related", null);
+    doc.applyOperations({ ordered: [[1, "s9", 0]], state: {} }, undefined, true);
+    expect(doc.getNode("s9")).toBeUndefined();
+    expect(doc.detachedStubs()).toEqual([]);
+    expect(events[1].ordered).toEqual([[1, "s9", 0]]);
+    // A local delete of one is refused like any stub's.
+    expect(() => doc.deleteRange("s9")).toThrow(/not found/);
+  });
+
+  it("a rolled-back delete of a detached stub brings it back", () => {
+    const doc = makeDoc();
+    doc.setNodeState("s1", "related", null);
+    expect(() =>
+      doc.applyOperations(
+        { ordered: [[1, "s9", 0], [0, [["i1", "Item"]], "s1", "items", 0, 0]], state: {} },
+        undefined,
+        true,
+      ),
+    ).toThrow(/already exists/);
+    expect(doc.getNode("s9")!.stub).toBe(true);
+    expect(doc.detachedStubs()).toEqual([["s9", "Section"]]);
   });
 });
 
@@ -282,6 +368,20 @@ describe("NodeStore with stubs", () => {
     const store = new NodeStore();
     store.loadSnapshot([ROOT, "Page", { title: "T" }, { sections: [] }]);
     expect(store.getRoot()!.stub).toBeFalsy();
+  });
+
+  it("an insert pair marked null creates a stub; a delete removes a detached one", () => {
+    const store = new NodeStore();
+    store.loadSnapshot(partial, referents);
+    applyPatch(store, {
+      ordered: [[0, [["i4", "Item", null], ["i5", "Item"]], "s1", "items", "i3", 0]],
+      state: {},
+    });
+    expect(store.getNode("i4")!.stub).toBe(true);
+    expect(store.getNode("i5")!.stub).toBeUndefined();
+    expect(store.getChildren("s1", "items")).toEqual(["i1", "i2", "i3", "i4", "i5"]);
+    applyPatch(store, { ordered: [[1, "s9", 0]], state: {} });
+    expect(store.getNode("s9")).toBeUndefined();
   });
 });
 
@@ -382,6 +482,52 @@ describe("thick client with stubs", () => {
     const { client, sent } = scopedClient();
     client.moveNodeRelative("i1", "i3", "after");
     expect(sent[0].operations.ordered).toEqual([[2, "i1", 0, "s1", "items", "i3", 0]]);
+  });
+
+  it("keeps the store's stub flag through a confirmed delete and its undo", () => {
+    const { client, sent } = scopedClient();
+    let version = 0;
+    const echo = (i: number) =>
+      client._injectMessage({
+        type: "patch",
+        version: ++version,
+        ref: sent[i].ref,
+        source_client: "me",
+        operations: sent[i].operations,
+      } as PatchMsg);
+    client.deleteNode("s1");
+    echo(0);
+    expect(client.getStore().getNode("i3")).toBeUndefined();
+    client.undo();
+    expect(sent[1].operations.ordered).toContainEqual([
+      0,
+      [["i1", "Item"], ["i2", "Item"], ["i3", "Item", null]],
+      "s1",
+      "items",
+      0,
+      0,
+    ]);
+    echo(1);
+    expect(client.getDoc()!.getNode("i3")!.stub).toBe(true);
+    expect(client.getStore().getNode("i3")!.stub).toBe(true);
+    expect(client.getState("i3")).toBeUndefined();
+  });
+
+  it("a patch carrying state for a stub is reported and the client disconnects", () => {
+    const { client } = scopedClient();
+    const internals = client as unknown as { ws: { send: unknown; close: () => void } };
+    internals.ws.close = vi.fn();
+    const errors: ErrorMsg[] = [];
+    client.onError((e) => errors.push(e));
+    client._injectMessage({
+      type: "patch",
+      version: 1,
+      source_client: null,
+      operations: { ordered: [], state: { s2: { heading: "x" } } },
+    } as PatchMsg);
+    expect(errors.map((e) => e.code)).toEqual(["protocol_error"]);
+    expect(client.isOnline()).toBe(false);
+    expect(client.getDoc()!.getNode("s2")!.stub).toBe(true);
   });
 
   it("the resync callback reports a partial document", () => {

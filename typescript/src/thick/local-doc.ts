@@ -8,11 +8,19 @@
 import type {
   AtomDocSchema,
   HandleDef,
+  InsertPair,
   JsonDoc,
   RefDef,
   WireOperations,
 } from "../types.js";
-import { createDocNode, resetDocNode, OutOfScopeError, type DocNode } from "./doc-node.js";
+import {
+  createDocNode,
+  resetDocNode,
+  fillStub,
+  makeStub,
+  OutOfScopeError,
+  type DocNode,
+} from "./doc-node.js";
 export { OutOfScopeError } from "./doc-node.js";
 import {
   createOpsAccumulator,
@@ -123,10 +131,12 @@ export class LocalDoc {
   /** Every node the document holds, stubs included. */
   readonly nodeMap: Map<string, DocNode>;
   /**
-   * True when the document is a scoped view of a larger one: some nodes
-   * are stubs (`DocNode.stub`), held by identity only.
+   * True when the document is a scoped view of a larger one, so nodes
+   * may be stubs (`DocNode.stub`), held by identity only. Set from the
+   * snapshot (its `partial` flag, or any stub in it) or by a later
+   * scope change; it stays true when the last stub leaves.
    */
-  readonly partial: boolean;
+  partial: boolean;
 
   _lifecycleStage: LifecycleStage = "idle";
   _forwardOps: OpsAccumulator = createOpsAccumulator();
@@ -148,12 +158,14 @@ export class LocalDoc {
    * Derived state — never serialized, rebuilt from a snapshot.
    */
   private refIndex = new Map<string, Set<string>>();
+  /** Detached stubs deleted in the open transaction, for its rollback. */
+  private detachedDrops: DocNode[] = [];
   /**
-   * True while operations from the server (or a rollback) are applied:
-   * they may delete stubs and place nodes beside them, which a local
-   * edit may not.
+   * True while wire operations (from the server, or a rollback's
+   * inverse) are applied: they may delete and insert stubs, which a
+   * local edit may not.
    */
-  private applyingRemote = false;
+  private applyingOps = false;
 
   constructor(schema: AtomDocSchema, snapshot: JsonDoc, options: LocalDocOptions = {}) {
     this.schema = schema;
@@ -331,7 +343,9 @@ export class LocalDoc {
    * Commit-time referential integrity: every reference written by an
    * inserted or updated node must resolve to a node of the declared type,
    * and no deleted node may still be referenced by a live one (policy
-   * "restrict").
+   * "restrict"). In a partial document this is advisory: stubs hold no
+   * references locally, so a delete this check passes may still be
+   * refused by the server for a reference the client cannot see.
    */
   private _checkRefIntegrity(): void {
     const diff = this._diff;
@@ -426,7 +440,7 @@ export class LocalDoc {
       if (!parent.slotFirst.has(slotName)) {
         throw new Error(`Slot '${slotName}' does not exist on ${parent.type}`);
       }
-      if (!this.applyingRemote) {
+      if (!this.applyingOps) {
         // A local edit works on held nodes only: nothing goes under a
         // stub, and a stub is never made locally.
         if (parent.stub) throw new OutOfScopeError(parent.id, STUB_PARENT);
@@ -538,11 +552,24 @@ export class LocalDoc {
       // enclosing transaction leaves it untouched.
       this._checkLive(start);
       this._checkLive(end);
+      if (start.parent === null) {
+        // A detached stub: a reference target outside every held chain.
+        // Only the server drops one; it leaves no slot and its inverse
+        // (a detached re-insert) has no wire form, so a rollback revives
+        // it directly (see `abort`).
+        if (!this.applyingOps || !start.stub || end !== start) throw new OutOfScopeError(startId);
+        this._forwardOps.ordered.push([1, startId, 0]);
+        this._diff.deleted.set(startId, start);
+        this.nodeMap.delete(startId);
+        this.graveyard.set(startId, new WeakRef(start));
+        this.detachedDrops.push(start);
+        return;
+      }
       const range = iterRange(start, end);
       if (range[range.length - 1] !== end) {
         throw new Error(`Node '${end.id}' is not a later sibling of '${start.id}'`);
       }
-      if (!this.applyingRemote) {
+      if (!this.applyingOps) {
         // Only the server deletes a stub; a held node goes with its
         // whole subtree, stub descendants included.
         for (const node of range) {
@@ -647,7 +674,7 @@ export class LocalDoc {
     for (let anc = newParent.parent; anc; anc = anc.parent) {
       if (range.includes(anc)) throw new Error("Target is descendant of the range");
     }
-    if (!this.applyingRemote) {
+    if (!this.applyingOps) {
       // Held nodes move between held parents; a stub may be the
       // neighbor they land beside.
       for (const node of range) {
@@ -708,12 +735,12 @@ export class LocalDoc {
    * maintained on every path.
    */
   private _applyOps(ops: WireOperations): void {
-    const wasRemote = this.applyingRemote;
-    this.applyingRemote = true;
+    const was = this.applyingOps;
+    this.applyingOps = true;
     try {
       this._applyOpsInner(ops);
     } finally {
-      this.applyingRemote = wasRemote;
+      this.applyingOps = was;
     }
   }
 
@@ -722,7 +749,7 @@ export class LocalDoc {
       {
         if (op[0] === 0) {
           // Insert
-          const nodePairs = op[1] as [string, string][];
+          const nodePairs = op[1] as InsertPair[];
           const parentIdRaw = op[2];
           const slotName = op[3] as string;
           const prevId = op[4];
@@ -733,7 +760,9 @@ export class LocalDoc {
             : this.nodeMap.get(String(parentIdRaw));
           if (!parent) continue;
 
-          const nodes = nodePairs.map(([id, type]) => this._nodeForInsert(id, type));
+          const nodes = nodePairs.map((pair) =>
+            this._nodeForInsert(pair[0], pair[1], pair.length === 3),
+          );
 
           if (prevId) {
             const prev = this.nodeMap.get(String(prevId));
@@ -886,6 +915,7 @@ export class LocalDoc {
   }
 
   private _reset(): void {
+    this.detachedDrops = [];
     this._forwardOps = createOpsAccumulator();
     this._inverseOps = createOpsAccumulator();
     this._diff = createDiff();
@@ -903,6 +933,14 @@ export class LocalDoc {
     };
     try {
       this._applyOps(inverse);
+      // Detached stubs dropped in this transaction come straight back:
+      // there is no wire operation for a detached insert.
+      for (const node of this.detachedDrops) {
+        if (!this.nodeMap.has(node.id)) {
+          this.graveyard.delete(node.id);
+          this.nodeMap.set(node.id, node);
+        }
+      }
     } finally {
       // Whatever happens, the document must not stay in the update stage.
       this._reset();
@@ -952,15 +990,26 @@ export class LocalDoc {
    * document removed earlier (an undone delete, a rolled-back
    * transaction) and someone still holds that object, it is revived:
    * reset to a fresh node and handed back, so the holder's handle is
-   * live again. Otherwise a new object is created.
+   * live again. Otherwise a new object is created. The insert pair says
+   * whether the node is a stub; a revived node takes that kind.
    */
-  private _nodeForInsert(id: string, type: string): DocNode {
+  private _nodeForInsert(id: string, type: string, stub: boolean): DocNode {
     const old = this.graveyard.get(id)?.deref();
     this.graveyard.delete(id);
     if (old && old.type === type) {
       resetDocNode(old);
+      if (stub && !old.stub) {
+        makeStub(old);
+        this.partial = true;
+      } else if (!stub && old.stub) {
+        fillStub(old, {});
+      }
       this._applyDefaults(old);
       return old;
+    }
+    if (stub) {
+      this.partial = true;
+      return createDocNode(id, type, this._slotOrderFor(type), true);
     }
     const node = this.createNode(type);
     (node as { id: string }).id = id;

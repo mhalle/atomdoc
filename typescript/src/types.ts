@@ -31,10 +31,18 @@ export interface StoreNode {
 // Wire operations (match Python _types.py)
 // ---------------------------------------------------------------------------
 
+/**
+ * A node in an insert: `[id, type]`, or `[id, type, null]` for a stub
+ * (see {@link StoreNode.stub}), mirroring the snapshot shape. Only the
+ * server inserts stubs; a client's inverse of a delete may list the stub
+ * descendants of a held node this way.
+ */
+export type InsertPair = [string, string] | [string, string, null];
+
 /** Insert: [0, [[id, type], ...], parentId|0, slotName, prevId|0, nextId|0] */
 export type InsertOp = [
   0,
-  [string, string][],
+  InsertPair[],
   string | 0,
   string,
   string | 0,

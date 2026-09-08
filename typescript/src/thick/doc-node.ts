@@ -19,6 +19,8 @@ export class OutOfScopeError extends Error {
   }
 }
 
+const INSPECT = Symbol.for("nodejs.util.inspect.custom");
+
 /**
  * The state object of a stub: every access throws. A stub must never
  * read as an empty node, so this cannot be a plain `{}`.
@@ -27,12 +29,23 @@ function stubState(id: string): Record<string, unknown> {
   const fail = (): never => {
     throw new OutOfScopeError(id);
   };
+  const describe = () => `[stub ${id}]`;
+  // Inspection reads the target, not the traps: describe it there too.
+  const target: Record<PropertyKey, unknown> = {};
+  Object.defineProperty(target, INSPECT, { value: describe });
+  Object.defineProperty(target, Symbol.toStringTag, { value: "Stub" });
   return new Proxy(
-    {},
+    target,
     {
-      // Symbol probes (inspection, `then` checks, tags) see nothing;
-      // any named field, in either direction, is an error.
-      get: (_t, key) => (typeof key === "symbol" ? undefined : fail()),
+      // Symbol probes (inspection, `then` checks, tags) see nothing but
+      // a description; any named field, in either direction, is an
+      // error.
+      get: (_t, key) => {
+        if (key === INSPECT) return describe;
+        if (key === Symbol.toStringTag) return "Stub";
+        if (key === Symbol.toPrimitive) return describe;
+        return typeof key === "symbol" ? undefined : fail();
+      },
       set: fail,
       has: fail,
       deleteProperty: fail,

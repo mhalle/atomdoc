@@ -13,6 +13,7 @@ export {
 } from "./operations.js";
 export type {
   StoreNode,
+  InsertPair,
   InsertOp,
   DeleteOp,
   MoveOp,

@@ -17,9 +17,18 @@
   may not write a stub, delete or move one, or insert or move under one
   (`OutOfScopeError`, before anything is sent); a stub may be the
   neighbor a held node lands beside, and a held node goes with its stub
-  descendants. `LocalDoc.partial`, `LocalDoc.detachedStubs()`,
-  `NodeStore.loadSnapshot(data, stubs)`, and the `fillStub` / `makeStub`
-  helpers for the scope changes to come. A whole-document client is
+  descendants. An insert pair may be `[id, type, null]` for a stub
+  (`InsertPair`): the inverse of deleting a held node lists its stub
+  descendants that way, and a revived node takes the kind the pair
+  says, so a stub never comes back as a defaulted node. Server
+  operations may delete stubs, detached ones included; a patch that
+  carries state for a stub is a protocol error: the thick client rolls
+  it back, fires `onError` with the client-side code `protocol_error`,
+  and disconnects, since the local document has diverged. Local
+  reference integrity is advisory in a partial document: stubs hold no
+  references, so the server may still refuse a delete. Also
+  `LocalDoc.partial`, `LocalDoc.detachedStubs()`, and
+  `NodeStore.loadSnapshot(data, stubs)`. A whole-document client is
   unaffected.
 - `onSchemaMismatch: "adopt" | "disconnect"` on the thick client. The
   default adopts the new schema and reports it; `"disconnect"` refuses
