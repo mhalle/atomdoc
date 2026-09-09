@@ -35,7 +35,11 @@
   empty edit. A listener that throws (`onPatch`, `onError`, ...) no
   longer stops message handling: the error is rethrown asynchronously.
   Rollbacks of the visibility operations restore a placed detached stub
-  as detached and leave no stub a rolled-back `[5]` created.
+  as detached and leave no stub a rolled-back `[5]` created. Measured
+  against the Python session (`test/integration/scoped-perf.test.ts`):
+  a scoped client holding a 7-node section joins a 21,000-node document
+  about nine times faster than a whole-document client, and forty scope
+  changes across it leave the client at working-set size.
 - Stubs, the client half of partial replication (the server side
   follows): a node a scoped client holds by identity only. A snapshot
   carries a stub as `[id, type, null]` with only the children the client

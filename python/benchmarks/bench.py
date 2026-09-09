@@ -88,6 +88,36 @@ def make_scene(n: int, *, undo: bool = True) -> Doc:
     return doc
 
 
+WORKING_SET = 259  # 1 + 6 + 36 + 216: a three-level, six-ary subtree
+
+
+def make_tree(n: int, fanout: int = 6, levels: int = 3) -> Doc:
+    """A scene whose folders form a forest of about n nodes: top-level
+    folders, each the root of a full ``levels``-deep ``fanout``-ary
+    subtree of a fixed size (259 nodes at the defaults). A scoped client
+    anchored on one top folder holds that working set whatever n is."""
+    doc = Doc(Scene, undo_manager=None)
+    per_tree = sum(fanout**k for k in range(levels + 1))
+    with doc.transaction():
+        count = 0
+        while count < n:
+            top = doc.create_node(Folder, name=f"f{count}")
+            doc.root.folders.append(top)
+            count += 1
+            frontier = [top]
+            for _ in range(levels):
+                next_frontier = []
+                for parent in frontier:
+                    for _ in range(fanout):
+                        child = doc.create_node(Folder, name=f"f{count}")
+                        parent.items.append(child)
+                        next_frontier.append(child)
+                        count += 1
+                frontier = next_frontier
+    assert per_tree == WORKING_SET or fanout != 6 or levels != 3
+    return doc
+
+
 # --- scenarios: each returns seconds for the timed part only ---
 
 
@@ -338,6 +368,98 @@ def bench_session_patch(n: int) -> float:
     return timed(lambda: asyncio.run(transport.on_message(clients[0], msg)))
 
 
+class _PartialClient(_Client):
+    @property
+    def wants_partial(self) -> bool:
+        return True
+
+
+def _scoped_session(n: int) -> tuple[Session, _Transport, _Client, list[Any]]:
+    """A tree of n folders with one whole-document client connected;
+    returns the session, transport, that client, and the top folders."""
+    doc = make_tree(n)
+    session = Session(doc)
+    transport = _Transport()
+    whole = _Client("whole")
+
+    async def setup() -> None:
+        await session.bind(transport)
+        await transport.on_connect(whole)
+
+    asyncio.run(setup())
+    return session, transport, whole, list(doc.root.folders)
+
+
+def bench_tree_connect(n: int) -> float:
+    """A whole-document client joining an n-folder tree: the baseline."""
+    session, transport, whole, tops = _scoped_session(n)
+    return timed(lambda: asyncio.run(transport.on_connect(_Client("b"))))
+
+
+def bench_scope_join(n: int) -> float:
+    """A scoped client joining an n-folder tree, anchored on one top
+    folder (a working set of ~259 nodes): schema, scope, partial snapshot.
+    Should not grow with n."""
+    session, transport, whole, tops = _scoped_session(n)
+    client = _PartialClient("p")
+    scope = {"type": "scope", "ref": "s", "anchors": [{"id": tops[0].id}]}
+
+    async def join() -> None:
+        await transport.on_connect(client)
+        await transport.on_message(client, scope)
+
+    return timed(lambda: asyncio.run(join()))
+
+
+def bench_project(n: int) -> float:
+    """One field write by the whole-document client, projected onto a
+    scoped client holding a ~259-node subtree of an n-folder tree, and
+    broadcast. Should not grow with n."""
+    session, transport, whole, tops = _scoped_session(n)
+    client = _PartialClient("p")
+    target = tops[0].items[0]
+
+    async def join() -> None:
+        await transport.on_connect(client)
+        await transport.on_message(client, {"type": "scope", "ref": "s", "anchors": [{"id": tops[0].id}]})
+
+    asyncio.run(join())
+    msg = {"type": "op", "ref": "w", "operations": {"ordered": [], "state": {target.id: {"name": "x"}}}}
+    return timed(lambda: asyncio.run(transport.on_message(whole, msg)))
+
+
+def bench_project_view(k: int) -> float:
+    """The same write, projected onto a scoped client whose view holds
+    the whole k-folder tree: the cost of a projection in the size of the
+    view (the placement recompute)."""
+    session, transport, whole, tops = _scoped_session(k)
+    client = _PartialClient("p")
+    target = tops[0]
+
+    async def join() -> None:
+        await transport.on_connect(client)
+        await transport.on_message(client, {"type": "scope", "ref": "s", "anchors": [{"id": session.doc.root.id}]})
+
+    asyncio.run(join())
+    msg = {"type": "op", "ref": "w", "operations": {"ordered": [], "state": {target.id: {"name": "x"}}}}
+    return timed(lambda: asyncio.run(transport.on_message(whole, msg)))
+
+
+def bench_scope_change(n: int) -> float:
+    """A scoped client moving its anchor from one top folder to another
+    (~259 nodes out, ~259 in) in an n-folder tree. Should not grow with n."""
+    session, transport, whole, tops = _scoped_session(n)
+    client = _PartialClient("p")
+
+    async def join() -> None:
+        await transport.on_connect(client)
+        await transport.on_message(client, {"type": "scope", "ref": "s", "anchors": [{"id": tops[0].id}]})
+
+    asyncio.run(join())
+    change = {"type": "scope", "ref": "t", "anchors": [{"id": tops[1].id}]}
+    return timed(lambda: asyncio.run(transport.on_message(client, change)))
+
+
 def bench_session_small_ops(n: int) -> float:
     """n one-field ops from a client, each broadcast to 4 clients."""
     doc = make_scene(64)
@@ -386,6 +508,11 @@ SCENARIOS: dict[str, tuple[Callable[[int], float], str]] = {
     "session_connect": (bench_session_connect, "connect to an n-volume scene"),
     "session_patch": (bench_session_patch, "one op patching n nodes, 4 clients"),
     "session_small_ops": (bench_session_small_ops, "n one-field ops, 4 clients"),
+    "tree_connect": (bench_tree_connect, "whole-document join of an n-folder forest"),
+    "scope_join": (bench_scope_join, "scoped join, 259-node working set, n-folder forest"),
+    "project": (bench_project, "one write projected onto that view, n-folder forest"),
+    "project_view": (bench_project_view, "one write projected onto a view of n folders"),
+    "scope_change": (bench_scope_change, "move the anchor to another 259-node subtree"),
 }
 
 # Sizes that keep a scenario within a few seconds at the default sweep.

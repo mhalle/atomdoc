@@ -56,6 +56,16 @@ async def main() -> None:
                 ids[f"n{s}{i}"] = note.id
         # Section 0 references an item of section 2.
         doc.root.sections[0].related = doc.root.sections[2].items[1]
+        # Bulk: SIZE more sections of 3 items with a note each, so a
+        # scoped client's working set can be measured against a large
+        # document.
+        for s in range(int(os.environ.get("SIZE", "0"))):
+            section = doc.create_node(Section, heading=f"Bulk {s}")
+            doc.root.sections.append(section)
+            for i in range(3):
+                item = doc.create_node(Item, label=f"Bulk {s}.{i}")
+                section.items.append(item)
+                item.notes.append(doc.create_node(Note, text=f"Bulk note {s}.{i}"))
 
     session = Session(doc)
     port = int(os.environ.get("PORT", "9880"))

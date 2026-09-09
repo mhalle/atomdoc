@@ -37,6 +37,15 @@ All notable changes to this project will be documented in this file.
   name no node outside the client's view, and `undo`/`redo` are refused
   for a scoped client on a session with global undo.
 
+- Benchmarks and tests for the cost of partial replication
+  (`benchmarks/bench.py`: `scope_join`, `project`, `project_view`,
+  `scope_change`; `tests/test_scope_perf.py`): a scoped join of a
+  259-node working set takes under a millisecond whether the document
+  holds 1,000 or 50,000 nodes (a whole-document join of 50,000 takes
+  140 ms), a projected commit and a scope change cost the same at any
+  document size, a projected commit costs the same at any view size,
+  and scope churn across a large document reaches a steady state.
+
 ### Changed
 
 - A move whose named neighbor has since moved to another slot is

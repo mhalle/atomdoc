@@ -115,6 +115,36 @@ def _order_key(node: AtomNode) -> tuple[int, list[tuple[int, int]]]:
     return (len(path), path)
 
 
+class _Overlay:
+    """A set read through additions and removals recorded on top of a
+    base set that is never copied: the simulation of the client's state
+    while a patch is emitted touches a few nodes of a large view."""
+
+    __slots__ = ("_base", "_added", "_removed")
+
+    def __init__(self, base: set[str] | dict[str, Any]) -> None:
+        self._base = base
+        self._added: set[str] = set()
+        self._removed: set[str] = set()
+
+    def __contains__(self, node_id: object) -> bool:
+        if node_id in self._added:
+            return True
+        if node_id in self._removed:
+            return False
+        return node_id in self._base
+
+    def add(self, node_id: str) -> None:
+        self._removed.discard(node_id)
+        if node_id not in self._base:
+            self._added.add(node_id)
+
+    def discard(self, node_id: str) -> None:
+        self._added.discard(node_id)
+        if node_id in self._base:
+            self._removed.add(node_id)
+
+
 class ClientView:
     """What one scoped client holds, and how commits reach it."""
 
@@ -123,6 +153,9 @@ class ClientView:
         self.anchors: Anchors = dict(anchors)
         # Node ID -> kind, for every node the client holds.
         self.held: dict[str, Kind] = {}
+        # The held nodes that are stubs: few, and re-checked on every
+        # commit.
+        self.stubs: set[str] = set()
         # Held nodes the client has in its tree; the rest are detached
         # stubs (reference targets whose parent it does not hold).
         self.placed: set[str] = set()
@@ -229,22 +262,31 @@ class ClientView:
     def reset(self) -> None:
         """Recompute the view from scratch (a snapshot follows)."""
         self.held = self._compute_all()
+        self.stubs = {node_id for node_id, kind in self.held.items() if kind == "stub"}
         self._recompute_placed()
 
     def hold_everything(self) -> None:
         """The view of a client that received the whole document."""
         self.held = {node_id: "full" for node_id in self._doc._node_map}
+        self.stubs = set()
         self.placed = set(self.held)
 
-    def _recompute_placed(self) -> None:
+    def _recompute_placed(self, ids: Any = None) -> None:
         """A held node is in the client's tree when every ancestor up to
-        the root is held; the rest are detached stubs."""
+        the root is held; the rest are detached stubs. With ``ids``, only
+        those nodes are reconsidered: a node's placement changes only
+        with its own kind, its parent, or an ancestor's kind, and every
+        such node is a candidate of the commit or scope change that did
+        it, so the rest of the view keeps its placement."""
         doc = self._doc
-        placed: set[str] = set()
         known: dict[str, bool] = {}
-        for node_id in self.held:
+        if ids is None:
+            ids = list(self.held)
+            self.placed = set()
+        for node_id in ids:
             node = doc.get_node_by_id(node_id)
-            if node is None:
+            if node is None or node_id not in self.held:
+                self.placed.discard(node_id)
                 continue
             chain: list[str] = []
             current: AtomNode | None = node
@@ -261,8 +303,9 @@ class ClientView:
             for chain_id in chain:
                 known[chain_id] = result
             if result:
-                placed.add(node_id)
-        self.placed = placed
+                self.placed.add(node_id)
+            else:
+                self.placed.discard(node_id)
 
     def _has_held_child(self, node: AtomNode) -> bool:
         for name in node._slot_order:
@@ -463,7 +506,7 @@ class ClientView:
         # Stubs are few and cheap to re-check; an anchor that moved
         # changes which ancestors are stubs, and a stub whose ancestor
         # left the view is detached.
-        candidates.update(node_id for node_id, kind in self.held.items() if kind == "stub")
+        candidates.update(self.stubs)
         candidates -= deleted.keys()
         if not candidates and not (deleted.keys() & self.held.keys()):
             return None
@@ -496,9 +539,10 @@ class ClientView:
         ordered: list[Any] = []
         # A simulation of what the client has as each operation lands:
         # ``present`` is every node it holds, ``placed`` those in its
-        # tree (the rest are detached stubs).
-        present: set[str] = set(old)
-        placed: set[str] = set(self.placed)
+        # tree (the rest are detached stubs). Overlays: a patch touches
+        # a few nodes of a view that may hold thousands.
+        present = _Overlay(old)
+        placed = _Overlay(self.placed)
         emitted: set[str] = set()
         entered_state: dict[str, dict[str, Any]] = {}
 
@@ -747,11 +791,17 @@ class ClientView:
         for node_id, kind in new_kinds.items():
             if kind is None:
                 self.held.pop(node_id, None)
+                self.stubs.discard(node_id)
             else:
                 self.held[node_id] = kind
+                if kind == "stub":
+                    self.stubs.add(node_id)
+                else:
+                    self.stubs.discard(node_id)
         for node_id in deleted:
             self.held.pop(node_id, None)
-        self._recompute_placed()
+            self.stubs.discard(node_id)
+        self._recompute_placed([*new_kinds, *deleted])
 
         if not ordered and not state:
             return None
