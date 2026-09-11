@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
+
+Partial replication: a scoped thick client. Released in step with
+atomdoc 0.6.0.
 
 ### Added
 

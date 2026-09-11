@@ -578,6 +578,9 @@ class Session:
                 await self._send_snapshot(client)
             return
         if error is not None:
+            view = self._views.get(client.client_id)
+            if view is not None:
+                error["message"] = view.redact(error["message"])
             await client.send({"type": MSG_ERROR, "ref": ref, **error})
             return
         if ref is not None and len(self._pending_broadcasts) == queued_before:

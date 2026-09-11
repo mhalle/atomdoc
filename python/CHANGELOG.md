@@ -2,7 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## [0.6.0] - 2026-09-11
+
+Partial replication: a client may hold part of a document. Released in
+step with atomdoc-ts 0.6.0.
 
 ### Added
 

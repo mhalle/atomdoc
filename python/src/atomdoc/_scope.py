@@ -453,8 +453,9 @@ class ClientView:
 
     def redact(self, message: str) -> str:
         """Replace, in an error message, the id of any node this client
-        does not hold: it must not learn what lies outside its view."""
-        for node_id in self._doc._node_map:
+        does not hold (a deleted one still in the graveyard included): it
+        must not learn what lies outside its view."""
+        for node_id in (*self._doc._node_map, *self._doc._graveyard):
             if node_id not in self.held and node_id in message:
                 message = message.replace(node_id, "(a node outside your scope)")
         return message

@@ -3,7 +3,10 @@
 A schema-driven document model with a server-authoritative sync protocol:
 a Python document and session (`python/`) and a TypeScript client library
 with thin and thick clients (`typescript/`). The wire protocol both sides
-implement is specified once, in [PROTOCOL.md](PROTOCOL.md).
+implement is specified once, in [PROTOCOL.md](PROTOCOL.md). A client
+holds the whole document or, with a scope of anchors, only the subtrees
+it is working on ([partial replication](PROTOCOL.md#partial-replication)):
+joining and every commit after then cost the size of the view.
 
 | Directory | Package | Docs |
 |---|---|---|

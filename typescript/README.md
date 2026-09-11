@@ -524,6 +524,77 @@ client.onOffline(() => { /* show a banner; edits queue until reconnect */ });
 client.onOnline(() => { /* the document is the server's again */ });
 ```
 
+#### Partial replication
+
+A thick client can hold part of a document: pass a `scope`, a set of
+anchors naming the subtrees to hold and, optionally, how deep.
+
+```ts
+const client = new ThickAtomDocClient({
+  url: "ws://localhost:8765",
+  scope: [{ id: sectionId }, { id: rootId, depth: 0 }],
+});
+await client.connect();
+await client.ready();
+```
+
+The client connects with `?partial=1`, sends its scope after the schema,
+and loads a partial snapshot. Within the view everything works as it
+does for a whole document: `getState`, `setField`, `createNode`,
+`deleteNode`, `moveNode`, the store and its subscribers, `settled()`.
+Nodes the client knows by identity only — the ancestors of its anchors,
+the children past a depth bound, the targets of references its nodes
+hold — are **stubs**: `DocNode.stub` and `StoreNode.stub` are true,
+`getState()` returns `undefined`, and reading a stub's `state` on the
+document throws `OutOfScopeError` rather than returning defaults, so a
+renderer checks the flag. Writing a stub, deleting or moving one, or
+inserting under one throws `OutOfScopeError` before anything is sent; a
+stub may be the neighbor a node is placed beside. The server enforces
+the same rule with an `out_of_scope` error and a fresh partial snapshot.
+
+`depth: 0` holds the anchor's own state with its children as stubs;
+`depth: 1` the children in full with their children as stubs; no depth
+the whole subtree. A `createNode` under a node at the depth bound throws
+(the node would come back as a stub the client cannot write).
+
+```ts
+await client.setScope([{ id: sectionId, depth: 1 }]); // deepen: stubs fill in place
+await client.setScope([{ id: otherId }]);            // move the view: a delta, not a reload
+client.getScope();                                     // a copy of the anchors asked for;
+                                                       // null for a whole-document client
+```
+
+`setScope()` replaces the scope without reconnecting. The server answers
+with the delta: nodes that enter arrive in full, stubs the client already
+has fill where they are (ids and `DocNode` handles survive), nodes that
+leave go. The promise resolves with the anchors that resolved to a node;
+an anchor whose node is gone is still asked for, so it comes back if the
+node does (an undo). Edits pending when the scope changes are answered
+as usual; one whose node the new scope dropped is retired. A
+`setScope()` in flight when the connection drops rejects; one made
+offline is sent with the next connection and resolves when the server
+holds it (with the snapshot, or after the edits made offline went out
+under the old scope). A whole-document client may `setScope()` too and
+becomes scoped.
+
+Undo and redo of a scoped client live on the server: `undo()` and
+`redo()` send requests (one per step) and apply the projected answer;
+`getUndoManager()` is `null` and there is no `canUndo`. Offline they do
+nothing: only edits queue. `onResync` reports `partial: true` and the
+resolved `anchors`. On reconnect the client sends its anchors again;
+edits made offline are sent under the scope they were made in before a
+scope changed offline is set. `getVersion()` advances with commits that
+touch the view, with a scope change, and with the answer to the
+client's own request. A patch the view cannot apply is reported as an
+`onError` with the client-side code `protocol_error` and the connection
+closed; the application reconnects (`connect()`) for a fresh snapshot.
+Moves are not checked against the depth bound: a subtree moved past it
+comes back demoted, as the server projects it.
+
+See [PROTOCOL.md](../PROTOCOL.md#partial-replication) for the wire
+protocol; `test/integration/scoped.test.ts` for a scoped client beside a
+whole-document one.
+
 ### LocalDoc (Advanced)
 
 The thick client's local document model is accessible for advanced use
@@ -804,9 +875,10 @@ See [PROTOCOL.md](../PROTOCOL.md) for the full wire protocol specification.
 | Message | Fields | When |
 |---------|--------|------|
 | `schema` | `schema: AtomDocSchema` | On connect |
-| `snapshot` | `doc_id`, `version`, `data: JsonDoc`, `client_id` (this connection's id; thick clients prefix their refs with it) | On connect, after schema; on reconnect; after a rejected `op` |
-| `patch` | `version`, `operations: WireOperations`, `source_client` (set only for the verbatim echo of that client's `op`), `ref` (the request's `ref`) | After each commit; also, to the requester alone at the current version, for an `op` that changed nothing |
-| `error` | `ref` (or `null`), `code`, `message` | On invalid operation |
+| `snapshot` | `doc_id`, `version`, `data: JsonDoc`, `client_id` (this connection's id; thick clients prefix their refs with it); for a scoped client `partial: true`, `stubs`, `anchors`, `ref` | On connect, after schema (after the first `scope` for a `?partial=1` connection); on reconnect; after a rejected `op` |
+| `patch` | `version`, `operations: WireOperations`, `source_client` (set only for the verbatim echo of that client's `op`; always `null` to a scoped client), `ref` (the request's `ref`) | After each commit (projected onto a scoped client's view; none when it touches nothing held); also, to the requester alone at the current version, for an `op` that changed nothing |
+| `scope_ack` | `ref`, `version`, `operations`, `source_client: null`, `anchors` | The delta answering a `scope` from a client that holds a view |
+| `error` | `ref` (or `null`), `code`, `message` | On invalid operation (`out_of_scope` and `no_scope` for scoped clients) |
 
 ### Client -> Server
 
@@ -814,8 +886,9 @@ See [PROTOCOL.md](../PROTOCOL.md) for the full wire protocol specification.
 |---------|--------|------|
 | `op` | `ref?`, `operations: WireOperations` | Apply operations |
 | `create` | `ref?`, `node_type`, `state`, `parent_id?`, `slot`, `position?`, `target_id?` | Create new node (thin client) |
-| `undo` | `ref?`, `steps?` | Undo (thin client only) |
-| `redo` | `ref?`, `steps?` | Redo (thin client only) |
+| `undo` | `ref?`, `steps?` | Undo (thin and scoped thick clients) |
+| `redo` | `ref?`, `steps?` | Redo (thin and scoped thick clients) |
+| `scope` | `ref?`, `anchors: [{ id, depth? }]` | Set the client's view (partial replication) |
 
 ### WireOperations Format
 
@@ -823,8 +896,14 @@ See [PROTOCOL.md](../PROTOCOL.md) for the full wire protocol specification.
 {
   ordered: [
     [0, [["id", "type"], ...], parentId|0, slotName, prevId|0, nextId|0],  // insert
+    //   a pair ["id", "type", null] is a stub (to a scoped client only)
     [1, startId, endId|0],                                                   // delete
     [2, startId, endId|0, parentId|0, slotName, prevId|0, nextId|0],       // move
+    // to a scoped client only:
+    [3, id],           // becomes a stub
+    [4, id],           // leaves the view
+    [5, id, type],     // is now a detached stub
+    [6, id],           // a stub fills (state follows)
   ],
   state: {
     "nodeId": { "field": value }   // native JSON, never a stringified string
@@ -839,11 +918,12 @@ The `0` sentinel represents null (root parent, no positioning).
 | | Thin | Thick |
 |---|---|---|
 | **Latency** | Round-trip per operation | Field writes instant; structure on confirmation |
-| **Undo** | Server-side (shared stack) | Client-side (per-client) |
+| **Undo** | Server-side, per client | Client-side (per client); server-side when scoped |
 | **Offline** | No | Edits queue until reconnect |
 | **Complexity** | Store and senders | Tree model, transactions, undo, pending structure |
-| **Memory** | Flat store only | Full tree model |
-| **Use case** | Dashboards, simple views | Editors, device-driven scenes |
+| **Memory** | Flat store only | Full tree model, or a scoped view of it |
+| **Scope** | Whole document | Whole document, or anchored subtrees (`scope`) |
+| **Use case** | Dashboards, simple views | Editors, device-driven scenes, large documents |
 
 For read-heavy UIs with occasional edits, thin is simpler. For interactive editors where responsiveness matters, thick.
 

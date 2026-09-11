@@ -159,6 +159,14 @@ The root node's `id` is also the document ID.
 clients prefix their request `ref`s with it (`<client_id>:<n>`), which is
 how a patch is recognized as the answer to one of their own requests.
 
+A client that connected with `?partial=1` receives its snapshot only
+after sending a `scope`, and the snapshot is a *partial* one: `partial:
+true`, `data` holding the client's view with stubs (`[id, type, null]`)
+for nodes it knows by identity only, `stubs` listing the detached ones as
+`[id, type]` pairs, `anchors` echoing the anchors that resolved to a node,
+and `ref` the `ref` of the `scope` request it answers. See [Partial
+Replication](#partial-replication).
+
 #### `patch`
 
 Sent after every committed transaction.
@@ -206,7 +214,36 @@ their requests by `ref`, not by this field. A
 client that connects during a commit receives the change either in its
 snapshot or as a patch after it, never both.
 
-`version` is a monotonically increasing integer.
+`version` is a monotonically increasing integer. A scoped client sees it
+grow but not contiguously: a commit that does not touch its view produces
+no `patch` for it. `version` names a commit; it never counts messages.
+
+A patch to a scoped client is the commit *projected* onto its view (see
+[Partial Replication](#partial-replication)): state for the nodes it
+holds in full, ordered operations with neighbors rewritten to the
+nearest siblings it has, and the visibility operations `[3]`, `[4]`,
+`[5]`, `[6]`. Its `source_client` is always `null`, and its `ref` is set
+when the commit answers that client's own request.
+
+#### `scope_ack`
+
+The answer to a `scope` request from a client that already holds a
+view: the delta from the old view to the new, shaped as a patch.
+
+```json
+{
+  "type": "scope_ack",
+  "ref": "e99065b8:scope:3",
+  "version": 6,
+  "operations": { "ordered": [[6, "i1"], [0, [["n1", "Note", null]], "i1", "notes", 0, 0]], "state": { "i1": { "label": "A" } } },
+  "source_client": null,
+  "anchors": [{ "id": "s1", "depth": 1 }]
+}
+```
+
+`operations` is applied like any patch. `anchors` are the anchors of the
+new scope that resolved to a node. A first `scope` on a `?partial=1`
+connection is answered with a partial `snapshot` instead.
 
 #### `error`
 
@@ -224,7 +261,14 @@ Sent to one client when its request could not be applied. Nothing is broadcast.
   have, an unknown `create` position. Nothing was applied and no
   snapshot follows; resending the same frame will fail the same way.
 - `unsupported` — a request kind this session refuses (`undo`/`redo`
-  when the session's undo policy is `none`).
+  when the session's undo policy is `none`, or from a scoped client when
+  it is `global`).
+- `no_scope` — a `?partial=1` connection sent something before its
+  first `scope`. Nothing was applied.
+- `out_of_scope` — a scoped client's request touched a node it does not
+  hold in full (see [Writing from a scoped
+  client](#writing-from-a-scoped-client)). Rolled back like a rejection,
+  and followed by a fresh partial `snapshot` for this client.
 - `rejected` — a well-formed request that is invalid against the current
   document: a reference that does not resolve, a node that is still
   referenced, a validation failure, a target that another client deleted
@@ -238,7 +282,9 @@ Sent to one client when its request could not be applied. Nothing is broadcast.
   multi-step `undo` applies (and broadcasts) the steps before the failing
   one; only that one is rolled back.
 
-`ref` is the request's `ref`, or `null` when it sent none.
+`ref` is the request's `ref`, or `null` when it sent none. An error sent
+to a scoped client names no node outside its view (the id of a node it
+does not hold, a deleted one included, is replaced in the message).
 
 A request that a host-side change listener fails on after the commit
 (the document's `ListenerError`) is applied and broadcast normally; the
@@ -287,6 +333,11 @@ The server assigns the node ID. The client learns it from the resulting patch.
 
 `steps` defaults to 1 if omitted and must be a positive integer.
 
+A scoped client (see [Partial Replication](#partial-replication)) sends
+these too: its history lives on the server, and the answer is the step's
+inverse projected onto its view. The TypeScript thick client sends one
+request per step.
+
 What these revert depends on the session's undo policy. By default
 (`per-client`) the server keeps a history per connected client and an
 `undo` reverts only that client's own commits; another client's edits are
@@ -297,13 +348,28 @@ validation or referential integrity is answered with an `error` of code
 `rejected` and kept for a retry; no snapshot follows, since the client
 applied nothing itself. A client with nothing to undo, or whose step
 applied nothing, gets an empty `patch` at the current version carrying
-its `ref` (nothing, if it sent none). Thick clients never send these
-messages (nor `create`): they undo locally
-and send every change as an `op` with client-minted node IDs, because a
+its `ref` (nothing, if it sent none). A whole-document thick client never
+sends these messages (nor `create`): it undoes locally
+and sends every change as an `op` with client-minted node IDs, because a
 thick client needs an ID before the echo to anchor its next edit. Under the `global` policy an `undo` reverts the
 document's last commit, whoever made it. Under `none` the request is
 answered with code `unsupported`. The history is dropped when the client
 disconnects.
+
+#### `scope` — Set the client's view
+
+```json
+{ "type": "scope", "ref": "e99065b8:scope:3", "anchors": [{ "id": "s1", "depth": 1 }, { "id": "s2" }] }
+```
+
+Replaces the client's scope (see [Partial Replication](#partial-replication)).
+Each anchor names a node and, optionally, how deep below it the client
+holds nodes in full. The first `scope` on a `?partial=1` connection
+completes the handshake and is answered with a partial `snapshot`; any
+later one, from any client, is answered with a `scope_ack` (a
+whole-document client still receiving its snapshot gets `invalid_op`).
+One scope request is handled at a time per client. A `types` field is
+refused (`invalid_op`): the scope is a set of anchors.
 
 **Note:** `ref` is optional on all client messages. If provided, it is echoed back in the `error` reply and in every `patch` the request produces. Refs must be unique across clients — prefix them with the server-assigned `client_id` (the thick client sends `<client_id>:<n>`) — because the server does not check ownership: a client must only treat a `ref` it minted itself as an acknowledgment of its own pending work.
 
@@ -331,6 +397,9 @@ Tree structure changes. Applied in order.
 - `prev_id` — insert after this node, or `0`
 - `next_id` — insert before this node, or `0`
 - If both `prev_id` and `next_id` are `0`, append to end
+- A named neighbor must lie in `slot_name` of `parent_id` (for a move
+  too); one that has since moved elsewhere makes the request stale
+  (`rejected`) rather than redirecting the node.
 
 **Delete:** `[1, start_id, end_id]`
 
@@ -342,6 +411,25 @@ Tree structure changes. Applied in order.
 
 - `2` — operation type (move)
 - Same positioning semantics as insert
+
+**Visibility operations** appear only in patches to a scoped client
+(see [Partial Replication](#partial-replication)); a client never sends
+them:
+
+- `[3, id]` — the node becomes a stub: its state is dropped; it stays
+  where it is, and children that leave the view get operations of their
+  own.
+- `[4, id]` — the node and its subtree leave the view. The node still
+  exists; a node the client no longer has is ignored.
+- `[5, id, type]` — the node is now a detached stub: created if unknown,
+  otherwise taken out of the tree with its subtree and demoted.
+- `[6, id]` — a stub in the client's tree fills with the state carried
+  in the same patch.
+
+An insert pair may be `[id, type, null]`: a stub. An insert may name a
+node the client holds as a detached stub, which places it there (and
+fills it when the pair is full); it never names a node the client has in
+its tree.
 
 ### State Patches
 
@@ -836,6 +924,176 @@ on remote patch:
   doc.applyOperations(patch.operations)
   applyingRemote = false
 ```
+
+## Partial Replication
+
+A client can hold part of a document instead of all of it: the subtrees
+it is working on, with enough of the rest to know where they hang and
+what they point at. Joining, and every commit after, then costs the size
+of that view, not of the document.
+
+### What a scoped client holds
+
+Every node in a scoped client's replica is one of two kinds:
+
+- **full** — id, type, state, and its held children.
+- **stub** — id and type only. Reading a stub's state is an error, never
+  a default; the TypeScript `DocNode.state` throws on access and
+  `getState()` returns `undefined`.
+
+Stubs stand in for exactly four things: the ancestors of an anchor (so
+the held subtree is rooted), the children just past a depth bound (so
+the client can see that a node has children and navigate down), the
+targets of references held by full nodes (so every reference resolves to
+a node with a type), and — the same rule, seen from the client — a node
+that left the view while something held still references it. The root
+is always at least a stub, so a scope none of whose anchors names a node
+is a bare root stub. Siblings
+outside the view are not stubs; a client never sees them. A stub whose
+parent the client holds sits in its slot; one whose parent it does not
+hold is *detached* (listed in the snapshot's `stubs`).
+
+"Held" therefore has two senses: a node is **held in full** (the client
+may edit it) or merely **known** (a stub). Both count as neighbors.
+
+### Anchors
+
+A scope is a set of anchors, `{ id, depth? }`, on the ownership tree.
+A node is in full when it is an anchor or lies below one within its
+depth: `depth: 0` is the anchor's own state with its children as stubs,
+`depth: 1` adds the children in full with *their* children as stubs, and
+no depth is the whole subtree. Overlapping anchors keep the more
+generous depth. The root is always at least a stub. An anchor that names
+no node is ignored (and not echoed in `anchors`); the client keeps asking
+for it, so if the node comes back — an undo — so does the view. A client
+with nothing but the document id anchors the root at a small depth and
+walks down.
+
+### The handshake
+
+```
+client                                   server
+  connect ws://host/doc?partial=1        (the query value "1" or "true";
+                                          anything else is a whole-document connection)
+                                         { "type": "schema", ... }
+  { "type": "scope", "ref": r, "anchors": [...] }
+                                         { "type": "snapshot", "partial": true,
+                                           "data": ..., "stubs": [...],
+                                           "anchors": [...], "client_id": ..., "ref": r }
+```
+
+The schema is sent whole: the client needs the full type system for the
+stubs it may later hold. Any other message before the first `scope` is
+answered with `no_scope`. A reconnect is a new handshake: the client
+re-sends the anchors it *asked for*, not the resolved ones it was
+echoed. A whole-document client may send `scope` too; it is answered with
+a `scope_ack` whose delta is what leaves.
+
+Snapshot shape: the tree from the root, each held node a JsonDoc entry
+and each stub `[id, type, null]` with a slots object only when it has
+held children; `stubs` lists the detached stubs as `[id, type]`.
+
+### Projected order
+
+A scoped client sees each slot as the subsequence of the true order
+restricted to the nodes it knows. When the server projects an ordered
+operation, it rewrites `prev_id` and `next_id` to the nearest siblings
+the client has *in place at that point of the patch*, or `0` at the
+ends. Relative order among known nodes is exact; absolute position is
+not knowable and not needed. The reverse direction keeps the whole-
+document rule: an insert or move the client positions after `A` lands
+immediately after `A` in the true order, one before `B` immediately
+before `B`, and with both `0` at the end of the slot.
+
+### Operations in a projected patch
+
+State goes only to nodes the client holds in full. Ordered operations
+are the client's `[0]`, `[1]`, `[2]` with neighbors rewritten, plus the
+visibility operations `[3]` demote, `[4]` exit, `[5]` detached stub, and
+`[6]` fill (defined under [Ordered Operations](#ordered-operations)). A
+node entering the view arrives as an insert of its full pair with its
+state, its held children as inserts of runs per slot, and so on down; a
+stub the client already has in its tree fills in place with `[6]`, and
+a detached stub is placed by an insert naming it. Entering and
+deepening never rebuild anything: ids and handles survive.
+
+The server emits a patch's operations in an order that keeps every
+operation's preconditions true on the client as it lands: deletes
+first, then arrivals top-down (fills, inserts, placements), then moves,
+then exits, demotions, and detachments, then state. Apply them in order.
+An exit or detachment of a node under one that already left is not
+sent; `[4]` and `[5]` are idempotent, so a client may see them for a node
+it no longer has.
+
+### Writing from a scoped client
+
+A scoped client may edit only what it holds in full. The subject of an
+edit (the node written, deleted, or moved — every node of a range) and
+the destination parent of an insert or move must be full; a neighbor
+need only be known (a stub may be the neighbor a node lands beside) and
+must lie in the slot the request names; an inserted node must be new
+(neither in the document nor an id a deleted node still holds); a client
+never inserts a stub pair. Anything else is refused with `out_of_scope`
+and followed by a fresh partial snapshot, since a thick client may hold
+a write it applied locally. The server checks every request; a client
+that refuses the same edits locally (the TypeScript client does, with
+`OutOfScopeError`, before sending) spares itself the round trip.
+
+Referential integrity is advisory on a scoped client: its stubs hold no
+references, so a delete it accepts locally may still be refused by the
+server for a reference it cannot see. The error message then names no
+node outside the view.
+
+A create past the client's own depth bound is legal and the node exists,
+but the client receives it as a stub pair and cannot write it; the
+TypeScript client refuses such a create locally. A move past the bound
+is answered with demotions and exits, as designed.
+
+### Changing scope
+
+`scope` replaces the anchors and is answered with a `scope_ack`: the
+delta from the old view to the new, computed by the server, never a
+re-snapshot. The patch for growing by an anchor is that subtree; for
+deepening by one level, the nodes at that level, as fills; for
+narrowing, exits.
+Scope requests from one client are handled one at a time, in order, and
+a commit projected after a delta reaches the client after it.
+
+### Undo
+
+A scoped client's history lives on the server, per client (the
+`per-client` policy): it sends `undo`/`redo` on the wire, and the answer
+is the inverse, projected onto its view, applied like any patch. Under
+the `global` policy these requests are refused (`unsupported`). A local
+undo manager is off when scoped: a step's inverse may name nodes the
+client does not hold.
+
+### Resync and reconnect
+
+A rejection (`rejected`, `out_of_scope`) resyncs a scoped client with a
+fresh partial snapshot at its current scope, never the whole document.
+On reconnect the client sends its requested anchors again; edits made
+offline are sent under the scope they were made in (the TypeScript
+client asks for that scope first and sets a scope changed offline
+afterwards).
+
+### Cost
+
+Joining, a projected commit, and a scope change cost the size of the
+view, not of the document: measured on the Python session, a scoped join
+of a 259-node working set takes under a millisecond whether the document
+holds 1,000 or 50,000 nodes, while a whole-document join of 50,000 takes
+a hundred times longer; a projected commit costs the nodes the commit
+touches and the view's stubs, not the document. Scope churn across a
+large document reaches a steady state in memory.
+
+### Not covered
+
+Type filters (a scope is anchors only), wide slots (a slot with
+thousands of children is that many nodes when in scope, and that many
+stubs at a depth boundary), query-shaped scopes, a per-client scope
+timeout, and a thin client with a scoped mode (the thin client applies
+`scope_ack` but has no handshake; only the thick client can be scoped).
 
 ## UI Framework Integration
 
