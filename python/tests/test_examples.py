@@ -23,7 +23,7 @@ def test_local_storage_demo(backend):
     out = run(*backend, "demo")
     assert "four edits, 1 save" in out
     assert "refused, then re-applied" in out and "(the phone's edit): True" in out
-    assert "['scratch/session-1']; half a second unrenewed: []" in out
+    assert "renewed for 1.2s: ['scratch/session-1']; unrenewed: []" in out
 
 
 @pytest.mark.parametrize("backend", [[], ["--sqlite"]])
