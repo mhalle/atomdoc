@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.7.0
+
+No runtime dependencies: validation without zod. Released in step with
+atomdoc 0.7.0.
+
+### Changed
+
+- The client validates against the JSON Schema the server sends with its
+  own compiler (`src/validate.ts`) instead of zod, which leaves the
+  package with no runtime dependencies. A widget bundling the client
+  drops from 73.6 KB to 17.3 KB. Checked against the zod implementation
+  on 35 cases across 8 schema shapes: identical accept, reject, and parsed
+  output, except as follows.
+- A union with a declared discriminator reads the tag from the data, as
+  pydantic's tagged unions do: a value that omits the tag is refused,
+  even when the tag has a default. zod accepted it.
+- `SchemaRegistry.getValidator(typeName)` returns the compiled validator.
+
+### Deprecated
+
+- `SchemaRegistry.getZodSchema()` remains as an alias of `getValidator()`
+  and now returns that validator, not a zod schema.
+
 ## 0.6.0
 
 Partial replication: a scoped thick client. Released in step with

@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-09-16
+
+Documents that outlive the process: a swappable store. Released in step
+with atomdoc-ts 0.7.0.
+
+### Added
+
+- `DocumentStore`, a protocol for keeping documents between runs: opaque
+  bytes under a caller-composed key (`read`, `get`, `head`, `put`,
+  `touch`, `delete`, `keys`, `list`, `aclose`), so the envelope around
+  `doc.dump()` belongs to the application. `put(if_match=token)` is a
+  compare-and-set that raises `StaleWrite` when another writer saved
+  first, and `if_match=ABSENT` creates only if absent; `ttl` expires an
+  entry, and `touch(key, ttl)` renews it without changing its token, so a
+  lease can be kept alive while the holder still compare-and-sets. Keys
+  are case-sensitive paths checked by `check_key` (prefixes by
+  `check_prefix`); failures are `StoreError`s (`DocumentNotFound`,
+  `StaleWrite`, `CapabilityError`, `InvalidKey`, `ValueTooLarge`,
+  `StoreUnavailable`, `StoreClosed`).
+- Three backends: `MemoryStore` (the reference implementation),
+  `FileStore` (one file per document in a directory, replaced atomically,
+  locked across processes with `flock`), and `SqliteStore` (WAL, with
+  metadata apart from bodies so `head` and `touch` do not touch a large
+  document). Both on-disk stores provide `purge()` to reclaim expired
+  entries; reads never delete.
+- `StoreCapabilities`: what a backend promises (atomic put, durability,
+  expiry, compare-and-set, write-unique tokens, consistent listing, size
+  and retention limits). Asking for something a store does not claim
+  raises `CapabilityError`; claims that cannot hold together are refused
+  when the capabilities are built. `StoreBase` validates every call
+  before a backend sees it.
+- A conformance suite for backends (`tests/store_conformance.py`) that
+  asserts exactly what a store claims, including durability from a fresh
+  interpreter. Built against two adversarial reviews: twenty deliberately
+  wrong backends, all caught, and attacks on the real ones (crashes,
+  concurrent processes, hostile keys, damaged files).
+- `examples/local_storage.py`, a to-do list kept on disk, with autosave, a
+  conflict between two writers, and an expiring scratch document; and a
+  Storage section in the README.
+
 ## [0.6.0] - 2026-09-11
 
 Partial replication: a client may hold part of a document. Released in
