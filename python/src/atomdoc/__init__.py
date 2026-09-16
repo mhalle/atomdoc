@@ -11,6 +11,12 @@ from ._operations import merge_operations
 from ._protocol import operations_from_wire, operations_to_wire
 from ._ref import Ref, RefIntegrityError
 from ._session import Session
+from ._store import (ABSENT, MAX_KEY_BYTES, CapabilityError, DocumentNotFound,
+                     DocumentStore, Entry, InvalidKey, MemoryStore, StaleWrite,
+                     StoreBase, StoreCapabilities, StoreClosed, StoreError,
+                     StoreUnavailable, ValueTooLarge, check_key, check_prefix)
+from ._store_file import FileStore
+from ._store_sqlite import SqliteStore
 from ._transport import ClientConnection, Transport
 from ._ws_transport import WebSocketTransport
 from ._types import ChangeEvent, Diff, ListenerError, Operations, TransactionFlags
@@ -36,6 +42,25 @@ __all__ = [
     "RefIntegrityError",
     "ListenerError",
     "Session",
+    "DocumentStore",
+    "MemoryStore",
+    "FileStore",
+    "SqliteStore",
+    "StoreCapabilities",
+    "StoreClosed",
+    "StoreError",
+    "DocumentNotFound",
+    "StaleWrite",
+    "CapabilityError",
+    "ABSENT",
+    "Entry",
+    "InvalidKey",
+    "ValueTooLarge",
+    "StoreUnavailable",
+    "StoreBase",
+    "check_key",
+    "check_prefix",
+    "MAX_KEY_BYTES",
     "TransactionFlags",
     "Transport",
     "WebSocketTransport",
