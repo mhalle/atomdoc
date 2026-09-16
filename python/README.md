@@ -519,6 +519,42 @@ a transaction leaves it consistent.
 Node handles stay valid across undo and rollback: a node deleted and then
 restored is the same Python object.
 
+## Storage
+
+A `DocumentStore` keeps documents between runs. It holds bytes under a key,
+so what you store is `doc.dump()` in whatever envelope you choose:
+
+```python
+import json
+from atomdoc import ABSENT, Doc, DocumentNotFound, FileStore, StaleWrite
+
+store = FileStore("documents")          # or SqliteStore("documents.db"), MemoryStore()
+
+try:
+    data, token = await store.read("lists/default")
+    doc = Doc.restore(json.loads(data), root_type=TodoList)
+except DocumentNotFound:
+    doc = Doc(TodoList())
+    token = await store.put("lists/default", json.dumps(doc.dump()).encode(), if_match=ABSENT)
+
+with doc.transaction():
+    doc.root.title = "Groceries"
+
+# Only if nobody saved since we read; otherwise StaleWrite, and nothing is lost.
+token = await store.put("lists/default", json.dumps(doc.dump()).encode(), if_match=token)
+```
+
+Each backend declares what it can promise in `store.capabilities`
+(compare-and-set, expiry, durability, …), and asking for something it does
+not claim raises `CapabilityError` rather than being ignored. `put(..., ttl=)`
+and `touch(key, ttl)` give a document a renewable lease. Keys are
+case-sensitive paths like `f"{owner}/{doc_id}"`; `store.list(prefix)` lists
+them.
+
+[`examples/local_storage.py`](examples/local_storage.py) is a runnable to-do
+list built this way, with autosave, a conflict between two writers, and an
+expiring scratch document (`uv run python examples/local_storage.py demo`).
+
 ## Server protocol
 
 AtomDoc includes a server protocol layer for connecting clients to a
