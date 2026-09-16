@@ -197,14 +197,15 @@ async def demo(store: DocumentStore) -> None:
     # 3. A scratch document that lives only while someone renews it.
     if store.capabilities.honors_ttl:
         scratch = Doc(TodoList(title="scratch"))
-        await store.put("scratch/session-1", encode(scratch), ttl=0.5)
-        for _ in range(3):                                    # a client still connected
+        # Renew at a third of the lease, so one slow renewal does not lose it.
+        await store.put("scratch/session-1", encode(scratch), ttl=0.9)
+        for _ in range(4):                                    # a client still connected
             await asyncio.sleep(0.3)
-            await store.touch("scratch/session-1", 0.5)
+            await store.touch("scratch/session-1", 0.9)
         alive = [k async for k in store.keys("scratch/")]
-        await asyncio.sleep(0.7)                              # and then it left
+        await asyncio.sleep(1.2)                              # and then it left
         gone = [k async for k in store.keys("scratch/")]
-        print(f"3. renewed for 0.9s: {alive}; half a second unrenewed: {gone}")
+        print(f"3. a 0.9s lease renewed for 1.2s: {alive}; unrenewed: {gone}")
 
     print("\nin the store:")
     async for entry in store.list():

@@ -474,11 +474,13 @@ class StoreConformance:
     async def test_touch_extends_a_lease_and_keeps_the_token(self, store):
         if not store.capabilities.honors_ttl:
             pytest.skip("no ttl")
-        token = await store.put("a", b"x", ttl=0.3)
+        # Survival tests give the put-then-touch real slack: a slow disk (CI,
+        # with fsync) once took longer than a 0.1 s lease between the two.
+        token = await store.put("a", b"x", ttl=0.6)
         entry = await store.touch("a", 60)
         assert entry.token == token, "renewing a lease must not break the holder's next CAS"
         assert entry.expires_at is not None and entry.expires_at > time.time() + 30
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.8)
         assert await store.read("a") == (b"x", token)
         if store.capabilities.compare_and_set:
             await store.put("a", b"y", if_match=token)
@@ -491,9 +493,9 @@ class StoreConformance:
         await asyncio.sleep(0.2)
         with pytest.raises(DocumentNotFound):
             await store.get("a")
-        await store.put("b", b"x", ttl=0.1)
+        await store.put("b", b"x", ttl=0.6)
         assert (await store.touch("b", None)).expires_at is None
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.8)
         assert await store.get("b") == b"x"
 
     async def test_touch_needs_a_live_document(self, store):
