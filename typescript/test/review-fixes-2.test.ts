@@ -1,5 +1,4 @@
 import { describe, it, expect, vi } from "vitest";
-import { z } from "zod";
 import { LocalDoc, ListenerError } from "../src/thick/local-doc.js";
 import { withTransaction } from "../src/thick/local-transaction.js";
 import { UndoManager } from "../src/thick/undo-manager.js";
@@ -693,11 +692,12 @@ describe("second review: schema conversion", () => {
         ],
       },
     });
-    const obj = r.getZodSchema("N") as z.ZodObject<Record<string, z.ZodType>>;
-    let inner: z.ZodType = obj.shape.shape;
-    while (inner instanceof z.ZodOptional || inner instanceof z.ZodDefault) {
-      inner = (inner._def as { innerType: z.ZodType }).innerType;
-    }
-    expect(inner).toBeInstanceOf(z.ZodDiscriminatedUnion);
+    expect(() => r.validate("N", { shape: { kind: "circle", r: 1 } })).not.toThrow();
+    expect(() => r.validate("N", { shape: { kind: "square", s: 2 } })).not.toThrow();
+    expect(() => r.validate("N", { shape: { kind: "circle", s: 2 } })).toThrow();
+    expect(() => r.validate("N", { shape: { kind: "triangle", r: 1 } })).toThrow();
+    // a declared discriminator reads the tag from the data, as pydantic does:
+    // without it the server answers union_tag_not_found, so the client refuses too
+    expect(() => r.validate("N", { shape: { r: 1 } })).toThrow();
   });
 });
