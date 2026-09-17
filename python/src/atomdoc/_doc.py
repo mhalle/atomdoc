@@ -1264,6 +1264,33 @@ class Doc:
         view.reset()
         return view.snapshot()
 
+    # --- Queries ---
+
+    def select(self, query: str) -> list[AtomNode]:
+        """The nodes a JSONPath query (RFC 9535) matches, in document order,
+        each once. ``$`` is the root; fields and child slots are keys, and
+        every node also has ``$id`` and ``$type``::
+
+            doc.select("$.milestones[?@.name == 'launch'].tasks[?@.status != 'done']")
+            doc.select("$..[?@['$type'] == 'Task' && deref(@.assignee, 'name') == 'Alice']")
+
+        A query that reaches a plain value (``$..title``) raises ``TypeError``:
+        select the node and read the field. Needs ``atomdoc[query]``.
+        """
+        from ._select import select
+
+        return select(self, query)
+
+    def dump_selected(
+        self, query: str, depth: int | None = None
+    ) -> tuple[JsonDoc, list[list[str]]]:
+        """``dump_scope`` anchored at the nodes ``query`` selects, each to
+        ``depth`` levels (all of it when None): the part of a document a query
+        names, with stubs for the rest."""
+        anchors = [{"id": n.id} if depth is None else {"id": n.id, "depth": depth}
+                   for n in self.select(query)]
+        return self.dump_scope(anchors)
+
     # --- Composition ---
 
     def adopt(

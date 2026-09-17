@@ -867,6 +867,30 @@ class Scene:
 The schema export lists a slot's accepted types under `allowed_types`
 (`allowed_type` names the one type when there is exactly one).
 
+## Queries
+
+`doc.select(query)` returns the nodes a [JSONPath](https://www.rfc-editor.org/rfc/rfc9535)
+query matches, in document order, each once. The query sees the document
+as `to_json()` shows it — fields as keys, defaults included, child slots as
+arrays — plus `$id` and `$type` on every node, with references as node IDs.
+`deref(ref, 'field')` reads a field of the node a reference points at.
+Install the `query` extra (`pip install atomdoc[query]`).
+
+```python
+doc.select("$.milestones[?@.name == 'launch'].tasks[?@.status != 'done']")
+doc.select("$..[?@['$type'] == 'Person']")
+doc.select("$..tasks[?deref(@.assignee, 'name') == 'Alice']")
+
+with doc.transaction():                       # select, then edit what was found
+    for task in doc.select("$..tasks[?@.status == 'todo']"):
+        task.status = "in_progress"
+```
+
+A query that reaches a plain value (`$..title`) raises `TypeError`: select
+the node and read the field. `doc.dump_selected(query, depth=None)` is
+`dump_scope` anchored at the selected nodes — the part of the document a
+query names, with stubs for the rest (see partial replication).
+
 ## Tree navigation
 
 Navigation goes through the doc:
