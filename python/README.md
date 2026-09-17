@@ -721,6 +721,13 @@ validation language is available. Validation runs at **transaction commit
 time** — not on every field write — so intermediate states don't need to
 be valid.
 
+A field's own type is still checked on every write, on plain classes too,
+and a value is never trusted because it is already an instance of the
+right model: `model_copy(update=...)` and `model_construct(...)` build
+instances pydantic never validated, so every model instance in a value —
+at any depth — is validated again, by its own class, before it enters the
+document. `color.model_copy(update={"r": "x"})` is refused like `{"r": "x"}`.
+
 ### Field constraints
 
 ```python

@@ -16,7 +16,7 @@ from pydantic_core import PydanticUndefined
 
 from ._array import Array, get_array_element_type, is_array_annotation, is_classvar_annotation
 from ._children import ChildrenView
-from ._descriptors import _MISSING, RefDescriptor, StateDescriptor
+from ._descriptors import _MISSING, RefDescriptor, StateDescriptor, ValueAdapter
 from ._range import NodeRange
 from ._ref import Ref, RefAdapter, RefDef, parse_ref_annotation
 from ._tier import Tier, classify_field
@@ -355,8 +355,8 @@ class AtomNode:
 
             tier = classify_field(ann)
             cls._field_tiers[name] = tier
-            adapter = TypeAdapter(ann)
-            cls._field_adapters[name] = adapter
+            adapter = ValueAdapter(ann)
+            cls._field_adapters[name] = adapter  # type: ignore[assignment]
 
             desc = StateDescriptor(name, ann, default)
             setattr(cls, name, desc)
