@@ -650,7 +650,7 @@ class Doc:
 
     # --- Node creation ---
 
-    def create_node(self, node_cls: type[AtomNode], **state: Any) -> AtomNode:
+    def create_node(self, node_cls: type[AtomNode], /, **state: Any) -> AtomNode:
         if not hasattr(node_cls, "_node_type"):
             raise TypeError(f"{node_cls} is not a valid AtomNode subclass")
         if node_cls._node_type not in self._node_types:
