@@ -26,6 +26,7 @@ dev = [
     "marimo>=0.21.1",
     "anywidget>=0.9.21",
     "jsonpath-rfc9535>=1.0",
+    "micromcp @ git+https://github.com/mhalle/micromcp@v0.2.0",
 ]
 
 [build-system]

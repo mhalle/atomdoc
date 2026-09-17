@@ -880,41 +880,44 @@ class Doc:
 
     def _validate_changed_nodes(self) -> None:
         """Run Pydantic model validation on nodes changed in this transaction."""
-        from ._array import is_array_annotation
-
         for node_id in self._diff.updated | self._diff.inserted:
             node = self._node_map.get(node_id)
-            if node is None:
-                continue
-            cls = type(node)
-            validator = getattr(cls, "_validator_model", None)
-            constraint = getattr(cls, "_constraint_model", None)
-            if (
-                constraint is not None
-                and validator is not None
-                and cls._constrained_fields <= set(getattr(validator, "model_fields", {}))
-            ):
-                constraint = None  # the source model enforces them itself
-            models = [m for m in (validator, constraint) if m is not None]
-            if not models:
-                continue
+            if node is not None:
+                self._validate_node(node)
 
-            # Build a data dict for the models.
-            # State fields get their current values; Array fields get empty lists.
-            data: dict[str, Any] = {}
-            for name, default in cls._field_defaults.items():
-                if default is not _MISSING:
-                    data[name] = node._state.get(name, default)
-                elif name in node._state:
-                    data[name] = node._state[name]
+    def _validate_node(self, node: AtomNode) -> None:
+        """Run one node's Pydantic model validation, as commit does."""
+        from ._array import is_array_annotation
 
-            for model in models:
-                # Fill Array fields with empty lists so the model doesn't complain
-                for name in getattr(model, "__annotations__", {}):
-                    ann = model.__annotations__[name]
-                    if is_array_annotation(ann) and name not in data:
-                        data[name] = []
-                model.model_validate(data)
+        cls = type(node)
+        validator = getattr(cls, "_validator_model", None)
+        constraint = getattr(cls, "_constraint_model", None)
+        if (
+            constraint is not None
+            and validator is not None
+            and cls._constrained_fields <= set(getattr(validator, "model_fields", {}))
+        ):
+            constraint = None  # the source model enforces them itself
+        models = [m for m in (validator, constraint) if m is not None]
+        if not models:
+            return
+
+        # Build a data dict for the models.
+        # State fields get their current values; Array fields get empty lists.
+        data: dict[str, Any] = {}
+        for name, default in cls._field_defaults.items():
+            if default is not _MISSING:
+                data[name] = node._state.get(name, default)
+            elif name in node._state:
+                data[name] = node._state[name]
+
+        for model in models:
+            # Fill Array fields with empty lists so the model doesn't complain
+            for name in getattr(model, "__annotations__", {}):
+                ann = model.__annotations__[name]
+                if is_array_annotation(ann) and name not in data:
+                    data[name] = []
+            model.model_validate(data)
 
     # --- References ---
 

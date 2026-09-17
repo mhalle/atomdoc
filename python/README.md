@@ -921,6 +921,48 @@ loc.node, loc.field, loc.inner, loc.tier, loc.settable
 the selected nodes — the part of the document a query names, with stubs for
 the rest (see partial replication).
 
+## Editing for a model
+
+`atomdoc.editing` lets a model read and change a document through tools —
+MCP or any other transport — without being able to break the rules the
+document's types set. It needs the `query` extra.
+
+```python
+from atomdoc.editing import DocumentEditor
+
+editor = DocumentEditor(FileStore("documents"), Project)
+
+await editor.read("plan", "$.milestones[?@.name == 'launch']", depth=1)
+await editor.edit("plan", [
+    {"op": "set", "path": "$..tasks[?@.title == 'deploy'].estimate", "value": {"days": 2}},
+    {"op": "set", "path": "$..tasks[?@.title == 'deploy'].status", "value": "done"},
+    {"op": "insert", "path": "$.milestones[?@.name == 'launch'].tasks",
+     "value": {"$type": "Task", "title": "smoke test"}, "after": "$..tasks[?@.title == 'deploy']"},
+])
+```
+
+An edit is a list of `set`, `add`, `remove`, `insert`, `move` and `delete`
+operations applied in one transaction: all of it lands, or none of it does
+and an `EditError` says what to change. The rules it holds a model to:
+
+* **Fields are written whole.** A path inside a frozen value or a list is
+  refused, and the error carries the current whole value to resubmit.
+* **A write matches exactly one place** unless `expect` says how many (a
+  number, or `"all"`), so a filter slightly too broad is refused, not obeyed.
+* **Stale decisions are refused, not retried.** `if_current` states a field's
+  expected value; `version`, returned by every read, states the document. A
+  save that loses a race is reported rather than re-applied.
+* **The document's own validators run before commit**, and a failure names
+  the node and the operations that touched it.
+* **A node still referenced cannot be deleted**; the error lists the
+  references to clear first, in the same edit.
+
+`apply_edits`, `read_view` and `describe_schema` do the same on a `Doc` in
+memory; `TOOL_DESCRIPTIONS` holds tool descriptions written for a model.
+[`examples/mcp_editor.py`](examples/mcp_editor.py) serves a project plan over
+MCP with the three generic tools and a domain tool, `complete_task`, built
+from the same operations.
+
 ## Tree navigation
 
 Navigation goes through the doc:
