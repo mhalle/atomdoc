@@ -886,10 +886,33 @@ with doc.transaction():                       # select, then edit what was found
         task.status = "in_progress"
 ```
 
-A query that reaches a plain value (`$..title`) raises `TypeError`: select
-the node and read the field. `doc.dump_selected(query, depth=None)` is
-`dump_scope` anchored at the selected nodes — the part of the document a
-query names, with stubs for the rest (see partial replication).
+`$` is the document root, or the node passed as `node=` (an instance or its
+ID); a query given a node stays inside its subtree, though `deref` still
+follows references out of it. `dump(node)` and `to_json(node)` take an ID the
+same way. An ID that names nothing raises `LookupError` rather than falling
+back to the whole document.
+
+```python
+doc.select("$.tasks[?@.status != 'done']", node=launch)      # or node=launch.id
+```
+
+A query that reaches a value rather than a node (`$..title`) raises
+`TypeError` from `select`. `doc.locate(query)` answers it instead, in the
+terms an edit needs: a `Location` is a node, a whole field of a node, or a
+node's child slot. A match *inside* a field's value — a component of a
+frozen value, an element of a list — is located as that field, with the rest
+of the path in `inner` and `settable` false, because fields are only ever
+written whole: the red channel of a `Color` is readable, never editable alone.
+
+```python
+[loc] = doc.locate("$..tasks[?@.title == 'deploy'].estimate.days")
+loc.node, loc.field, loc.inner, loc.tier, loc.settable
+# (<Task>, "estimate", ("days",), "atomic", False)
+```
+
+`doc.dump_selected(query, depth=None, node=None)` is `dump_scope` anchored at
+the selected nodes — the part of the document a query names, with stubs for
+the rest (see partial replication).
 
 ## Tree navigation
 

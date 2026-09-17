@@ -25,6 +25,7 @@ from ._handle import Handle, is_handle_type
 from ._node import AtomNode, _MISSING
 from ._range import _descendants, _descendants_inclusive
 from ._ref import RefIntegrityError, ref_ids
+from ._select import Location
 from ._tier import frozen_models_in
 from ._types import (
     ChangeEvent,
@@ -1211,9 +1212,10 @@ class Doc:
     # --- Clean JSON (user-facing, no IDs) ---
 
     def to_json(
-        self, node: AtomNode | None = None, *, include_defaults: bool = False,
+        self, node: AtomNode | str | None = None, *, include_defaults: bool = False,
     ) -> dict[str, Any]:
-        """Return clean JSON for a node (default: root).
+        """Return clean JSON for a node (default: root), given as an instance
+        or its ID.
 
         Node IDs are omitted; the tree is nested data. A ``Ref[T]`` field
         is emitted as the target's *document path*, a bare JSON Pointer
@@ -1231,23 +1233,23 @@ class Doc:
         """
         if self._lifecycle_stage not in ("idle", "change"):
             raise RuntimeError("Cannot serialize during an active transaction")
-        target = node if node is not None else self._root
+        target = self._resolve_node(node)
         return _node_to_data(target, include_defaults=include_defaults)
 
     # --- Wire format (dump/restore, has IDs) ---
 
     def dump(
-        self, node: AtomNode | None = None, *, include_defaults: bool = False
+        self, node: AtomNode | str | None = None, *, include_defaults: bool = False
     ) -> JsonDoc:
         """Serialize to wire format (with IDs) for persistence and sync.
 
-        With ``node``, serialize that subtree only — a fragment another
+        With ``node`` (an instance or its ID), serialize that subtree only — a fragment another
         document can take in with ``adopt()``. If ``include_defaults`` is
         True, fields with default values are included in the output.
         """
         if self._lifecycle_stage not in ("idle", "change"):
             raise RuntimeError("Cannot serialize during an active transaction")
-        target = node if node is not None else self._root
+        target = self._resolve_node(node)
         return _node_to_wire(target, include_defaults=include_defaults)
 
     def dump_scope(self, anchors: Any) -> tuple[JsonDoc, list[list[str]]]:
@@ -1266,29 +1268,62 @@ class Doc:
 
     # --- Queries ---
 
-    def select(self, query: str) -> list[AtomNode]:
+    def _resolve_node(self, node: AtomNode | str | None) -> AtomNode:
+        """The node a ``node=`` argument names: an instance in this document's
+        tree, its ID, or None for the root. Never falls back to the root for
+        something that does not resolve — a stale ID would silently widen the
+        work from a subtree to the whole document."""
+        if node is None:
+            return self._root
+        if isinstance(node, str):
+            found = self._node_map.get(node)
+            if found is None:
+                raise LookupError(f"no node {node!r} in this document")
+            return found
+        if isinstance(node, AtomNode):
+            if self._node_map.get(node.id) is node:
+                return node
+            if node._doc_ref is not self:
+                raise ValueError(f"{node._node_type} {node.id} belongs to another document")
+            raise ValueError(f"{node._node_type} {node.id} is not in this document's tree "
+                             "(deleted, or created and not yet attached)")
+        raise TypeError(f"node= is a node, a node ID, or None, not {type(node).__name__}")
+
+    def select(self, query: str, node: AtomNode | str | None = None) -> list[AtomNode]:
         """The nodes a JSONPath query (RFC 9535) matches, in document order,
-        each once. ``$`` is the root; fields and child slots are keys, and
-        every node also has ``$id`` and ``$type``::
+        each once. ``$`` is ``node`` when given (an instance or its ID),
+        otherwise the root. Fields and child slots are keys, and every node
+        also has ``$id`` and ``$type``::
 
             doc.select("$.milestones[?@.name == 'launch'].tasks[?@.status != 'done']")
-            doc.select("$..[?@['$type'] == 'Task' && deref(@.assignee, 'name') == 'Alice']")
+            doc.select("$.tasks[?deref(@.assignee, 'name') == 'Alice']", node=launch)
 
-        A query that reaches a plain value (``$..title``) raises ``TypeError``:
-        select the node and read the field. Needs ``atomdoc[query]``.
+        A query that reaches a value rather than a node (``$..title``) raises
+        ``TypeError``; ``locate`` answers those. Needs ``atomdoc[query]``.
         """
         from ._select import select
 
-        return select(self, query)
+        return select(self, query, self._resolve_node(node))
+
+    def locate(self, query: str, node: AtomNode | str | None = None) -> list[Location]:
+        """Where a JSONPath query lands, as the units an edit acts on: a node,
+        a whole field of a node, or a node's child slot. A match inside a
+        field's value — a frozen value's component, a list element — is
+        reported as that field with the rest of the path in ``inner`` and
+        ``settable`` False, since a field is only ever written whole."""
+        from ._select import locate
+
+        return locate(self, query, self._resolve_node(node))
 
     def dump_selected(
-        self, query: str, depth: int | None = None
+        self, query: str, depth: int | None = None, node: AtomNode | str | None = None
     ) -> tuple[JsonDoc, list[list[str]]]:
         """``dump_scope`` anchored at the nodes ``query`` selects, each to
         ``depth`` levels (all of it when None): the part of a document a query
         names, with stubs for the rest."""
-        anchors = [{"id": n.id} if depth is None else {"id": n.id, "depth": depth}
-                   for n in self.select(query)]
+        anchors: list[dict[str, Any]] = [
+            {"id": n.id} if depth is None else {"id": n.id, "depth": depth}
+            for n in self.select(query, node)]
         return self.dump_scope(anchors)
 
     # --- Composition ---

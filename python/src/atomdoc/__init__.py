@@ -10,6 +10,7 @@ from ._node import AtomNode
 from ._operations import merge_operations
 from ._protocol import operations_from_wire, operations_to_wire
 from ._ref import Ref, RefIntegrityError
+from ._select import Location
 from ._session import Session
 from ._store import (ABSENT, MAX_KEY_BYTES, CapabilityError, DocumentNotFound,
                      DocumentStore, Entry, InvalidKey, MemoryStore, StaleWrite,
@@ -38,6 +39,7 @@ __all__ = [
     "Diff",
     "NodeIdGenerator",
     "Operations",
+    "Location",
     "Ref",
     "RefIntegrityError",
     "ListenerError",

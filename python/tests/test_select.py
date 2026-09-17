@@ -29,6 +29,7 @@ class Task:
     assignee: Ref[Person] | None = None
     reviewers: list[Ref[Person]] = []
     estimate: Estimate | None = None
+    tags: list[str] = []
 
 
 @node
@@ -187,3 +188,184 @@ def test_without_the_extra(doc, monkeypatch):
     finally:
         _select._environment.cache_clear()
         _select._compile.cache_clear()
+
+
+# ── node=: a query that starts below the root ─────────────────────────────────
+
+def milestone(doc, name):
+    return doc.select(f"$.milestones[?@.name == '{name}']")[0]
+
+
+def task(doc, title):
+    return doc.select(f"$..tasks[?@.title == '{title}']")[0]
+
+
+def test_node_is_dollar(doc):
+    launch = milestone(doc, "launch")
+    assert titles(doc.select("$.tasks[*]", node=launch)) == ["docs", "deploy", "announce"]
+    assert doc.select("$", node=launch) == [launch]
+
+
+def test_node_by_id_or_instance(doc):
+    launch = milestone(doc, "launch")
+    assert doc.select("$.tasks[*]", node=launch.id) == doc.select("$.tasks[*]", node=launch)
+
+
+def test_a_query_below_the_root_stays_below_it(doc):
+    setup = milestone(doc, "setup")
+    assert titles(doc.select("$..[?@['$type'] == 'Task']", node=setup)) == ["repo", "ci"]
+    assert doc.select("$..[?@['$type'] == 'Person']", node=setup) == []
+
+
+def test_references_are_followed_out_of_the_subtree(doc):
+    launch = milestone(doc, "launch")          # Alice and Bob live under the root, not here
+    q = "$.tasks[?deref(@.assignee, 'name') == 'Alice']"
+    assert titles(doc.select(q, node=launch)) == ["docs", "announce"]
+
+
+def test_an_unknown_id_never_widens_to_the_whole_document(doc):
+    with pytest.raises(LookupError, match="no node"):
+        doc.select("$..tasks[*]", node="-nope.0")
+    with pytest.raises(LookupError):
+        doc.dump("-nope.0")
+    with pytest.raises(LookupError):
+        doc.to_json("-nope.0")
+
+
+def test_a_node_from_another_document(doc):
+    other = Doc(Project())
+    with pytest.raises(ValueError, match="another document"):
+        doc.select("$", node=other.root)
+
+
+def test_a_copy_of_the_document_shares_ids_but_not_nodes(doc):
+    """A restored copy has the same IDs. Its node must not be taken for this
+    document's node of the same ID: that would query the wrong document."""
+    copy = Doc.restore(doc.dump(), root_type=Project)
+    theirs = copy.root.milestones[0]
+    assert doc.get_node_by_id(theirs.id) is not None           # the ID exists here too
+    with pytest.raises(ValueError, match="another document"):
+        doc.select("$", node=theirs)
+    assert doc.select("$", node=theirs.id) == [doc.root.milestones[0]]   # an ID names ours
+
+
+def test_a_deleted_node(doc):
+    gone = task(doc, "ci")
+    with doc.transaction():
+        gone.delete()
+    with pytest.raises(ValueError, match="not in this document's tree"):
+        doc.select("$", node=gone)
+    with pytest.raises(LookupError):
+        doc.select("$", node=gone.id)
+
+
+def test_a_node_not_yet_attached(doc):
+    with doc.transaction():
+        loose = doc.create_node(Task, title="loose")
+        with pytest.raises(ValueError, match="not yet attached"):
+            doc.select("$", node=loose)
+        doc.root.milestones[0].tasks.append(loose)
+
+
+def test_node_must_be_a_node_or_an_id(doc):
+    with pytest.raises(TypeError, match="node="):
+        doc.select("$", node=3)                                  # type: ignore[arg-type]
+
+
+def test_dump_and_to_json_take_an_id_too(doc):
+    deploy = task(doc, "deploy")
+    assert doc.dump(deploy.id) == doc.dump(deploy)
+    assert doc.to_json(deploy.id) == doc.to_json(deploy)
+    assert doc.dump() == doc.dump(None) == doc.dump(doc.root.id)
+
+
+def test_dump_selected_below_the_root(doc):
+    launch = milestone(doc, "launch")
+    snapshot, _ = doc.dump_selected("$.tasks[?@.title == 'deploy']", depth=0, node=launch)
+    assert "deploy" in str(snapshot) and "repo" not in str(snapshot)
+
+
+# ── locate: where a query lands, as the unit an edit acts on ──────────────────
+
+def test_a_node(doc):
+    [loc] = doc.locate("$..tasks[?@.title == 'deploy']")
+    assert (loc.kind, loc.node, loc.settable) == ("node", task(doc, "deploy"), False)
+
+
+def test_a_plain_field(doc):
+    [loc] = doc.locate("$..tasks[?@.title == 'deploy'].status")
+    assert (loc.kind, loc.field, loc.inner, loc.tier, loc.settable) == \
+        ("field", "status", (), "mergeable", True)
+    assert loc.node is task(doc, "deploy")
+
+
+def test_a_frozen_value_whole(doc):
+    with doc.transaction():
+        task(doc, "deploy").estimate = Estimate(days=2)
+    [loc] = doc.locate("$..tasks[?@.title == 'deploy'].estimate")
+    assert (loc.field, loc.tier, loc.inner, loc.settable) == ("estimate", "atomic", (), True)
+
+
+def test_inside_a_frozen_value_is_the_field_and_not_settable(doc):
+    """The red channel of a Color: readable, located, never writable alone."""
+    with doc.transaction():
+        task(doc, "deploy").estimate = Estimate(days=2)
+    [loc] = doc.locate("$..tasks[?@.title == 'deploy'].estimate.days")
+    assert (loc.kind, loc.field, loc.inner, loc.tier) == ("field", "estimate", ("days",), "atomic")
+    assert loc.settable is False
+    assert str(loc).endswith("estimate.days (atomic)")
+
+
+def test_inside_an_absent_value_matches_nothing(doc):
+    assert doc.locate("$..tasks[?@.title == 'deploy'].estimate.days") == []   # estimate is None
+
+
+def test_inside_a_list_is_the_field_and_not_settable(doc):
+    with doc.transaction():
+        task(doc, "deploy").tags = ["infra", "urgent"]
+    [loc] = doc.locate("$..tasks[?@.title == 'deploy'].tags[1]")
+    assert (loc.field, loc.inner, loc.tier, loc.settable) == ("tags", (1,), "mergeable", False)
+    [whole] = doc.locate("$..tasks[?@.title == 'deploy'].tags")
+    assert whole.settable
+
+
+def test_references(doc):
+    alice, bob = doc.root.people
+    with doc.transaction():
+        task(doc, "deploy").reviewers = [alice, bob]
+    [one] = doc.locate("$..tasks[?@.title == 'deploy'].assignee")
+    assert (one.field, one.tier, one.settable) == ("assignee", "ref", True)
+    [member] = doc.locate("$..tasks[?@.title == 'deploy'].reviewers[1]")
+    assert (member.field, member.inner, member.tier, member.settable) == \
+        ("reviewers", (1,), "ref", False)
+
+
+def test_a_child_slot(doc):
+    [loc] = doc.locate("$.milestones[?@.name == 'launch'].tasks")
+    assert (loc.kind, loc.slot, loc.field, loc.settable) == ("slot", "tasks", None, False)
+    assert loc.node is milestone(doc, "launch")
+    assert str(loc).endswith("slot tasks")
+
+
+def test_id_and_type_are_never_settable(doc):
+    for key in ("$id", "$type"):
+        [loc] = doc.locate(f"$..tasks[?@.title == 'deploy']['{key}']")
+        assert (loc.field, loc.tier, loc.settable) == (key, None, False)
+
+
+def test_many_in_document_order_each_once(doc):
+    locs = doc.locate("$..tasks[*].status")
+    assert [loc.node.title for loc in locs] == ["repo", "ci", "docs", "deploy", "announce"]
+    assert len(doc.locate("$.milestones[0, 0].name")) == 1
+
+
+def test_locate_below_a_node(doc):
+    deploy = task(doc, "deploy")
+    [loc] = doc.locate("$.status", node=deploy.id)
+    assert (loc.node, loc.field) == (deploy, "status")
+
+
+def test_locate_and_select_agree_on_nodes(doc):
+    q = "$..tasks[?@.status != 'done']"
+    assert [loc.node for loc in doc.locate(q)] == doc.select(q)
+    assert all(loc.kind == "node" for loc in doc.locate(q))
