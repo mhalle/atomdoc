@@ -2,6 +2,80 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+Finding things in a document, and a way for a model to change them.
+
+### Added
+
+- `doc.select(query)` runs an RFC 9535 JSONPath query and returns the
+  matching nodes in document order, each once. The query sees the
+  document as `to_json()` does — fields as keys, defaults included,
+  child slots as arrays — plus `$id` and `$type` on every node, with
+  references as node IDs so they survive moves. `deref(ref, 'field')`,
+  a function extension, reads a field of the referenced node, following
+  references out of the queried subtree. A query that reaches a plain
+  value raises `TypeError` rather than returning something that is not
+  a node; a malformed one, `ValueError`. `doc.dump_selected(query,
+  depth)` anchors `dump_scope` at the selection, so a query names the
+  part of a document a scoped client or a model receives. Cost is
+  linear: about 13 ms for a narrow query over 10,000 nodes, 50 ms for a
+  whole-document filter.
+- `node=` on `select`, `dump_selected`, `dump` and `to_json` takes a
+  node or its ID and makes it `$`. It never falls back to the root: an
+  unknown ID raises `LookupError`, and a deleted, unattached or foreign
+  node raises `ValueError` — including a node from a restored copy,
+  which shares this document's IDs, so the check is identity, not ID.
+- `doc.locate(query)` returns `Location`s, the units an edit acts on: a
+  node, a whole field of a node, or a node's child slot. A match inside
+  a field's value is located as that field with the rest of the path in
+  `inner` and `settable` false, because a field is only ever written
+  whole; `$id` and `$type` are never settable. Each `Location` carries
+  the field's tier.
+- `atomdoc.editing`, tools for a model to read and change a document.
+  `read_view(doc, path)` returns what a JSONPath finds: nodes with their
+  fields, labels for what their references name, and children to a
+  depth. `apply_edits(doc, ops)` applies `set`, `add`, `remove`,
+  `insert`, `move` and `delete` in one transaction, all of it or none.
+  `describe_schema(doc)` is the schema at 1.3 KB. `DocumentEditor` does
+  all three over a `DocumentStore`, with a version on every result.
+  Failures are `EditError`: a stable code, a message saying what to
+  change, and the details needed to change it. A write matches exactly
+  one place unless `expect` says otherwise; `if_current` and `version`
+  refuse an edit decided on content that has changed; a node something
+  still references cannot be deleted, and the error lists the references
+  to clear. `examples/mcp_editor.py` serves a project plan over MCP.
+
+### Changed
+
+- **`jsonpath-rfc9535` is a base dependency.** It was briefly an
+  optional `query` extra, on the reasoning that queries were a side
+  feature and the package pulls in compiled `regex` and
+  `iregexp-check`. The edit layer addresses everything by path — even an
+  op that names a node by ID compiles `$` — so the extra gated most of
+  what a model-facing install is for. The extra is gone; it was never
+  part of a release. The import stays lazy, so `import atomdoc` does not
+  load `regex` in a process that never queries.
+- `create_node`'s `node_cls` is positional-only, so a node type with a
+  field named `node_cls` can be created with `create_node(T,
+  node_cls=...)` instead of failing with "got multiple values for
+  argument".
+
+### Fixed
+
+- **Model instances entered a document unvalidated.** Pydantic accepts
+  an instance of the right class without looking inside it, and
+  `model_copy(update=...)` and `model_construct(...)` both build
+  instances it never validated: a `Color` with `r='x'` or `r=999` made
+  that way was stored and committed, through assignment, `create_node`
+  and a node snapshot, alone or nested. The frozen boundary itself held
+  — `r` still could not be set on its own — but an invalid whole value
+  got in. Field adapters are now `ValueAdapter`: every model instance in
+  a value is validated again by its own class, inside out, before the
+  field's type checks the whole. Values without a model instance take
+  the path they took before. Assigning one frozen `Color` costs 5.1 µs
+  rather than 3.2; a list of twenty, 45 µs rather than 7.
+
 ## [0.7.0] - 2026-09-16
 
 Documents that outlive the process: a swappable store. Released in step

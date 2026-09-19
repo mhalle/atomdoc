@@ -13,8 +13,7 @@ something a query can act on:
   wherever that node is — a query confined to a subtree still follows
   references out of it.
 
-``$`` is the document root, or the node a query is given. Needs the
-``query`` extra: ``pip install atomdoc[query]``.
+``$`` is the document root, or the node a query is given.
 """
 
 from __future__ import annotations
@@ -84,8 +83,8 @@ def _jsonpath() -> Any:
         import jsonpath_rfc9535
     except ImportError as exc:
         raise ImportError(
-            "Doc.select needs the jsonpath-rfc9535 package. "
-            "Install it with: pip install atomdoc[query]"
+            "queries need the jsonpath-rfc9535 package, which atomdoc requires. "
+            "Reinstall atomdoc, or install it directly: pip install jsonpath-rfc9535"
         ) from exc
     return jsonpath_rfc9535
 

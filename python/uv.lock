@@ -52,14 +52,12 @@ name = "atomdoc"
 version = "0.7.0"
 source = { editable = "." }
 dependencies = [
+    { name = "jsonpath-rfc9535" },
     { name = "pydantic" },
     { name = "python-ulid" },
 ]
 
 [package.optional-dependencies]
-query = [
-    { name = "jsonpath-rfc9535" },
-]
 server = [
     { name = "websockets" },
 ]
@@ -67,7 +65,6 @@ server = [
 [package.dev-dependencies]
 dev = [
     { name = "anywidget" },
-    { name = "jsonpath-rfc9535" },
     { name = "marimo" },
     { name = "micromcp" },
     { name = "mypy" },
@@ -79,17 +76,16 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "jsonpath-rfc9535", marker = "extra == 'query'", specifier = ">=1.0" },
+    { name = "jsonpath-rfc9535", specifier = ">=1.0" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "python-ulid", specifier = ">=3.0.0" },
     { name = "websockets", marker = "extra == 'server'", specifier = ">=13.0" },
 ]
-provides-extras = ["server", "query"]
+provides-extras = ["server"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "anywidget", specifier = ">=0.9.21" },
-    { name = "jsonpath-rfc9535", specifier = ">=1.0" },
     { name = "marimo", specifier = ">=0.21.1" },
     { name = "micromcp", git = "https://github.com/mhalle/micromcp?rev=v0.2.0" },
     { name = "mypy", specifier = ">=1.0" },

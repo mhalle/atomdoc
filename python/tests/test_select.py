@@ -177,13 +177,13 @@ def test_queries_are_independent(doc):
     assert titles(doc.select(q)) == ["ci", "deploy"]
 
 
-def test_without_the_extra(doc, monkeypatch):
+def test_without_jsonpath_installed(doc, monkeypatch):
     from atomdoc import _select
     _select._environment.cache_clear()
     _select._compile.cache_clear()
     monkeypatch.setitem(sys.modules, "jsonpath_rfc9535", None)
     try:
-        with pytest.raises(ImportError, match=r"atomdoc\[query\]"):
+        with pytest.raises(ImportError, match=r"jsonpath-rfc9535"):
             doc.select("$")
     finally:
         _select._environment.cache_clear()

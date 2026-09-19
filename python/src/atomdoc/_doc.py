@@ -1302,7 +1302,7 @@ class Doc:
             doc.select("$.tasks[?deref(@.assignee, 'name') == 'Alice']", node=launch)
 
         A query that reaches a value rather than a node (``$..title``) raises
-        ``TypeError``; ``locate`` answers those. Needs ``atomdoc[query]``.
+        ``TypeError``; ``locate`` answers those.
         """
         from ._select import select
 

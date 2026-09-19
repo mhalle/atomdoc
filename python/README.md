@@ -881,7 +881,6 @@ query matches, in document order, each once. The query sees the document
 as `to_json()` shows it — fields as keys, defaults included, child slots as
 arrays — plus `$id` and `$type` on every node, with references as node IDs.
 `deref(ref, 'field')` reads a field of the node a reference points at.
-Install the `query` extra (`pip install atomdoc[query]`).
 
 ```python
 doc.select("$.milestones[?@.name == 'launch'].tasks[?@.status != 'done']")
