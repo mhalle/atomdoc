@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.0
+
+No changes. Released in step with atomdoc 0.8.0, whose additions —
+`select`, `locate` and `atomdoc.editing` — are server-side and touch
+neither the protocol nor the client.
+
 ## 0.7.0
 
 No runtime dependencies: validation without zod. Released in step with
